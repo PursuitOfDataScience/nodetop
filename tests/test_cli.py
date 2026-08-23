@@ -1072,6 +1072,18 @@ class TestRoutingQueuePresentation:
 
 
 class TestStatusIdentity:
+    #: A username the test controls.
+    #:
+    #: The assertion used to be the literal name of whoever wrote it, which
+    #: passes on their machine and nowhere else -- CI runs as `runner` and went
+    #: red on the first push. The name comes from the environment rather than
+    #: from the recorded fixture, so the environment is what has to be pinned.
+    USER = "testuser"
+
+    @pytest.fixture(autouse=True)
+    def _fixed_user(self, monkeypatch):
+        monkeypatch.setenv("USER", self.USER)
+
     def _templated(self):
         from nodetop.backends.slurm import SlurmBackend
         from nodetop.core.cluster import Cluster
@@ -1098,7 +1110,7 @@ class TestStatusIdentity:
         # The raw account count left the header: now that access is filtered
         # and the hidden counts are reported, "34 accounts" is context rather
         # than an answer. The username stays -- it says whose access this is.
-        assert "youzhi" in out
+        assert self.USER in out
 
     def test_templated_entitlements_are_called_out_once(self, capsys):
         # A property of the cluster, not of one placement -- but context rather
