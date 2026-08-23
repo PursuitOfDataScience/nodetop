@@ -1,0 +1,110 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nodetop"
+version = "0.1.0"
+description = "See what your cluster actually has free -- and why a queue that looks fine will not take your job. Slurm, PBS, LSF, Grid Engine, Kubernetes, or a bare pool of machines."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Youzhi Yu", email = "yuyouzhi666@icloud.com" }]
+keywords = [
+    "hpc", "scheduler", "slurm", "pbs", "torque", "lsf", "sge", "gridengine",
+    "kubernetes", "gpu", "capacity", "queue",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Clustering",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Systems Administration",
+    "Typing :: Typed",
+]
+# No runtime dependencies, deliberately. This is a tool you reach for when a
+# cluster is misbehaving, so it must run on a login node with nothing but the
+# system Python and whatever scheduler client is already there.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/PursuitOfDataScience/nodetop"
+Repository = "https://github.com/PursuitOfDataScience/nodetop.git"
+Issues = "https://github.com/PursuitOfDataScience/nodetop/issues"
+
+[project.scripts]
+nodetop = "nodetop.cli:main"
+# A two-letter alias, because this is a tool you run to decide where to put the
+# next job -- several times an hour, interactively -- and eight characters is
+# enough friction to make someone not bother checking.
+nt = "nodetop.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.3",
+    "mypy>=1.8",
+    "build>=1.0",
+    "twine>=4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["nodetop*"]
+
+[tool.setuptools.package-data]
+nodetop = ["py.typed"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4"]
+
+[tool.ruff.lint.per-file-ignores]
+# Fixtures hold verbatim or format-faithful scheduler output; long lines are
+# the point.
+"tests/fixtures/*" = ["E501"]
+# Runner implementations must accept `timeout` to match the interface even when
+# replaying recorded output makes it meaningless; every backend must accept the
+# full probe signature even when it has no dry-run; and every cmd_* function
+# takes the same (cluster, args, style) triple so the dispatch table stays
+# uniform.
+"src/nodetop/runner.py" = ["ARG002"]
+"src/nodetop/backends/*" = ["ARG002"]
+"src/nodetop/cli.py" = ["ARG001"]
+# Test doubles must match the real signatures they stand in for, and
+# parametrised ids are sometimes documentation rather than an input.
+"tests/*" = ["ARG002"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "-q --tb=short"
+# TOML has no implicit string concatenation, so this stays on one line.
+markers = [
+    "live_detect: the test owns backend detection, so the conftest fixture that substitutes a recorded backend stands aside",
+]
+
+[tool.coverage.run]
+source = ["nodetop"]
+omit = ["*/tests/*"]

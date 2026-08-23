@@ -1,0 +1,38 @@
+PartitionName=test
+   AllowGroups=ALL AllowAccounts=none AllowQos=none
+   AllocNodes=ALL Default=NO QoS=N/A
+   DefaultTime=00:05:00 DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=YES
+   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED
+   Nodes=beagle3-[0001-0044],beagle3-bigmem[1-4],climate-[001-048],midway3-[0001-0010,0012-0015,0017-0216,0219-0308,0310-0324,0329-0427,0429-0442,0444-0456,0501-0562,0600-0606]
+   PriorityJobFactor=1 PriorityTier=1 RootOnly=NO ReqResv=NO OverSubscribe=NO
+   OverTimeLimit=NONE PreemptMode=OFF
+   State=DOWN TotalCPUs=36440 TotalNodes=610 SelectTypeParameters=NONE
+   JobDefaults=(null)
+   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED
+
+
+PartitionName=beagle3
+   AllowGroups=ALL AllowAccounts=pi-foster,pi-zemmour,pi-roux,pi-eperozo,pi-bkeenan,pi-mlzhao,pi-ejadams,pi-arac,pi-wtang,pi-gavoth,pi-trsosnic,pi-freed,pi-dadrummond,pi-ranganathanr,pi-dinner,pi-tokmakoff,pi-dan1,pi-ggreene,pi-akossiak,pi-yamuna,pi-nicho,pi-price,pi-kayeelee,beagle3-exusers,bcmb32600,rcc-staff,pi-jpicciri,pi-eozkan AllowQos=beagle3,beagle3-long,beagle3-prio,beagle3-long-prio,beagle3-temp,beagle3-voth
+   AllocNodes=ALL Default=NO QoS=N/A
+   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO
+   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED
+   Nodes=beagle3-00[01-44]
+   PriorityJobFactor=1 PriorityTier=1 RootOnly=NO ReqResv=NO OverSubscribe=NO
+   OverTimeLimit=NONE PreemptMode=OFF
+   State=UP TotalCPUs=1408 TotalNodes=44 SelectTypeParameters=NONE
+   JobDefaults=(null)
+   DefMemPerCPU=7810 MaxMemPerNode=UNLIMITED
+
+
+PartitionName=gpu
+   AllowGroups=ALL AllowAccounts=ALL AllowQos=gpu,debug
+   AllocNodes=ALL Default=NO QoS=N/A
+   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO
+   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED
+   Nodes=midway3-0[277-286,294]
+   PriorityJobFactor=1 PriorityTier=1 RootOnly=NO ReqResv=NO OverSubscribe=NO
+   OverTimeLimit=NONE PreemptMode=OFF
+   State=UP TotalCPUs=528 TotalNodes=11 SelectTypeParameters=NONE
+   JobDefaults=(null)
+   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED
+

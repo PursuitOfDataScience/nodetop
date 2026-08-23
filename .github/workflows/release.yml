@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # The gate, and it runs here rather than being assumed from CI. GitHub cannot
+  # express `needs:` across workflow files, so a tag push would otherwise go
+  # straight to publish with no dependency on the suite at all -- and a PyPI
+  # upload cannot be taken back: the version is burned whether or not the code
+  # works. This runs on the tagged commit, which is the commit being shipped.
+  gate:
+    name: Lint, types & tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: mypy src
+      - run: python -m pytest -q
+
+  build-and-publish:
+    name: Build & publish to PyPI
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      # The version is declared in pyproject.toml, so nothing derives it from
+      # the tag -- which means the two can disagree, and a mismatch would ship
+      # the wrong version number under the right tag.
+      - name: Verify the tag matches the declared version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          DECLARED=$(python -c "import tomllib,pathlib; \
+            print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "tag=$TAG declared=$DECLARED"
+          test "$TAG" = "$DECLARED" || {
+            echo "::error::tag $TAG does not match pyproject version $DECLARED"; exit 1; }
+
+      - name: Check artifacts
+        run: |
+          pip install twine
+          twine check --strict dist/*
+
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1

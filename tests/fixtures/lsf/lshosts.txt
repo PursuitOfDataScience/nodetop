@@ -1,0 +1,7 @@
+HOST_NAME      type    model            cpuf ncpus maxmem maxswp server RESOURCES
+gpu-01         X86_64  Intel_Platinum  60.0    40   512G    16G      Yes (mg gpu nvidia_a100)
+gpu-02         X86_64  Intel_Platinum  60.0    40   512G    16G      Yes (mg gpu nvidia_v100)
+gpu-03         X86_64  Intel_Platinum  60.0    40   512G    16G      Yes (mg gpu nvidia_a100)
+gpu-04         X86_64  Intel_Platinum  60.0    40   512G    16G      Yes (mg gpu nvidia_a100)
+cpu-01         X86_64  AMD_EPYC        55.0   128   256G    16G      Yes (mg)
+cpu-02         X86_64  AMD_EPYC        55.0   128   256G    16G      Yes (mg)

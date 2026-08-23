@@ -1,0 +1,7 @@
+HOST_NAME          STATUS       JL/U    MAX  NJOBS    RUN  SSUSP  USUSP    RSV
+gpu-01             ok              -     40      0      0      0      0      0
+gpu-02             ok              -     40     40     40      0      0      0
+gpu-03             closed_Adm      -     40      0      0      0      0      0
+gpu-04             unavail         -     40      0      0      0      0      0
+cpu-01             closed_Full     -    128    128    128      0      0      0
+cpu-02             ok              -    128     16     16      0      0      0

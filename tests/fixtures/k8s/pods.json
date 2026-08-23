@@ -1,0 +1,136 @@
+{
+ "apiVersion": "v1",
+ "kind": "List",
+ "items": [
+  {
+   "metadata": {
+    "name": "train-0",
+    "namespace": "research"
+   },
+   "spec": {
+    "nodeName": "gpu-node-1",
+    "containers": [
+     {
+      "name": "c",
+      "resources": {
+       "requests": {
+        "cpu": "12",
+        "memory": "80Gi",
+        "nvidia.com/gpu": "2"
+       }
+      }
+     }
+    ]
+   },
+   "status": {
+    "phase": "Running"
+   }
+  },
+  {
+   "metadata": {
+    "name": "train-1",
+    "namespace": "research"
+   },
+   "spec": {
+    "nodeName": "gpu-node-2",
+    "containers": [
+     {
+      "name": "c",
+      "resources": {
+       "requests": {
+        "cpu": "48",
+        "memory": "300Gi",
+        "nvidia.com/gpu": "8"
+       }
+      }
+     }
+    ]
+   },
+   "status": {
+    "phase": "Running"
+   }
+  },
+  {
+   "metadata": {
+    "name": "done-1",
+    "namespace": "research"
+   },
+   "spec": {
+    "nodeName": "gpu-node-1",
+    "containers": [
+     {
+      "name": "c",
+      "resources": {
+       "requests": {
+        "cpu": "36",
+        "memory": "200Gi",
+        "nvidia.com/gpu": "2"
+       }
+      }
+     }
+    ]
+   },
+   "status": {
+    "phase": "Succeeded"
+   }
+  },
+  {
+   "metadata": {
+    "name": "web-0",
+    "namespace": "default"
+   },
+   "spec": {
+    "nodeName": "cpu-node-1",
+    "containers": [
+     {
+      "name": "c",
+      "resources": {
+       "requests": {
+        "cpu": "500m",
+        "memory": "1Gi"
+       }
+      }
+     }
+    ]
+   },
+   "status": {
+    "phase": "Running"
+   }
+  },
+  {
+   "metadata": {
+    "name": "init-heavy",
+    "namespace": "research"
+   },
+   "spec": {
+    "nodeName": "gpu-node-4",
+    "initContainers": [
+     {
+      "name": "prep",
+      "resources": {
+       "requests": {
+        "cpu": "80",
+        "memory": "400Gi",
+        "nvidia.com/gpu": "8"
+       }
+      }
+     }
+    ],
+    "containers": [
+     {
+      "name": "main",
+      "resources": {
+       "requests": {
+        "cpu": "4",
+        "memory": "8Gi"
+       }
+      }
+     }
+    ]
+   },
+   "status": {
+    "phase": "Running"
+   }
+  }
+ ]
+}

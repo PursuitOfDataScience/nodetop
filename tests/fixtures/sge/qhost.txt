@@ -1,0 +1,17 @@
+HOSTNAME                ARCH         NCPU NSOC NCOR NTHR  LOAD  MEMTOT  MEMUSE  SWAPTO  SWAPUS
+----------------------------------------------------------------------------------------------
+global                  -               -    -    -    -     -       -       -       -       -
+node001                 lx-amd64       32    2   16   32  0.05  251.6G   12.4G    4.0G    0.0G
+   hf:gpu_model=A100
+   hc:gpu=4.000000
+   all.q                BIP   0/2/32
+node002                 lx-amd64       32    2   16   32 30.10  251.6G  200.0G    4.0G    0.0G
+   hf:gpu_model=V100
+   hc:gpu=0.000000
+   all.q                BIP   0/30/32
+node003                 lx-amd64       32    2   16   32     -  251.6G       -    4.0G       -
+   hf:gpu_model=A100
+   hc:gpu=4.000000
+   all.q                BIP   0/0/32
+node004                 lx-amd64      128    2   64  128  1.00  503.7G   20.0G    8.0G    0.0G
+   cpu.q                BIP   0/1/128

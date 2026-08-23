@@ -1,0 +1,44 @@
+{
+  "timestamp": 1755800000,
+  "pbs_version": "2022.1.1",
+  "pbs_server": "pbs-head",
+  "nodes": {
+    "gpu001": {
+      "Mom": "gpu001",
+      "state": "free",
+      "pcpus": 64,
+      "resources_available": {
+        "ncpus": 64, "ngpus": 4, "mem": "512gb",
+        "gpu_model": "A100", "Qlist": "gpuq,debug", "host": "gpu001"
+      },
+      "resources_assigned": {"ncpus": 0, "ngpus": 0, "mem": "0kb"},
+      "queue": "gpuq"
+    },
+    "gpu002": {
+      "state": "job-busy",
+      "resources_available": {
+        "ncpus": 64, "ngpus": 4, "mem": "512gb", "gpu_model": "V100", "Qlist": "gpuq"
+      },
+      "resources_assigned": {"ncpus": 64, "ngpus": 4, "mem": "500gb"}
+    },
+    "gpu003": {
+      "state": "offline",
+      "comment": "HwPowerBrake: clocks throttled, pending vendor RMA",
+      "resources_available": {
+        "ncpus": 64, "ngpus": 4, "mem": "512gb", "gpu_model": "A100", "Qlist": "gpuq"
+      },
+      "resources_assigned": {"ncpus": 0, "ngpus": 0}
+    },
+    "cpu001": {
+      "state": "free",
+      "resources_available": {"ncpus": 128, "mem": "256gb", "Qlist": "cpuq"},
+      "resources_assigned": {"ncpus": 8, "mem": "16gb"}
+    },
+    "cpu002": {
+      "state": "down,state-unknown",
+      "comment": "node not responding",
+      "resources_available": {"ncpus": 128, "mem": "256gb", "Qlist": "cpuq"},
+      "resources_assigned": {}
+    }
+  }
+}

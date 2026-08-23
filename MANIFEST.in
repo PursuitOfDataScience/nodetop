@@ -1,0 +1,7 @@
+# The sdist should be able to run its own test suite: a source release that
+# cannot be verified by whoever downloaded it is a source release you have to
+# take on trust. Wheels are unaffected -- setuptools takes only the package.
+include LICENSE README.md
+recursive-include tests *.py *.txt *.json
+recursive-include src/nodetop py.typed
+global-exclude __pycache__ *.py[cod]

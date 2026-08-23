@@ -1,0 +1,7 @@
+HOST_NAME     GPU_ID   MODEL          MUSED    MRSV  NJOBS    RUN   SUSP    RSV
+gpu-01        0        NVIDIA_A100      0M      0M      0      0      0      0
+gpu-01        1        NVIDIA_A100      0M      0M      0      0      0      0
+gpu-02        0        NVIDIA_V100     30G      0M      1      1      0      0
+gpu-02        1        NVIDIA_V100     30G      0M      1      1      0      0
+gpu-03        0        NVIDIA_A100      0M      0M      0      0      0      0
+gpu-04        0        NVIDIA_A100      0M      0M      0      0      0      0

@@ -1,0 +1,20 @@
+node01
+     Mom = node01
+     state = free
+     pcpus = 32
+     resources_available.ncpus = 32
+     resources_available.ngpus = 2
+     resources_available.mem = 128gb
+     resources_available.gputype = H100
+     resources_available.Qlist = workq
+     resources_assigned.ncpus = 0
+     resources_assigned.ngpus = 0
+
+node02
+     Mom = node02
+     state = offline
+     comment = drained for maintenance
+     resources_available.ncpus = 32
+     resources_available.mem = 128gb
+     resources_available.Qlist = workq
+     resources_assigned.ncpus = 0

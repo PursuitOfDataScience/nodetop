@@ -1,0 +1,10 @@
+{"apiVersion":"v1","kind":"List","items":[
+ {"metadata":{"name":"gpu-quota","namespace":"research"},
+  "status":{"hard":{"requests.nvidia.com/gpu":"4","requests.cpu":"64",
+                    "requests.memory":"512Gi"},
+            "used":{"requests.nvidia.com/gpu":"10"}}},
+ {"metadata":{"name":"tighter-gpu","namespace":"research"},
+  "status":{"hard":{"requests.nvidia.com/gpu":"2"},"used":{}}},
+ {"metadata":{"name":"default-quota","namespace":"default"},
+  "status":{"hard":{"requests.cpu":"8","requests.memory":"16Gi"},"used":{}}}
+]}

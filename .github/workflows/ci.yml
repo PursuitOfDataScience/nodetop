@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Ruff and mypy give the same verdict on every interpreter, so they run once;
+  # the matrix below is for the code, not the linters.
+  lint:
+    name: Lint & types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: mypy src
+
+  test:
+    name: Test (py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # The interactive layer is the one part that is genuinely
+          # platform-specific -- termios, tty, pty -- so it is exercised on macOS
+          # too. Everything else is stdlib parsing and arithmetic.
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # No scheduler is installed on the runner, and that is the point: every
+      # test drives a recorded runner, so a suite that needs a live control
+      # plane would fail here rather than on somebody's laptop.
+      - name: Test with pytest
+        run: >
+          python -m pytest -q
+          --cov=nodetop --cov-report=xml --cov-report=term
+          --cov-fail-under=85
+
+      - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+  # The packaging is checked on every push, not only at release. A metadata
+  # mistake is cheap to fix now and unfixable after a version is burned on PyPI.
+  package:
+    name: Build & check the distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+      - run: twine check --strict dist/*
+
+      # The console scripts are the whole interface, so install the built wheel
+      # into a clean environment and run them. `pip install -e` masks a missing
+      # entry point or a package-data mistake; this does not.
+      - name: Install the wheel and run it
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install --no-index dist/*.whl
+          /tmp/fresh/bin/nodetop --version
+          /tmp/fresh/bin/nt --version
+          /tmp/fresh/bin/nodetop backends
+          /tmp/fresh/bin/python -c "import nodetop; print(nodetop.__doc__.splitlines()[0])"

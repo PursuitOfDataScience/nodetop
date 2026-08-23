@@ -1,0 +1,12 @@
+qname                 all.q
+hostlist              @allhosts
+seq_no                0
+load_thresholds       np_load_avg=1.75
+suspend_thresholds    NONE
+priority              0
+qtype                 BATCH INTERACTIVE
+user_lists            gpu_users
+xuser_lists           NONE
+h_rt                  48:00:00
+s_rt                  INFINITY
+h_vmem                INFINITY

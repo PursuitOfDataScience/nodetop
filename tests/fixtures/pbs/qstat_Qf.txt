@@ -1,0 +1,39 @@
+Queue: gpuq
+    queue_type = Execution
+    Priority = 100
+    total_jobs = 12
+    state_count = Transit:0 Queued:8 Held:0 Waiting:0 Running:4 Exiting:0 Begun:0
+    resources_max.walltime = 48:00:00
+    resources_max.ncpus = 256
+    resources_default.walltime = 01:00:00
+    max_run_res.ngpus = [u:PBS_GENERIC=8]
+    max_run = [u:PBS_GENERIC=4]
+    acl_user_enable = True
+    acl_users = alice,bob,carol
+    enabled = True
+    started = True
+
+Queue: cpuq
+    queue_type = Execution
+    Priority = 50
+    resources_max.walltime = 24:00:00
+    enabled = True
+    started = True
+
+Queue: drainq
+    queue_type = Execution
+    resources_max.walltime = 24:00:00
+    enabled = True
+    started = False
+
+Queue: closedq
+    queue_type = Execution
+    enabled = False
+    started = False
+
+Queue: emptyaclq
+    queue_type = Execution
+    acl_user_enable = True
+    acl_users =
+    enabled = True
+    started = True

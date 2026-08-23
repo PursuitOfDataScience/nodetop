@@ -1,0 +1,7 @@
+qname                 cpu.q
+hostlist              @cpuhosts
+priority              0
+qtype                 BATCH
+user_lists            NONE
+xuser_lists           NONE
+h_rt                  24:00:00

@@ -1,0 +1,42 @@
+QUEUE: gpu
+  -- For GPU workloads
+
+PARAM: PRIO NICE STATUS          MAX JL/U JL/P JL/H NJOBS  PEND   RUN RSV SSUSP USUSP  RSV
+       50    20  Open:Active       -    8    -    -    24    20     4   0     0     0    0
+
+RUNLIMIT
+ 2880.0 min
+
+USERS: alice bob carol
+HOSTS:  gpu-01 gpu-02 gpu-03 gpu-04
+MAX_JOBS_PER_USER: 12
+
+QUEUE: normal
+  -- Default queue
+
+PARAM: PRIO NICE STATUS          MAX JL/U JL/P JL/H NJOBS  PEND   RUN RSV SSUSP USUSP  RSV
+       30    20  Open:Active       -    -    -    -     0     0     0   0     0     0    0
+
+RUNLIMIT
+ 1440.0 min
+
+USERS: all users
+HOSTS: all
+
+QUEUE: frozen
+  -- Accepts work but dispatches nothing
+
+PARAM: PRIO NICE STATUS          MAX JL/U JL/P JL/H NJOBS  PEND   RUN RSV SSUSP USUSP  RSV
+       10    20  Open:Inact        -    -    -    -   140   140     0   0     0     0    0
+
+USERS: all users
+HOSTS: all
+
+QUEUE: shut
+  -- Closed to submission
+
+PARAM: PRIO NICE STATUS          MAX JL/U JL/P JL/H NJOBS  PEND   RUN RSV SSUSP USUSP  RSV
+       10    20  Closed:Active     -    -    -    -     0     0     0   0     0     0    0
+
+USERS: all users
+HOSTS: all
