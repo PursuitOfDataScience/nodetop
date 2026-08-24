@@ -301,11 +301,46 @@ class Cluster:
         Systems overwhelmingly name a queue's limit set after the queue, so
         that is the fallback; a dry-run's ``effective_qos`` is more reliable
         and takes precedence wherever one is available.
+
+        Where the queue declares no limit set and none is named after it, the
+        ceiling that binds is the caller's OWN -- and missing it is a false
+        "runs now". Measured on a Slurm 25.11 cluster whose `standard`
+        partition has `QoS=N/A` while the caller's association carries
+        `DefaultQOS=clay`, `MaxTRESPerJob=cpu=16,node=1`: a 32-CPU job was
+        reported as RUN NOW there, and the dry-run agreed with it, because
+        `sbatch --test-only` does not check QOS ceilings either. Both H100
+        partitions, which *do* declare a QOS, were correctly marked over the
+        limit -- so the tool caught the same ceiling wherever the partition
+        happened to name it and missed it wherever the account did.
         """
         q = self.queues.get(queue)
         if q is not None and q.limits_name and q.limits_name in self.limits:
             return self.limits[q.limits_name]
-        return self.limits.get(queue)
+        by_name = self.limits.get(queue)
+        if by_name is not None:
+            return by_name
+        return self.caller_limits()
+
+    def caller_limits(self) -> Limits | None:
+        """The limit set the caller's own jobs run under, if it is knowable.
+
+        A published default is the answer; failing that, a caller holding
+        exactly one limit set runs under it. Anything else -- several sets and
+        no default -- is genuinely ambiguous, since the job picks one at submit
+        time, and inventing a ceiling for a queue is worse than reporting none:
+        it rules out a placement that would have worked. Clusters that name a
+        QOS after every partition land here with ~90 of them and are left
+        alone, which is correct -- there the queue-named lookup above already
+        found the one that binds.
+        """
+        ident = self.identity
+        if ident is None:
+            return None
+        if ident.default_qos:
+            return self.limits.get(ident.default_qos)
+        if len(ident.qos) == 1:
+            return self.limits.get(ident.qos[0])
+        return None
 
     def effective_max_walltime(self, queue: str) -> int | None:
         """The wall limit that will actually bite, in seconds.

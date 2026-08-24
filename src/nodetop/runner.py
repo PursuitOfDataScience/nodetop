@@ -147,6 +147,18 @@ class RecordedRunner(Runner):
         self._responses = responses
         self.calls: list[list[str]] = []
 
+    @staticmethod
+    def _signature(text: str) -> tuple[str, ...]:
+        """The program and its sub-command, with every flag and value dropped.
+
+        ``scontrol show node --all --oneliner`` and ``scontrol show node
+        --oneliner`` reduce to the same thing, which is the point: see
+        :meth:`_lookup`.
+        """
+        return tuple(
+            w for w in text.split() if not w.startswith("-") and "=" not in w
+        )
+
     def _lookup(self, cmd: Sequence[str]) -> tuple[int, str, str]:
         self.calls.append(list(cmd))
         joined = " ".join(cmd)
@@ -154,6 +166,30 @@ class RecordedRunner(Runner):
         for key in sorted(self._responses, key=len, reverse=True):
             if key in joined:
                 return self._responses[key]
+        # Nothing matched literally, so try again ignoring flags -- but only
+        # where that is unambiguous.
+        #
+        # A snapshot is recorded under the exact argv of the version that took
+        # it, and adding one flag to a query orphans every recording of it.
+        # Measured: teaching the node query `--all` made an hour-old snapshot
+        # replay as "every query failed, so there is nothing to report -- this
+        # is not an empty cluster", which is a claim about the cluster, from a
+        # file that holds a complete and healthy picture of it. Snapshots
+        # travel between machines and versions -- that is what they are for --
+        # so a flag added on either side must not invalidate one.
+        #
+        # The ambiguity check is what makes this safe rather than merely
+        # convenient: every per-queue dry-run in a snapshot differs from its
+        # siblings ONLY in flags (`--partition=`, `--account=`), so they all
+        # share a signature. Answering one of those from another's recording
+        # would put a verdict under the wrong queue's name -- a wrong answer,
+        # where failing to find it is only a missing one. Several candidates
+        # therefore means no match, exactly as before.
+        want = self._signature(joined)
+        if want:
+            hits = [k for k in self._responses if self._signature(k) == want]
+            if len(hits) == 1:
+                return self._responses[hits[0]]
         raise CommandError(list(cmd), 127, f"no recorded response for {joined!r}")
 
     def run(  # `timeout` unused here but required by the interface

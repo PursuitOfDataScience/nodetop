@@ -6,7 +6,7 @@ import pytest
 from fixtures.slurm import probe_outputs as po
 
 from nodetop.backends.slurm import SlurmBackend, parse_probe, parse_slurm_duration
-from nodetop.core.model import JobShape, VerdictCategory
+from nodetop.core.model import JobShape, Queue, VerdictCategory
 from nodetop.runner import RecordedRunner
 
 B1 = "gn-0001"
@@ -57,11 +57,103 @@ class TestNodes:
         n = {x.name: x for x in slurm_backend.load_nodes()}[DEGRADED]
         assert n.reason.startswith("maintenance: hardware issue")
 
+    @pytest.mark.parametrize("state", ["DOWN*", "DOWN+NOT_RESPONDING"])
+    def test_either_spelling_of_lost_contact_is_read(self, state):
+        # One fact, two spellings, and a Slurm version picks. `sinfo` writes the
+        # `*` suffix on every release, but `scontrol show node` -- what this
+        # backend reads -- writes `+NOT_RESPONDING` on 25.11 and no `*`
+        # anywhere in the record: `grep -c '*'` over every node came back 0.
+        # Reading only the marker left a node 23 days out of contact looking
+        # merely DOWN, and "the control plane has lost contact with this node"
+        # could not be said on that cluster at all.
+        n = SlurmBackend(RecordedRunner({
+            "scontrol show node": (
+                0, f"NodeName=n1 CPUTot=8 State={state} Partitions=p\n", ""),
+        })).load_nodes()[0]
+        assert n.unreachable is True
+        assert n.schedulable is False
+
     def test_accelerator_ness_is_from_gres_not_hostname(self, slurm_backend):
         # This host sits among 44 accelerator nodes and has none.
         n = {x.name: x for x in slurm_backend.load_nodes()}[BIGMEM]
         assert n.name.startswith("gn")
         assert n.is_gpu_node is False
+
+
+class TestPlannedIsAPlanNotAnOutage:
+    """`PLANNED` is the backfill scheduler's intent, not a node's condition.
+
+    Slurm writes it on a node it means to hand to a queued job -- `sinfo`'s `-`
+    suffix, beside `*` for unreachable and `$` for a maintenance reservation --
+    and goes on running work there and placing more. Reading it as MAINT is how
+    a healthy node becomes an outage: on a Slurm 25.11 cluster two
+    `MIXED+PLANNED` H100 nodes, all 8 GPUs allocated to other people's running
+    jobs, were reported as "all 2 nodes are down, drained or unreachable", both
+    their partitions were struck out as ALL_NODES_UNSCHEDULABLE, and
+    `accelerators` announced "no GPUs found in this cluster" one line under a
+    header counting 8 of them.
+    """
+
+    def _node(self, state: str):
+        return SlurmBackend(RecordedRunner({
+            "scontrol show node": (
+                0,
+                f"NodeName=mgpu03 CPUTot=64 CPUAlloc=28 RealMemory=8000 AllocMem=2000 "
+                f"Gres=gpu:h100:4 AllocTRES=cpu=28,mem=2000M,gres/gpu=1 "
+                f"State={state} Partitions=gpu\n",
+                "",
+            ),
+            "scontrol show config": (
+                0, "SelectTypeParameters    = CR_CORE_MEMORY\n", ""),
+        })).load_nodes()[0]
+
+    def test_a_planned_node_still_takes_work(self):
+        n = self._node("MIXED+PLANNED")
+        assert n.state_raw == "MIXED+PLANNED"   # verbatim, so the reader sees it
+        assert n.schedulable is True
+        assert n.cpus_free == 36
+        assert n.gpus_total == 4
+        assert n.effective_free_gpus == 3
+
+    def test_the_flag_is_carried_but_blocks_nothing(self):
+        # Informational, not dropped: "why is this idle node not filling up?"
+        # is a question the flag answers, and `--json` hands it over.
+        assert self._node("MIXED+PLANNED").conditions == frozenset({"PLANNED"})
+        assert self._node("IDLE+PLANNED").schedulable is True
+
+    @pytest.mark.parametrize("state", ["MIXED+MAINT", "MIXED+DRAIN", "DOWN+PLANNED"])
+    def test_a_real_condition_alongside_it_still_counts(self, state):
+        # The flag is not a blanket amnesty: PLANNED riding along with a state
+        # that does block must not rescue the node.
+        assert self._node(state).schedulable is False
+
+    @pytest.mark.parametrize("state", [
+        # `man sinfo`, verbatim: "not capable of running any jobs".
+        "IDLE+POWERED_DOWN",
+        # "blocked by exclusive topo job"
+        "IDLE+BLOCKED",
+        # "rendering this node as not usable for any other jobs"
+        "MIXED+PERFCTRS",
+        # "A reboot request has been sent to the agent"
+        "IDLE+REBOOT_ISSUED",
+    ])
+    def test_a_flag_that_means_not_usable_is_not_read_as_room(self, state):
+        # An unmapped flag fails in the expensive direction: it contributes no
+        # condition, so the node stays schedulable and its idle cores are
+        # offered as room. A powered-down node advertises a full complement of
+        # both while being, in `man sinfo`'s words, "not capable of running any
+        # jobs".
+        n = self._node(state)
+        assert n.schedulable is False, n.state_raw
+        queue = Queue(name="p", nodes=[n], node_names=(n.name,))
+        assert queue.effective_free_cpus == 0
+        assert queue.effective_free_gpus == 0
+
+    def test_powering_up_is_still_somewhere_to_send_work(self):
+        # The one powersave state Slurm does place work on. Calling it
+        # unschedulable would erase real capacity on any cluster that cycles
+        # nodes; the job waits for the boot instead.
+        assert self._node("IDLE+POWERING_UP").schedulable is True
 
 
 class TestMemoryIsAConsumableResourceOrItIsNot:
@@ -335,6 +427,37 @@ class TestProbeAccepted:
         assert v.allowed is True
         assert v.predicted_nodes == ("cn-0278",)
 
+    @pytest.mark.parametrize("line,nodes", [
+        # Slurm 25.11, byte for byte off `cat -A`: a stray `a` sits between the
+        # timestamp and `using`. One sentence-shaped regex matched the time,
+        # failed at `using`, and dropped the nodelist with it -- so `check`
+        # reported a confirmed start and `predicted_nodes: []` on every
+        # accepted probe on that cluster.
+        ("sbatch: Job 556812 to start at 2026-08-24T17:32:50 a using 1 processors "
+         "on nodes mcn53 in partition standard", ("mcn53",)),
+        ("sbatch: Job 556813 to start at 2026-08-24T17:32:50 a using 2 processors "
+         "on nodes mcn[52-53] in partition standard", ("mcn52", "mcn53")),
+        # The older wording has to keep working: this is a tolerance, not a
+        # migration.
+        ("sbatch: Job 42 to start at 2026-08-24T17:32:50 using 1 processors "
+         "on nodes mcn53 in partition standard", ("mcn53",)),
+        # And a line that says only when, which Slurm also emits.
+        ("sbatch: Job 42 to start at 2026-08-24T17:32:50", ()),
+    ])
+    def test_the_prediction_survives_a_reworded_sentence(self, line, nodes):
+        v = _parse(line, rc=0)
+        assert v.allowed is True
+        assert v.predicted_start.isoformat() == "2026-08-24T17:32:50"
+        assert v.predicted_nodes == nodes
+
+    def test_a_nodelist_from_another_line_is_not_borrowed(self):
+        # Three facts are read off the line the verdict is on, so an unrelated
+        # sentence mentioning nodes cannot be attributed to this prediction.
+        v = _parse(
+            "sbatch: Job 42 to start at 2026-08-24T17:32:50\n"
+            "sbatch: some other note on nodes mcn99\n", rc=0)
+        assert v.predicted_nodes == ()
+
 
 class TestTwoLayerDisagreement:
     """The case a single-source check gets exactly backwards."""
@@ -480,7 +603,7 @@ class TestIdentityQuery:
         runner = RecordedRunner({"sacctmgr": (0, "", "")})
         SlurmBackend(runner).load_identity()
         argv = next(c for c in runner.calls if c[0] == "sacctmgr")
-        assert "format=Account,Partition,QOS" in argv
+        assert "format=Account,Partition,QOS,DefaultQOS" in argv
 
     def test_a_rejected_query_is_raised_not_swallowed(self):
         # It used to return an empty identity, and that is indistinguishable
@@ -519,6 +642,29 @@ class TestIdentityQuery:
         assert set(ident.accounts) == {"acct-a", "acct-b"}
         assert "gn" in ident.qos
         assert ident.entitlements_look_templated is True
+
+    def _ident(self, dump):
+        return SlurmBackend(RecordedRunner({"sacctmgr": (0, dump, "")})).load_identity()
+
+    def test_the_default_qos_is_read_because_it_sets_the_ceilings(self):
+        # The set a job runs under when it names none, so it is the set whose
+        # MaxTRES decides whether the job is accepted -- and on a cluster whose
+        # partitions declare no QOS it is the only one that does.
+        ident = self._ident("basic||clay|clay\nstaff|||\n")
+        assert ident.default_qos == "clay"
+
+    def test_two_accounts_disagreeing_yields_no_default(self):
+        # Different ceilings per account and no way to know which the job will
+        # use: naming one would invent a limit for the other.
+        assert self._ident("a||x,y|x\nb||x,y|y\n").default_qos is None
+
+    def test_the_older_three_column_answer_still_parses(self):
+        # The field is read positionally, so an install that does not know the
+        # column must not disturb the three before it.
+        ident = self._ident("acct-a||gn,wide\n")
+        assert ident.default_qos is None
+        assert set(ident.qos) == {"gn", "wide"}
+        assert ident.accounts == ("acct-a",)
 
 
 class TestLocalGroupLookupIsAllOrNothing:

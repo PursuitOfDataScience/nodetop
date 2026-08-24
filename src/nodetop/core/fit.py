@@ -535,6 +535,11 @@ def _limits_for(cluster, queue: Queue, shape: JobShape, verdict: Verdict | None)
     Preference order matters: the control plane's *chosen* QOS beats the one
     we asked for, because sites routinely auto-promote and checking the
     requested name checks the wrong ceilings.
+
+    The caller's own set comes last and matters most where nothing above it
+    hits: a queue with `QoS=N/A` on a cluster whose limits hang off the
+    association has no ceiling under any of the four names above, and reporting
+    none is a false "runs now" -- see :meth:`Cluster.caller_limits`.
     """
     for key in (
         verdict.effective_qos if verdict else None,
@@ -544,7 +549,10 @@ def _limits_for(cluster, queue: Queue, shape: JobShape, verdict: Verdict | None)
     ):
         if key and key in cluster.limits:
             return cluster.limits[key]
-    return None
+    # Not when the job named a QOS that this cluster does not publish: the
+    # request said which ceilings to check, and substituting the caller's
+    # default would answer about a different one.
+    return None if shape.qos else cluster.caller_limits()
 
 
 def rank(

@@ -1138,6 +1138,46 @@ labels and none of them said which resource it belonged to. Now every column nam
 `cpu free`, `mem free`, `gpu free`, with the meter unlabelled beside the number it draws, in
 the same order the overview's table uses.
 
+### 7. A scheduler's vocabulary is versioned, and an unknown word reads as "fine"
+
+Everything above was found on one Slurm cluster. Taken to a second one -- same scheduler,
+Slurm **25.11** against the first site's older build, a different site's conventions -- six
+defects surfaced in an hour, and five were the same shape: a state or a sentence this
+version spells differently, met by a parser that had no case for it and therefore said
+nothing was wrong.
+
+| what the cluster said | what nodetop made of it | cost |
+|---|---|---|
+| `State=MIXED+PLANNED` on two H100 nodes | "all 2 nodes are down, drained or unreachable" | both GPU partitions struck out, all **8 H100s erased** from the inventory, `where -g 4` answered "no partition can run this shape" |
+| `State=DOWN+NOT_RESPONDING` (no `*` anywhere in the record) | merely DOWN | a node **23 days** out of contact, and "the control plane has lost contact" unsayable on that cluster |
+| a hidden partition's node, absent from a node query without `--all` | "1 node claimed but unresolved" | 31 nodes where the cluster has 32; that partition reported no capacity at all |
+| `to start at <time> a using 1 processors on nodes mcn53` | start time kept, nodelist dropped | `predicted_nodes: []` on **every** accepted dry-run -- the one thing only a dry-run knows |
+| `QoS=N/A` on the partition, `DefaultQOS=clay` on the association, `MaxTRESPerJob=cpu=16` | no ceiling found | a 32-CPU job reported **RUN NOW**; `--test-only` agrees, because it does not check QOS ceilings either |
+
+The direction of each failure is the point. An unrecognised *blocking* state contributes no
+condition, so the node stays schedulable and its idle cores are counted as room -- phantom
+capacity, from the tool written to find phantom capacity. An unrecognised *harmless* state
+mapped onto a blocking one does the reverse and is louder: it deletes hardware that is
+running other people's jobs right now.
+
+So the node-state table is now read off `man sinfo`'s NODE STATE CODES rather than off
+whatever one cluster happens to have set, and every code whose wording is "not usable" or
+"not capable of running any jobs" is mapped even where no cluster to hand has one:
+`POWERED_DOWN`, `BLOCKED`, `PERFCTRS`/`NPC`, `REBOOT_ISSUED`. `PLANNED` is carried as an
+informational condition -- it is the backfill scheduler's *plan*, not an outage -- and
+`POWERING_UP` is deliberately left schedulable, because that is the one powersave state
+Slurm does place work on.
+
+Two smaller lessons, same root:
+
+* **Ask both lists at the same visibility.** Partitions were fetched with `--all` and nodes
+  without it, so the two disagreed about what the cluster contained. Slurm applies the
+  hidden-partition filter to both, and `scontrol show node <name>` hides the node too, so
+  there is no way to recover it afterwards.
+* **Read a sentence as its facts, not as a sentence.** One chained regex over
+  `Job N to start at T using P processors on nodes L` lost `P` and `L` the moment 25.11 put
+  a stray token after `T`. Three patterns against that one line cannot fail that way.
+
 ### 1k. One window, whatever is in it
 
 The frame sized itself to its content, which is right for a printout and wrong for a

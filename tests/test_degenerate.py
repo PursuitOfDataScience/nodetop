@@ -131,6 +131,45 @@ class TestEmptyClusterIsTreatedAsAFinding:
         assert "no queue can run this shape" in out
 
 
+class TestGpusYouCannotReachAreNotAbsentGpus:
+    """"None" and "none for you" are different answers, and one is a lie.
+
+    Observed on a cluster whose only accelerators sat in two partitions closed
+    to the caller: the inventory header counted "0 GPUs of 8 on the cluster"
+    and the note one line below it said "no GPUs found in this cluster".
+    """
+
+    CLOSED = _cluster(
+        [_node("c1"), _node("g1", gpus=8)],
+        [Queue(name="open", node_names=("c1",)),
+         Queue(name="theirs", node_names=("g1",), enabled=False)],
+    )
+
+    def test_it_says_where_they_are_instead_of_denying_them(self):
+        _, out = _run(self.CLOSED, ["accelerators"])
+        text = " ".join(out.split())
+        assert "no GPUs found in this cluster" not in text
+        assert "8 GPUs on this cluster" in text
+        assert "theirs" in text
+        assert "--all" in text        # and what to type to see them anyway
+
+    def test_all_shows_them(self):
+        _, out = _run(self.CLOSED, ["accelerators", "--all"])
+        assert "8 GPUs" in out
+        assert "no GPUs" not in out
+
+    def test_a_queue_with_none_of_them_says_so_without_generalising(self):
+        _, out = _run(self.CLOSED, ["accelerators", "-q", "open"])
+        text = " ".join(out.split())
+        assert "no GPUs in that queue" in text
+        assert "the cluster has 8 elsewhere" in text
+
+    def test_a_cluster_with_no_gpus_at_all_still_says_that(self):
+        # The old message was not wrong everywhere -- only where it was.
+        _, out = _run(SHAPES["one node one queue"], ["accelerators"])
+        assert "no GPUs found in this cluster" in " ".join(out.split())
+
+
 class TestGrammar:
     def test_one_queue_is_not_reported_as_one_queues(self):
         _, out = _run(SHAPES["one node one queue"], ["where", "-c", "1"])
@@ -141,8 +180,12 @@ class TestGrammar:
 class TestScale:
     """Ten thousand nodes is a real cluster, not a stress test."""
 
+    # A classmethod, because a class-scoped fixture written as an instance
+    # method runs once against a throwaway instance -- pytest 9 deprecates it
+    # and pytest 10 removes it.
     @pytest.fixture(scope="class")
-    def big(self):
+    @classmethod
+    def big(cls):
         nodes = [_node(f"n{i:05d}", gpus=4 if i % 3 == 0 else 0) for i in range(10_000)]
         queue = Queue(name="big", node_names=tuple(n.name for n in nodes))
         return _cluster(nodes, [queue])

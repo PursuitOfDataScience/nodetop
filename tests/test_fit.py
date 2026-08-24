@@ -391,6 +391,69 @@ class TestAJobsShareOfOneNode:
         assert "allocations" in cl.errors
 
 
+class TestTheCallersOwnCeilingCounts:
+    """A queue that declares no limit set does not mean there is no limit.
+
+    Where the partition says `QoS=N/A` the ceiling that bites is the one on the
+    caller's association, and reading only the queue reports a job as RUN NOW
+    that the scheduler will refuse. The dry-run is no help: `sbatch
+    --test-only` does not check QOS ceilings either, so both agree, and both
+    are wrong. Measured on a Slurm 25.11 cluster: `DefaultQOS=clay`,
+    `MaxTRESPerJob=cpu=16,node=1`, a 32-CPU job called RUN NOW on `standard`
+    while the same ceiling WAS reported on the two partitions that happened to
+    name a QOS of their own.
+    """
+
+    CLAY = Limits(name="clay", per_job={"cpu": 16, "node": 1})
+    WIDE = Limits(name="wide", per_job={"cpu": 256})
+
+    def _cl(self, queue: Queue, ident: Identity):
+        return _cluster([queue], limits={"clay": self.CLAY, "wide": self.WIDE},
+                        identity=ident)
+
+    def test_the_published_default_applies_where_the_queue_names_nothing(self):
+        cl = self._cl(Queue(name="standard"),
+                      Identity(user="u", qos=("clay", "wide"), default_qos="clay"))
+        assert cl.limits_for("standard") is self.CLAY
+
+    def test_a_sole_limit_set_applies_even_unpublished(self):
+        # No DefaultQOS column, one QOS: there is nothing else it could be.
+        cl = self._cl(Queue(name="standard"), Identity(user="u", qos=("clay",)))
+        assert cl.limits_for("standard") is self.CLAY
+
+    def test_the_queues_own_limit_set_still_wins(self):
+        cl = self._cl(Queue(name="gpu", limits_name="wide"),
+                      Identity(user="u", qos=("clay",)))
+        assert cl.limits_for("gpu") is self.WIDE
+
+    def test_a_set_named_after_the_queue_still_wins(self):
+        cl = self._cl(Queue(name="clay"), Identity(user="u", qos=("wide",)))
+        assert cl.limits_for("clay") is self.CLAY
+
+    def test_several_sets_and_no_default_invents_nothing(self):
+        # The clusters that name a QOS after every partition arrive here
+        # holding ~90 of them; the job picks one at submit time and guessing
+        # would rule out a placement that works.
+        cl = self._cl(Queue(name="standard"),
+                      Identity(user="u", qos=("clay", "wide")))
+        assert cl.limits_for("standard") is None
+
+    def test_no_identity_at_all_invents_nothing(self):
+        assert self._cl(Queue(name="standard"), None).limits_for("standard") is None
+
+    def test_the_ceiling_reaches_the_placement_verdict(self):
+        # The point of all of the above: the blocker has to show up in `where`,
+        # named after the set it came from.
+        cl = self._cl(Queue(name="standard", nodes=[_node("n1")],
+                            node_names=("n1",)),
+                      Identity(user="u", qos=("clay",)))
+        p = evaluate(cl, JobShape(nodes=1, cpus_per_task=32), cl.queues["standard"])
+        codes = [b.code for b in p.blockers]
+        assert "MAX_CPU_JOB" in codes
+        assert any("clay" in b.detail for b in p.blockers)
+        assert p.runnable_now is False
+
+
 class TestClusterHelpers:
     def test_effective_walltime_takes_the_tighter_of_two(self):
         # A queue reporting no limit while its limit set caps the real ceiling

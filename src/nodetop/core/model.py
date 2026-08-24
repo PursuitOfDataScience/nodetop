@@ -926,6 +926,12 @@ class Identity:
     accounts: tuple[str, ...] = ()
     qos: tuple[str, ...] = ()
     groups: tuple[str, ...] = ()
+    #: The limit set a job of yours runs under when it names none -- Slurm's
+    #: association ``DefaultQOS``, and whatever each other scheduler calls the
+    #: same idea.  ``None`` where the system does not publish one.  This is not
+    #: an access fact like the fields above it: it says which *ceilings* apply,
+    #: which is why :meth:`Cluster.limits_for` reaches for it.
+    default_qos: str | None = None
     #: account -> queues the scheduler associates with it.
     account_queues: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
     #: True when every account claims an identical queue list -- a strong hint
@@ -951,6 +957,7 @@ class Identity:
         account_queues: dict[str, set[str]],
         qos: Iterable[str] = (),
         groups: Iterable[str] = (),
+        default_qos: str | None = None,
     ) -> Identity:
         """Build an identity and run the templated-entitlements check."""
         lists = [frozenset(v) for v in account_queues.values() if v]
@@ -959,6 +966,7 @@ class Identity:
             accounts=tuple(account_queues),
             qos=tuple(sorted(set(qos))),
             groups=tuple(sorted(set(groups))),
+            default_qos=default_qos,
             account_queues={k: tuple(sorted(v)) for k, v in account_queues.items()},
             entitlements_look_templated=len(lists) > 1 and len(set(lists)) == 1,
         )

@@ -113,6 +113,19 @@ class TestKnownArgvShapes:
                 fmt = argv[argv.index("-o") + 1]
                 assert "|" in fmt
 
+    def test_slurm_asks_for_nodes_and_partitions_at_the_same_visibility(self):
+        # Slurm applies the hidden-partition filter to BOTH lists, so asking
+        # for one with `--all` and the other without makes the two disagree
+        # about what the cluster contains: the partition list named a member
+        # the node list did not mention, and that partition reported "1 node
+        # claimed but unresolved" with no capacity. Measured on a live cluster:
+        # 31 nodes plain, 32 with the flag.
+        rec = _exercise("slurm")
+        for what in ("node", "partition"):
+            argv = next(c for c in rec.calls
+                        if c[:3] == ["scontrol", "show", what])
+            assert "--all" in argv, f"{what} query is narrower: {argv}"
+
     def test_every_dry_run_carries_its_no_op_flag(self):
         # The flag that keeps a probe read-only must never be optional.
         expected = {

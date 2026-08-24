@@ -63,14 +63,50 @@ _ALL = frozenset({"all", "(null)", ""})
 
 #: Slurm state flags meaning "will not accept new work", mapped onto the
 #: neutral conditions in :mod:`nodetop.core.model`.
+#:
+#: ``PLANNED`` is deliberately absent, and the omission is load-bearing: it is
+#: the backfill scheduler saying "I intend to use this node for a queued job",
+#: which is a *plan*, not an outage. Slurm keeps running work there and keeps
+#: placing more (sinfo writes it as the ``-`` suffix, alongside ``*`` for
+#: unreachable and ``$`` for a maintenance reservation). Reading it as MAINT
+#: cost two H100 nodes on a Slurm 25.11 cluster: ``MIXED+PLANNED``, 8 GPUs
+#: allocated to other people's running jobs, reported as "all 2 nodes are
+#: down, drained or unreachable", their partition marked
+#: ALL_NODES_UNSCHEDULABLE and every GPU on the cluster erased from the
+#: inventory -- `accelerators` said "no GPUs found in this cluster" one line
+#: under a header counting 8 of them.
+#: The rest of the table is read off `man sinfo`'s NODE STATE CODES rather than
+#: off one cluster's output, because an unknown flag fails silently in the
+#: expensive direction: it contributes no condition, the node stays
+#: "schedulable", and its idle cores are reported as room. Every entry below
+#: whose wording is "not usable"/"not capable of running any jobs" is therefore
+#: mapped, even where no cluster to hand has one set.
 _FLAG_TO_CONDITION = {
     "DRAIN": "DRAIN", "DRAINING": "DRAIN", "DRAINED": "DRAIN",
     "FAIL": "FAIL", "FAILING": "FAIL",
-    "MAINT": "MAINT", "PLANNED": "MAINT",
-    "REBOOT": "MAINT", "REBOOT_REQUESTED": "MAINT",
+    "MAINT": "MAINT",
+    "REBOOT": "MAINT", "REBOOT_REQUESTED": "MAINT", "REBOOT_ISSUED": "MAINT",
     "POWER_DOWN": "POWERSAVE", "POWERING_DOWN": "POWERSAVE",
+    # "currently powered down and not capable of running any jobs" -- the
+    # sibling of the two above, and the one that actually advertises a full
+    # complement of idle CPUs and memory while doing it.
+    "POWERED_DOWN": "POWERSAVE",
+    # "blocked by exclusive topo job" and "Network Performance Counters ... in
+    # use, rendering this node as not usable for any other jobs": someone
+    # else's exclusive claim on a node that is otherwise up, which is what
+    # RESERVED means here. `sinfo` prints the second as `PERFCTRS (NPC)`, so
+    # both spellings are taken.
+    "BLOCKED": "RESERVED", "PERFCTRS": "RESERVED", "NPC": "RESERVED",
     "RESERVED": "RESERVED", "INVAL": "UNKNOWN",
 }
+#: Flags worth carrying into the model without blocking anything: they change
+#: what a reader should expect, not whether the node accepts work.
+#:
+#: ``POWERING_UP`` is absent from both tables on purpose. It is the one
+#: powersave state Slurm places work on -- that is what powering up is *for* --
+#: so calling it unschedulable would erase real capacity on any cluster that
+#: cycles nodes, and the job it would have hidden simply waits for the boot.
+_FLAG_TO_NOTE = {"PLANNED": "PLANNED"}
 _BASE_TO_CONDITION = {
     "DOWN": "DOWN", "UNKNOWN": "UNKNOWN", "FUTURE": "DOWN",
     "DRAIN": "DRAIN", "ERROR": "FAIL", "INVAL": "UNKNOWN",
@@ -361,6 +397,8 @@ class SlurmBackend:
             for flag in flags:
                 if flag in _FLAG_TO_CONDITION:
                     conditions.add(_FLAG_TO_CONDITION[flag])
+                elif flag in _FLAG_TO_NOTE:
+                    conditions.add(_FLAG_TO_NOTE[flag])
 
             labels = f.get("ActiveFeatures") or f.get("AvailableFeatures") or ""
             gres = f.get("Gres", "")
@@ -382,14 +420,30 @@ class SlurmBackend:
                     labels=tuple(t.strip() for t in labels.split(",") if t.strip()),
                     queues=tuple(expand(f.get("Partitions", ""))),
                     reason=reason,
-                    unreachable="*" in state,
+                    # Two spellings of one fact, and a Slurm version decides
+                    # which you get. `sinfo` writes the `*` suffix on every
+                    # release; `scontrol show node` -- what this backend reads
+                    # -- writes `+NOT_RESPONDING` on 25.11 and no `*` anywhere
+                    # in the record. Reading only the marker made "the control
+                    # plane has lost contact with this node" unsayable there:
+                    # a node down for 23 days looked merely DOWN.
+                    unreachable="*" in state or "NOT_RESPONDING" in flags,
                 )
             )
         return nodes
 
     def load_nodes(self) -> list[Node]:
         nodes = self.parse_nodes(
-            self.runner.run(["scontrol", "show", "node", "--oneliner"]))
+            # `--all`, to match the partition query. Without it Slurm applies
+            # the hidden-partition filter to nodes as well, so a node whose
+            # only partition is hidden is absent from the answer -- and the
+            # partition list, which DOES ask for --all, then names a member the
+            # node list never mentions. Measured: 31 nodes without the flag, 32
+            # with it, and the missing one was the sole member of a hidden
+            # partition that reported "1 node claimed but unresolved" and no
+            # capacity at all. `scontrol show node <name>` hides it too, so
+            # there is no per-node way to recover it afterwards.
+            self.runner.run(["scontrol", "show", "node", "--all", "--oneliner"]))
         if self.memory_is_consumable():
             return nodes
         return [dataclasses.replace(n, memory_consumable=False) for n in nodes]
@@ -515,6 +569,7 @@ class SlurmBackend:
     def parse_identity(self, output: str, user: str) -> Identity:
         account_queues: dict[str, set[str]] = {}
         qos: set[str] = set()
+        defaults: set[str] = set()
         for line in output.splitlines():
             parts = line.split("|")
             if not parts or not parts[0].strip():
@@ -522,6 +577,10 @@ class SlurmBackend:
             acct = parts[0].strip()
             partition = parts[1].strip() if len(parts) > 1 else ""
             qos_field = parts[2].strip() if len(parts) > 2 else ""
+            # Optional, and read positionally: an older `sacctmgr` that does not
+            # know the column simply leaves the field off, which must not
+            # change the three before it.
+            default_field = parts[3].strip() if len(parts) > 3 else ""
             bucket = account_queues.setdefault(acct, set())
             if partition:
                 bucket.add(partition)
@@ -529,7 +588,15 @@ class SlurmBackend:
                 if q.strip():
                     qos.add(q.strip())
                     bucket.add(q.strip())
-        return Identity.from_account_queues(user, account_queues, qos, _unix_groups(user))
+            if default_field and default_field != "(null)":
+                defaults.add(default_field)
+        return Identity.from_account_queues(
+            user, account_queues, qos, _unix_groups(user),
+            # One default across every association, or none: two accounts whose
+            # jobs run under different ceilings have no single answer, and
+            # picking one of them would invent a limit for the other.
+            default_qos=defaults.pop() if len(defaults) == 1 else None,
+        )
 
     def load_identity(self) -> Identity:
         user = os.environ.get("USER") or getpass.getuser()
@@ -542,7 +609,7 @@ class SlurmBackend:
             # to compare against" as "no verdict".
             out = self.runner.run(
                 ["sacctmgr", "-nP", "show", "assoc", "where", f"user={user}",
-                 "format=Account,Partition,QOS"]
+                 "format=Account,Partition,QOS,DefaultQOS"]
             )
         except Exception:
             # Not swallowed into an empty identity. The comment above says why:
@@ -782,11 +849,23 @@ _PATTERNS: tuple[tuple[str, str], ...] = (
     (r"access/permission denied", VerdictCategory.ACCESS_DENIED),
 )
 
-_START = re.compile(
-    r"Job\s+(?P<jobid>\d+)\s+to start at\s+(?P<when>\S+)"
-    r"(?:\s+using\s+(?P<procs>\d+)\s+processors)?"
-    r"(?:\s+on nodes?\s+(?P<nodes>\S+))?"
-)
+# The acceptance line carries three separate facts, so it is read as three
+# separate patterns applied to that one line -- NOT as one sentence-shaped
+# regex. A single pattern makes every fact after the first hostage to the exact
+# wording between them, and that wording moves. Slurm 25.11 prints
+#
+#     sbatch: Job 556812 to start at 2026-08-24T17:32:50 a using 1 processors \
+#         on nodes mcn53 in partition standard
+#
+# -- a stray `a` after the timestamp, verified byte for byte with `cat -A`.
+# One chained regex matched the time, then failed at `using`, and both optional
+# tails fell off with it: `check` reported a confirmed start with
+# `predicted_nodes: []`, so the one thing a dry-run knows and nothing else does
+# -- which nodes the scheduler picked -- was dropped on every accepted probe on
+# that cluster, silently, while the verdict beside it still looked complete.
+_START = re.compile(r"Job\s+(?P<jobid>\d+)\s+to start at\s+(?P<when>\S+)")
+_START_PROCS = re.compile(r"using\s+(?P<procs>\d+)\s+processors")
+_START_NODES = re.compile(r"\bon nodes?\s+(?P<nodes>\S+)")
 _VERIFICATION = re.compile(r"Verification:\s*\**\s*(?P<v>PASSED|REJECTED)", re.IGNORECASE)
 _REASON = re.compile(r"^\s*Reason:\s*(?P<reason>.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 _ALLOC_FAIL = re.compile(r"allocation failure:\s*(?P<msg>.+?)\s*$", re.IGNORECASE | re.MULTILINE)
@@ -837,7 +916,20 @@ def parse_probe(
     core_msg = core_fail.group("msg").strip() if core_fail else ""
     rm = _REASON.search(clean)
     filter_reason = rm.group("reason").strip() if rm else ""
-    start = _START.search(clean)
+    # The other two facts are read from the line the start verdict is on, not
+    # from the whole message: a nodelist somewhere else in a multi-line answer
+    # is not this prediction's.
+    start = start_line = None
+    for line in clean.splitlines():
+        found = _START.search(line)
+        if found:
+            start, start_line = found, line
+            break
+    predicted_nodes: tuple[str, ...] = ()
+    if start_line:
+        on = _START_NODES.search(start_line)
+        if on:
+            predicted_nodes = tuple(expand(on.group("nodes")))
 
     # A TypedDict, not a plain one. Inference widens a plain dict of mixed
     # values to `str | Any | None`, and every `**common` splat below then checks
@@ -900,11 +992,7 @@ def parse_probe(
             allowed=True,
             category=VerdictCategory.OK,
             predicted_start=parse_timestamp(start.group("when")) if start else None,
-            predicted_nodes=(
-                tuple(expand(start.group("nodes")))
-                if start and start.group("nodes")
-                else ()
-            ),
+            predicted_nodes=predicted_nodes,
             **common,
         )
 

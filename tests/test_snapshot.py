@@ -56,6 +56,48 @@ class TestCapturingRunner:
         assert "a -b --c=d" in runner.captured
 
 
+class TestAFlagChangeDoesNotOrphanARecording:
+    """A snapshot outlives the version that took it, so replay tolerates flags.
+
+    Recordings are keyed by the exact argv of the version that captured them.
+    Teaching the Slurm node query `--all` orphaned every recording of it, and an
+    hour-old snapshot of a healthy cluster replayed as "every query failed, so
+    there is nothing to report -- this is not an empty cluster": a claim about
+    the cluster, made from a file that holds a complete picture of it.
+    """
+
+    def test_an_added_flag_still_finds_its_recording(self):
+        r = RecordedRunner({"scontrol show node --oneliner": (0, "NodeName=n1", "")})
+        assert r.run(["scontrol", "show", "node", "--all", "--oneliner"]) == "NodeName=n1"
+
+    def test_a_removed_flag_too(self):
+        r = RecordedRunner({"sacctmgr -nP show qos format=Name,MaxWall": (0, "q|", "")})
+        assert r.run(["sacctmgr", "show", "qos"]) == "q|"
+
+    def test_siblings_that_differ_only_in_flags_are_left_unmatched(self):
+        # Every per-queue dry-run in a snapshot differs from its siblings ONLY
+        # in `--partition=`/`--account=`. Answering one from another's recording
+        # would file a verdict under the wrong queue's name -- a wrong answer,
+        # where not finding it is merely a missing one.
+        from nodetop.exceptions import CommandError
+
+        r = RecordedRunner({
+            "sbatch --test-only --partition=a": (0, "queue a", ""),
+            "sbatch --test-only --partition=b": (0, "queue b", ""),
+        })
+        with pytest.raises(CommandError):
+            r.run(["sbatch", "--test-only", "--partition=c"])
+        # The exact keys still win, so the ordinary case is untouched.
+        assert r.run(["sbatch", "--test-only", "--partition=b"]) == "queue b"
+
+    def test_a_different_command_is_not_substituted(self):
+        from nodetop.exceptions import CommandError
+
+        r = RecordedRunner({"scontrol show node": (0, "nodes", "")})
+        with pytest.raises(CommandError):
+            r.run(["scontrol", "show", "partition", "--all"])
+
+
 class TestRoundTrip:
     def _snapshot(self, cluster, tmp_path, capture):
         cluster.capture = capture

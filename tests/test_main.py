@@ -222,6 +222,31 @@ class TestBackendSelection:
         capsys.readouterr()
 
 
+class TestAnOldInterpreterSaysSoInsteadOfBlamingTheCluster:
+    """The floor is stated where the failure happens.
+
+    `pip` refuses the install on an old Python, but the way this tool reaches a
+    login node is a clone and `PYTHONPATH=src python3 -m nodetop` -- and
+    `python3` there is whatever the distribution ships, 3.9 on RHEL 9. Nothing
+    fails to import, so on that site the tool ran, every scheduler query died
+    on `TypeError: zip() takes no keyword arguments`, and the report read "every
+    query failed, so there is nothing to report" -- an accusation against a
+    perfectly healthy cluster.
+    """
+
+    def test_it_names_the_version_and_stops(self, capsys, monkeypatch):
+        monkeypatch.setattr("sys.version_info", (3, 9, 25, "final", 0))
+        assert main(["status"]) == 2
+        err = capsys.readouterr().err
+        assert "3.10" in err          # what is needed
+        assert "3.9.25" in err        # what is here
+        assert "python3.11" in err    # and how to get out of it
+
+    def test_a_current_interpreter_is_not_lectured(self, capsys):
+        assert main(["--json"]) == 0
+        assert "needs Python" not in capsys.readouterr().err
+
+
 class TestDispatch:
     def test_no_subcommand_defaults_to_status(self, capsys):
         assert main(["--json"]) == 0

@@ -3301,8 +3301,31 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
 
     if not installed:
         print()
-        print(_note(
-            "no GPUs found in this cluster, so there is nothing to report", st))
+        # Two different answers wear the same empty table, and saying the wrong
+        # one is worse than saying nothing. A cluster with no accelerators at
+        # all has nothing to report; a cluster whose accelerators are all in
+        # partitions this account is not on has plenty to report and one thing
+        # to do about it. The header directly above already counted them ("0
+        # GPUs of 8 on the cluster"), so "no GPUs found in this cluster"
+        # contradicted the line above it -- observed verbatim where both H100
+        # partitions were closed to the caller.
+        if cluster_total and not args.queue:
+            where = sorted(
+                q.name for q in cluster.queues.values()
+                if any(n.is_gpu_node for n in q.nodes)
+            )
+            print(_note(
+                f"{cluster_total} {plural(cluster_total, 'GPU')} on this cluster, none of "
+                f"them in a {cluster.queue_term} you may submit to"
+                + (f" -- they are in {', '.join(where[:4])}" if where else "")
+                + ".  --all inventories them anyway", st))
+        elif cluster_total:
+            print(_note(
+                f"no GPUs in that {cluster.queue_term}; the cluster has "
+                f"{cluster_total} elsewhere", st))
+        else:
+            print(_note(
+                "no GPUs found in this cluster, so there is nothing to report", st))
         return 0
 
     print()
@@ -3422,7 +3445,32 @@ _COMMANDS = {
 }
 
 
+#: The floor `pyproject.toml` declares. Repeated here because the interpreter
+#: that runs this file is often not the one that installed it.
+_MIN_PYTHON = (3, 10)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    # Said once, plainly, before anything else runs. `pip` enforces the floor at
+    # install time, but the way this tool actually arrives on a login node is a
+    # `git clone` and a `PYTHONPATH=src python3 -m nodetop` -- and there
+    # `python3` is whatever the distribution ships, which on RHEL 9 is 3.9.
+    # Nothing here fails to *import* on 3.9, so the tool ran, every query threw
+    # `TypeError: zip() takes no keyword arguments`, and the report that came
+    # out was "every query failed, so there is nothing to report" -- a sentence
+    # about the cluster, printed on a healthy cluster, because of the
+    # interpreter. Observed on a Slurm 25.11 site whose system python3 is 3.9.
+    if sys.version_info < _MIN_PYTHON:
+        have = ".".join(str(v) for v in sys.version_info[:3])
+        want = ".".join(str(v) for v in _MIN_PYTHON)
+        print(
+            f"nodetop needs Python {want} or newer; this is {have} "
+            f"({sys.executable}).\n"
+            f"Nothing else is wrong -- try a newer interpreter, e.g. "
+            f"python3.11 -m nodetop",
+            file=sys.stderr,
+        )
+        return 2
     parser = build_parser()
     # `parse_known_args`, not `parse_args`, because the verb is optional.
     #
