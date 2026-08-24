@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nodetop"
-version = "0.1.0"
+version = "0.2.0"
 description = "See what your cluster actually has free -- and why a queue that looks fine will not take your job. Slurm, PBS, LSF, Grid Engine, Kubernetes, or a bare pool of machines."
 readme = "README.md"
 license = "MIT"
