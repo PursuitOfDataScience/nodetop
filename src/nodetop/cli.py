@@ -1665,11 +1665,14 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
             cell((share.memory_mb // 1024) if share else 0, i),
             cell(share.gpus if share else 0, i) if has_gpu else "",
             # The span as its own column rather than a marker glued to a
-            # number: "42" under `nodes` needs no decoding. Present only when
-            # something actually spans -- on most nodes every job is a
-            # single-node job, and a column of `·` costs width the name needs.
-            *([st.muted(str(len(j.nodes))) if len(j.nodes) > 1
-               else st.dim(st.g.sep)] if spans else []),
+            # number: "42" under `nodes` needs no decoding. The column appears
+            # only when something actually spans, because on most nodes every
+            # job is a single-node job and an all-`1` column costs width the
+            # name needs -- but when it does appear it holds the count, `1`
+            # included. A `·` there was the gpu column's mistake again: an
+            # empty-cell mark standing in for a number the reader then has to
+            # guess ("what does . mean in the node column?").
+            *([st.muted(str(len(j.nodes)))] if spans else []),
             st.muted(j.elapsed),
             j.remaining,
             j.name,
@@ -2034,8 +2037,8 @@ def _queues_table(cluster: Cluster, queues: list, st: Style,
             # rather than in a capacity slot it has no value for.
             summary = st.info(f"{st.g.arrow} " + ",".join(q.forwards_to))
             capacity = ""
-            nodes_up = st.dim(st.g.sep)
-            idle: object = st.dim(st.g.sep)
+            nodes_up = st.dim(st.g.dash)
+            idle: object = st.dim(st.g.dash)
         else:
             # The meter goes on free CORES. It measured GPU share first, so
             # seventy of eighty-seven rows drew an empty bar; it then measured
@@ -2129,7 +2132,7 @@ def _queues_detail(cluster: Cluster, queues: list, st: Style) -> None:
             ("accel", gauge(q.effective_free_gpus, q.gpus_total, 14, st, "free")
              if q.gpus_total else st.dim("none")),
             ("models", ", ".join(f"{k}x{v}" for k, v in q.accelerator_models.items())
-             or st.dim(st.g.sep)),
+             or st.dim("none")),
             ("maxtime", _wall_detail(cluster, q, st)),
         ], st, indent="    "))
         blockers = q.structural_blockers()
@@ -2429,7 +2432,7 @@ def cmd_health(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             ["", "NODE", "STATE", "GPUS", "REASON"],
             [[st.warn(st.g.warn), n.name, n.state_raw,
               f"{n.gpus_total}x{n.accelerator.model if n.accelerator else '?'}"
-              if n.is_gpu_node else st.dim(st.g.sep),
+              if n.is_gpu_node else st.dim(st.g.dash),
               st.dim(n.reason)] for n in degraded],
             style=st, indent="  ", limits=[0, 24, 16, 0, 46],
         ))
@@ -2587,7 +2590,9 @@ def _render_placements(
     rows = []
     for p in places:
         glyph, label = _verdict_marks(p, st)
-        when = st.dim(st.g.sep)
+        # A dash: there is no start time because nothing can start, which is a
+        # different claim from an empty cell.
+        when = st.dim(st.g.dash)
         if p.starts_now:
             when = st.ok("now")
         elif p.earliest_start:
@@ -2643,7 +2648,7 @@ def _render_placements(
             capable += st.warn(f"+{len(cap.unverified_nodes)}?")
         accel = ", ".join(
             f"{k}x{v}" for k, v in list(p.accelerator_models.items())[:2]
-        ) or st.dim(st.g.sep)
+        ) or st.dim(st.g.dash)
         row = [
             glyph, label, p.queue,
             f"{p.nodes_available}" + st.muted(f"/{shape.nodes}"),
@@ -3007,9 +3012,9 @@ def cmd_check(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         r = results[name]
         rows.append([
             st.ok(st.g.ok) if r.allowed else st.bad(st.g.off),
-            name, r.account or st.dim(st.g.sep),
-            r.effective_qos or st.dim(st.g.sep),
-            r.filter_verdict or st.dim(st.g.sep),
+            name, r.account or st.dim(st.g.dash),
+            r.effective_qos or st.dim(st.g.dash),
+            r.filter_verdict or st.dim(st.g.dash),
             "" if r.allowed else st.bad(r.category),
             r.predicted_start.strftime("%m-%d %H:%M")
             if r.predicted_start and r.allowed else "",
@@ -3195,7 +3200,8 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
         spec = group[0].accelerator
         if spec is None:
             rows.append([
-                st.warn(model), st.dim(st.g.sep), st.dim(st.g.sep), st.dim(st.g.sep),
+                st.warn(model), st.dim(st.g.dash), st.dim(st.g.dash),
+                st.dim(st.g.dash),
                 count, gauge(free, total, 9, st),
                 st.dim("unknown"), st.dim("unknown"),
             ])

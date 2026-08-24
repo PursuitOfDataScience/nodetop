@@ -559,6 +559,22 @@ class TestJobTotalsAreNotPerNodeShares:
             [Allocation(job="1", node="n1", cpus=8, memory_mb=1024, gpus=0)])
         assert " 0 " in out
 
+    def test_a_single_node_job_shows_one_under_nodes(self, monkeypatch, capsys):
+        # `·` was standing in for the number 1: "what does . mean in the node
+        # column? why this?" A count column holds counts.
+        from nodetop.core.model import Job
+
+        out = self._job_frame(monkeypatch, capsys, [
+            Job(id="1", user="u", cpus=8, nodes=("n1",)),
+            Job(id="2", user="u", cpus=8, nodes=tuple(f"m{i}" for i in range(9))
+                + ("n1",)),
+        ])
+        rows = [ln for ln in out.splitlines() if " u " in ln]
+        assert len(rows) == 2
+        assert PLAIN.g.sep not in "".join(rows), rows
+        assert " 1 " in rows[0] or rows[0].rstrip().endswith(" 1")
+        assert " 10 " in rows[1] or "10" in rows[1]
+
     def test_the_span_column_is_absent_when_nothing_spans(self, monkeypatch,
                                                           capsys):
         # A column of `·` costs width the job name needs.

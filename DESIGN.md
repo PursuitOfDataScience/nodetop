@@ -1109,15 +1109,27 @@ Both adapters now share one `count()` in `backends/base.py` rather than each kee
 — having two implementations of the same job is how they came to disagree in the first
 place.
 
-### 6. `·` cannot mean two things
+### 6. `·` cannot mean two things -- or a number
 
 `·` is this tool's empty cell. In a column headed `gpu free` it was appearing both on a node
 with no accelerator installed and on a job holding none of a node's four — *"putting a dot
 there means nothing. you put the same sign in the gpu partition but there is gpus in those
-nodes."* Now: a node with none installed gets `—`, which reads as not-applicable with colour
-off and in ASCII; a job holding none gets `0`, because that is a count; and when nothing in
-a listing has an accelerator the column is dropped entirely, since `table` drops a column no
-row fills.
+nodes."* Then it turned up again in the `nodes` column, standing in for the number **1**:
+*"what does . mean in the node column? why can't you put 1 there?"* A single-node job spans
+one node, and a count column holds counts.
+
+So the rule is written down on the glyph itself. `·` is a **separator between words** and
+never the content of a cell. A measurement goes in as a number, `0` included. `—` is what a
+question that does not arise looks like — a node with no accelerator under `gpu free`, a
+partition that can start nothing under `start`, a field the control plane never reported —
+and it reads as not-applicable with colour off and in ASCII. Six more cells were carrying a
+`·` for that meaning: the routing-queue rows in `queues`, the accelerator column in
+`health`, `start` and `gpus` in `where`, the unreported account/QOS/filter fields in
+`check`, and the vendor/arch/memory of an unidentifiable accelerator in `gpus`. A test now
+sweeps the grid rows of seven commands and fails on any cell that is a bare `·`.
+
+Where a whole column would be dashes, it is dropped instead: `table` already omits a column
+no row fills, so a CPU-only partition spends no width on a question that does not arise.
 
 The headers went the same way. It was `cpu | free | mem free | gpu`, with `cpu` over the
 meter and a bare `free` over the fraction beside it — *"what does 'free' mean here? and then

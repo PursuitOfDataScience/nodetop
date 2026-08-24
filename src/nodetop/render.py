@@ -220,8 +220,20 @@ class Glyphs:
     bad: str = "✗"
     warn: str = "▲"
     arrow: str = "→"
+    #: A SEPARATOR, and only ever that.
+    #:
+    #: It kept being reached for as an empty table cell, where it means nothing
+    #: a reader can act on and twice stood in for an actual number -- a job
+    #: holding none of a node's accelerators, and a job spanning exactly one
+    #: node. "putting a dot there means nothing"; "what does . mean in the node
+    #: column?" A count goes in a count column, and :attr:`dash` is what a
+    #: question that does not arise looks like.
     sep: str = "·"
     ellipsis: str = "…"
+    #: "This question does not arise here", in a column that asks one: a node
+    #: with no accelerator under `gpu free`, a partition that can start nothing
+    #: under `start`, a field the control plane did not report. Distinct from a
+    #: zero, which is a measurement.
     dash: str = "—"
     # meters: eighth-blocks give sub-cell resolution
     blocks: str = "▏▎▍▌▋▊▉█"

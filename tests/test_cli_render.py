@@ -8,6 +8,8 @@ in plain, coloured and ASCII modes, since the three take different branches.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from nodetop.cli import (
@@ -183,6 +185,53 @@ class TestContent:
     def test_health_admits_the_limits_of_a_keyword_scan(self, cluster, capsys):
         cmd_health(cluster, _args(["health"]), MODES["plain"])
         assert "reason-field" in _prose(capsys.readouterr().out)
+
+    def test_no_table_cell_is_a_bare_separator(self, cluster, capsys):
+        """`·` is a separator between words, never the content of a cell.
+
+        It kept being reached for as an empty cell, where it says nothing a
+        reader can act on -- and twice it stood in for an actual number: a job
+        holding none of a node's accelerators, and a job spanning exactly one
+        node. "putting a dot there means nothing"; "what does . mean in the
+        node column?"
+
+        Checked on the grid rows only. A facts line legitimately reads
+        `a  ·  b`, and it is recognised by having no leading mark column.
+        """
+        from nodetop.cli import (
+            cmd_accelerators,
+            cmd_check,
+            cmd_health,
+            cmd_nodes,
+            cmd_queues,
+            cmd_where,
+            cmd_zoom,
+        )
+
+        commands = [
+            (cmd_nodes, ["nodes", "--all"]),
+            (cmd_queues, ["queues", "--all"]),
+            (cmd_zoom, ["zoom", "beagle3"]),
+            (cmd_health, ["health"]),
+            (cmd_accelerators, ["accelerators", "--all"]),
+            (cmd_where, ["where", "-c", "2", "--all"]),
+            (cmd_check, ["check", "-q", "beagle3", "-g", "1"]),
+        ]
+        seen = 0
+        for fn, argv in commands:
+            fn(cluster, _args(argv), MODES["plain"])
+            out = capsys.readouterr().out
+            for line in out.splitlines():
+                # A grid row starts with the two-space indent and a mark or a
+                # blank in the mark column; a facts line does not.
+                if not line.startswith("  ") or line.startswith("   "):
+                    continue
+                cells = [c for c in re.split(r"\s{2,}", line.strip()) if c]
+                seen += len(cells)
+                assert Glyphs().sep not in cells, (argv, line)
+        # A guard on the guard: a sweep that matched no rows would pass while
+        # checking nothing.
+        assert seen > 40, seen
 
     def test_accelerator_memory_is_flagged_where_it_is_reported(self, cluster,
                                                                 capsys):
