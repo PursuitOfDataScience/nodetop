@@ -7,13 +7,13 @@ including the inconsistent ``sbatch: error:`` prefixing and the unprefixed
 """
 
 # Accepted.  Note the QOS the controller selected is not the one implied by
-# the partition name: "beagle3" was auto-promoted to "beagle3-prio".
+# the partition name: "gn" was auto-promoted to "gn-prio".
 ACCEPTED = """sbatch: Verify job submission ...
-sbatch: Partition: beagle3
-sbatch: QOS-Flag: beagle3-prio
+sbatch: Partition: gn
+sbatch: QOS-Flag: gn-prio
 sbatch: Account: rcc-staff
 sbatch: Verification: ***PASSED***
-sbatch: Job 54116041 to start at 2026-08-21T17:00:12 using 4 processors on nodes beagle3-0006 in partition beagle3
+sbatch: Job 54116041 to start at 2026-08-21T17:00:12 using 4 processors on nodes gn-0006 in partition gn
 """
 
 # The site plugin refuses outright.  This is the case sacctmgr does not
@@ -39,8 +39,8 @@ allocation failure: Invalid account or account/partition combination specified
 """
 
 NO_ACCOUNT = """sbatch: error: Verify job submission ...
-sbatch: error: Partition: beagle3
-sbatch: error: QOS-Flag: beagle3
+sbatch: error: Partition: gn
+sbatch: error: QOS-Flag: gn
 sbatch: error: Account: unknown
 sbatch: error: Verification: ***REJECTED***
 sbatch: error: Reason: Account is not specified
@@ -48,8 +48,8 @@ allocation failure: Access/permission denied
 """
 
 SHAPE_TOO_BIG = """sbatch: error: Verify job submission ...
-sbatch: error: Partition: beagle3
-sbatch: error: QOS-Flag: beagle3-prio
+sbatch: error: Partition: gn
+sbatch: error: QOS-Flag: gn-prio
 sbatch: error: Account: rcc-staff
 sbatch: error: Verification: ***PASSED***
 allocation failure: Node count specification invalid
@@ -60,7 +60,7 @@ sbatch: Partition: gpu
 sbatch: QOS-Flag: gpu
 sbatch: Account: rcc-staff
 sbatch: Verification: ***PASSED***
-sbatch: Job 54116043 to start at 2026-08-22T19:52:18 using 4 processors on nodes midway3-0278 in partition gpu
+sbatch: Job 54116043 to start at 2026-08-22T19:52:18 using 4 processors on nodes cn-0278 in partition gpu
 """
 
 # A controller that cannot write job scripts fails EVERY submission, including

@@ -28,21 +28,24 @@ misbehaving, so it runs on a login node with nothing but the system Python.
 
 ```
 ╭──────────────────────────────────────────────────────────────────────────────────────╮
-│ nodetop · slurm  ·  youzhi  ·  328 of 607 nodes, 326 up  ·  222 of 358 GPUs, 53 free │
+│ nodetop · slurm  ·  ada  ·  328 of 607 nodes, 326 up  ·  222 of 358 GPUs, 53 free    │
 │                                                                                      │
-│    87 partitions  → ❯8 open to you  ·  65 no access  ·  11 refused  ·  3 down        │
+│    87 partitions  · ❯8 open to you  ·  65 no access  ·  11 refused  ·  3 down        │
 │ ──────────────────────────────────────────────────────────────────────────────────── │
-│    partition       nodes  idle  cores  free              gpu  free  gpu model        │
-│    amd                40     0   5120  1695  ██████████                              │
-│    caslake           190     0   9120   436  ██▋░░░░░░░                              │
-│    beagle3            44     5   1408   406  ██▍░░░░░░░  176    48  A100, A40        │
-│    gpu                 9     0    432   186  █▏░░░░░░░░   36     0  V100, RTX6000    │
+│    partition   nodes idle  cores free              gpu free  gpu model               │
+│    compute           0/40   1695/5120  ██████████         —                          │
+│    gpu-a            11/44    406/1408  ██▍░░░░░░░    48/176  A100, A40               │
+│    wide             0/190    436/9120  ██▋░░░░░░░         —                          │
+│    gpu-b              0/9     186/432  █▏░░░░░░░░      0/36  V100, RTX6000           │
 ╰──────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-`caslake` has 190 nodes and 2654 cores its scheduler calls free. **436** of them can
+Every column is `free/total` under a header naming the numerator, and one hue per
+resource. `wide` has 190 nodes and 2654 cores its scheduler calls free. **436** of them can
 actually be allocated: the rest sit on nodes whose memory is entirely spoken for, so
 nothing can land there. `free` is what you can have, not what is advertised.
+
+*(Names and figures throughout are illustrative. Run it on your own cluster for yours.)*
 
 Every partition on the cluster is in exactly one term of that second line, so the
 counts reconcile with the total. **8 of 87** is the honest answer here — the rest
@@ -70,7 +73,7 @@ transcript of them.
 
 ```bash
 nodetop                      # the overview
-nodetop zoom beagle3         # one partition: its gates, then its nodes
+nodetop zoom gpu-a           # one partition: its gates, then its nodes
 nodetop where -g 4 --gpu-mem 40G --needs bf16 -t 2-00:00:00
 nodetop nodes --gpu --free   # GPU nodes with something free now
 nodetop queues -q test       # every gate on one queue

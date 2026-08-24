@@ -57,7 +57,7 @@ COMMANDS = [
     ("exclude --unschedulable", cmd_exclude, ["exclude", "--unschedulable"]),
     ("exclude --degraded", cmd_exclude, ["exclude", "--degraded"]),
     ("accelerators", cmd_accelerators, ["accelerators"]),
-    ("accel -q", cmd_accelerators, ["accel", "-q", "beagle3"]),
+    ("accel -q", cmd_accelerators, ["accel", "-q", "gn"]),
 ]
 
 
@@ -211,11 +211,11 @@ class TestContent:
         commands = [
             (cmd_nodes, ["nodes", "--all"]),
             (cmd_queues, ["queues", "--all"]),
-            (cmd_zoom, ["zoom", "beagle3"]),
+            (cmd_zoom, ["zoom", "gn"]),
             (cmd_health, ["health"]),
             (cmd_accelerators, ["accelerators", "--all"]),
             (cmd_where, ["where", "-c", "2", "--all"]),
-            (cmd_check, ["check", "-q", "beagle3", "-g", "1"]),
+            (cmd_check, ["check", "-q", "gn", "-g", "1"]),
         ]
         seen = 0
         for fn, argv in commands:
@@ -236,9 +236,27 @@ class TestContent:
     def test_accelerator_memory_is_flagged_where_it_is_reported(self, cluster,
                                                                 capsys):
         # An A100 could be 40 or 80 GB and no scheduler says which, so the
-        # figure is an inference and has to be marked as one.
+        # figure is an inference and has to be marked as one. `>=40G` says that
+        # without a legend -- the smaller variant is assumed, so "at least" is
+        # exactly what is known. A bare `?` needed explaining and got asked
+        # about instead.
         cmd_accelerators(cluster, _args(["accelerators"]), MODES["plain"])
-        assert "?" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert ">=" in out
+        assert "?" not in out
+
+    def test_the_inventory_says_where_each_model_lives(self, cluster, capsys):
+        # An inventory that cannot say which queue holds the A100s makes a
+        # correct listing look wrong: "the gpu partition should show a100 as
+        # well but doesn't" -- they were all in another partition.
+        cmd_accelerators(cluster, _args(["accelerators"]), MODES["plain"])
+        out = capsys.readouterr().out
+        assert "partitions" in out
+        rows = [ln for ln in out.splitlines() if "NVIDIA" in ln]
+        assert rows
+        for row in rows:
+            # Something after the capability columns names a queue.
+            assert row.split()[-1] not in ("yes", "no"), row
 
     def test_the_node_table_does_not_repeat_it_per_row(self, cluster, capsys):
         # Accelerator memory is a property of the MODEL, so it was the same

@@ -70,7 +70,7 @@ class TestRoundTrip:
             "scontrol show node": (0, slurm_nodes, ""),
             "scontrol show partition": (0, slurm_partitions, ""),
             "show qos": (0, slurm_qos, ""),
-            "show assoc": (0, "acct||beagle3\n", ""),
+            "show assoc": (0, "acct||gn\n", ""),
             "squeue": (0, "", ""),
         })
         capture = CapturingRunner(inner)
@@ -148,7 +148,7 @@ class TestReplayHonesty:
             "scontrol show node": (0, slurm_nodes, ""),
             "scontrol show partition": (0, slurm_partitions, ""),
             "show qos": (0, slurm_qos, ""),
-            "show assoc": (0, "acct||beagle3\n", ""),
+            "show assoc": (0, "acct||gn\n", ""),
             "squeue": (0, "", ""),
         }))
         cluster = Cluster.load(SlurmBackend(capture), with_free_times=True)
@@ -173,7 +173,7 @@ class TestReplayHonesty:
         from nodetop.core.model import JobShape
 
         cluster, _ = self._replayed(tmp_path, slurm_nodes, slurm_partitions, slurm_qos)
-        assert cluster.probe("beagle3", JobShape()) is None
+        assert cluster.probe("gn", JobShape()) is None
 
     def test_check_says_it_is_a_recording_not_that_slurm_lacks_a_dry_run(
         self, tmp_path, slurm_nodes, slurm_partitions, slurm_qos, capsys
@@ -235,7 +235,7 @@ class TestReplayIsDatedWhenItWasCaptured:
             "scontrol show node": (0, slurm_nodes, ""),
             "scontrol show partition": (0, slurm_partitions, ""),
             "show qos": (0, slurm_qos, ""),
-            "show assoc": (0, "acct||beagle3\n", ""),
+            "show assoc": (0, "acct||gn\n", ""),
             "squeue": (0, "", ""),
         }))
         cluster = Cluster.load(SlurmBackend(capture), with_free_times=True)

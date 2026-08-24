@@ -293,7 +293,7 @@ class TestDispatch:
             "scontrol show node": (0, slurm_nodes, ""),
             "scontrol show partition": (0, slurm_partitions, ""),
             "show qos": (0, slurm_qos, ""),
-            "show assoc": (0, "acct||beagle3\n", ""),
+            "show assoc": (0, "acct||gn\n", ""),
             "squeue": (0, "", ""),
         }))
         cluster = Cluster.load(SlurmBackend(capture), with_free_times=True)

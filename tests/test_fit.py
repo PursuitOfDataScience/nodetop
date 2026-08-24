@@ -163,8 +163,8 @@ class TestFreeNodesAreNotAStartTime:
     """Room here is a fact about hardware; starting is the scheduler's call.
 
     Measured for a four-core ten-minute job on a cluster where every partition
-    reported free cores: `beagle3` and `bigmem` started now, `amd` was 4h 24m
-    out, `build` 8h, `caslake` 18h. All five reported RUN NOW.
+    reported free cores: `gn` and `bigmem` started now, `amd` was 4h 24m
+    out, `build` 8h, `wide` 18h. All five reported RUN NOW.
     """
 
     TAKEN = datetime(2026, 8, 21, 12)
@@ -468,7 +468,7 @@ class TestProbeAccounts:
         # a wrong-answer bug rather than a slow-answer one: the caller could no
         # longer tell "refused by the 4 we tried" from "refused by all 50", so
         # it reported the first as the second and hid the queue. On the cluster
-        # this was written against that lost `caslake`, `gpu` and `bigmem` --
+        # this was written against that lost `wide`, `gpu` and `bigmem` --
         # all three accepted by an account lying 32nd in the list.
         #
         # The ceiling still exists; it is applied where the probing happens,
@@ -782,7 +782,7 @@ class TestTheWorkingAccountIsFoundHoweverLateItSorts:
     `probe_accounts` used to truncate its candidate list to 4. On a cluster
     where the user holds 34 associations and the general partitions set
     `AllowAccounts=ALL`, the intersection is all 34 and only the first 4 were
-    ever tried. `caslake` (190 nodes), `gpu` (44 accelerators) and `bigmem` are
+    ever tried. `wide` (190 nodes), `gpu` (44 accelerators) and `bigmem` are
     all accepted with `rcc-staff`, which sorts 32nd -- so all three were
     reported as refused and dropped from the overview. Verified against the
     real control plane: `sbatch --test-only` accepts every one of them.
@@ -909,7 +909,7 @@ class TestTheWorkingAccountIsFoundHoweverLateItSorts:
 
     def test_naming_one_queue_spends_the_budget_settling_it(self):
         # The other end of the same policy. A fixed per-queue ceiling of 12 left
-        # `check -q caslake` reporting ACCOUNTS_UNTRIED for a queue the user had
+        # `check -q wide` reporting ACCOUNTS_UNTRIED for a queue the user had
         # explicitly asked about, twenty probes short of the account that works.
         from nodetop.core.fit import rank
 

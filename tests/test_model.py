@@ -163,7 +163,7 @@ class TestPhantomCapacity:
 class TestCoresWithNoMemoryBehindThem:
     """Idle cores on a node whose memory is spoken for are not room.
 
-    Real and large: `caslake` advertised 2322 free cores, 2035 of them on 47
+    Real and large: `wide` advertised 2322 free cores, 2035 of them on 47
     nodes with every byte of memory allocated to a handful of four-core jobs.
     The scheduler gives every job memory -- the site default if the job names
     no figure -- so those cores can start nothing, and they were the biggest
@@ -440,9 +440,9 @@ class TestLimitWording:
         assert "1 nodes" not in detail
 
     def test_the_limit_set_is_named_at_the_end_not_mid_sentence(self):
-        limits = Limits(name="beagle3", per_job={"gpu": 2})
+        limits = Limits(name="gn", per_job={"gpu": 2})
         detail = limits.blockers(JobShape(nodes=4, gpus_per_node=1))[0].detail
-        assert detail.endswith("on beagle3")
+        assert detail.endswith("on gn")
 
 
 class TestBlockerLabel:
@@ -538,26 +538,26 @@ class TestQueueIsDedicated:
     The accounting database cannot answer this on a cluster whose associations
     are templated -- it reported the user as associated with 34 accounts and
     gave every one an identical QOS list -- so the queue's own allowlist is
-    read instead. A partition naming `pi-depablo` alone says what that hardware
+    read instead. A partition naming `pi-okafor` alone says what that hardware
     is for.
     """
 
     def test_a_single_account_allowlist_is_dedicated(self):
-        assert Queue(name="depablo-gpu", allow_accounts=("pi-depablo",)).is_dedicated
+        assert Queue(name="okafor-gpu", allow_accounts=("pi-okafor",)).is_dedicated
 
     def test_two_accounts_is_still_dedicated(self):
         # A PI partition routinely names the group plus a collaborator.
-        assert Queue(name="q", allow_accounts=("schmidt", "pi-dfreedman")).is_dedicated
+        assert Queue(name="q", allow_accounts=("lawson", "pi-varga")).is_dedicated
 
     def test_a_wide_allowlist_is_shared(self):
         assert not Queue(
-            name="beagle3",
+            name="gn",
             allow_accounts=tuple(f"a{i}" for i in range(28)),
         ).is_dedicated
 
     def test_no_allowlist_at_all_is_shared(self):
         # Unrestricted: open to everyone with an account on the cluster.
-        assert not Queue(name="caslake").is_dedicated
+        assert not Queue(name="wide").is_dedicated
 
     def test_the_threshold_is_a_named_constant(self):
         # It is quoted in the output, so it must be one value.

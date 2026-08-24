@@ -1,7 +1,7 @@
 """Bracket-notation node list expansion and collapse.
 
 Slurm writes node sets in a notation that nests commas *inside* the
-brackets -- ``midway3-[0001-0010,0012-0015],beagle3-bigmem[1-4]`` is two
+brackets -- ``cn-[0001-0010,0012-0015],gn-bigmem[1-4]`` is two
 groups, not five.  A naive ``split(",")`` therefore shreds it, which is the
 single most common way a home-grown Slurm script silently loses nodes.
 

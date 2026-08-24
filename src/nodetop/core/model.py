@@ -266,7 +266,7 @@ class Node:
         Slurm allocates memory to every job -- ``DefMemPerCPU`` if the site
         sets one, the whole node if it does not -- so there is no such thing
         as a job that needs cores and no memory.  Measured on the cluster this
-        was written against: ``caslake`` advertised **2322 free cores** across
+        was written against: ``wide`` advertised **2322 free cores** across
         190 nodes, of which 2035 sat on 47 nodes whose memory was fully
         allocated to a handful of small jobs.  A four-core job sent at the
         biggest number on the screen would pend indefinitely.
@@ -721,11 +721,11 @@ class Queue:
         ==================  ==============  ========================
         ``amd``             1 of 40 (2%)    2825 of 5120 (55%)
         ``build``           0 of 1 (0%)     42 of 48 (88%)
-        ``beagle3``         0 of 44 (0%)    200 of 1408, + 27 GPUs
-        ``beagle3-bigmem``  4 of 4 (100%)   128 of 128 (100%)
+        ``gn``         0 of 44 (0%)    200 of 1408, + 27 GPUs
+        ``gn-bigmem``  4 of 4 (100%)   128 of 128 (100%)
         ==================  ==============  ========================
 
-        So the summary put ``beagle3-bigmem`` top with a full meter and drew
+        So the summary put ``gn-bigmem`` top with a full meter and drew
         ``amd`` as an empty one, while ``amd`` had **22x** more free capacity.
         A node is not the unit of room; a core is. ``cmd_nodes`` already
         meters ``cpus_free / cpus_total`` per node -- this is the same
@@ -765,7 +765,7 @@ class Queue:
         :attr:`Identity.entitlements_look_templated` -- so the declared
         entitlement cannot distinguish a partition you may use from one that
         will reject you with "Invalid membership". The allowlist width can:
-        ``pi-depablo`` alone on ``depablo-gpu`` says what that hardware is for.
+        ``pi-okafor`` alone on ``okafor-gpu`` says what that hardware is for.
 
         A heuristic, and labelled as one in the output.  It is not a
         substitute for :meth:`Cluster.probe`; it is what can be said honestly

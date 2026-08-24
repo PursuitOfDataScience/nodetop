@@ -114,11 +114,11 @@ class Placement:
         ==================  =======================
         partition           the scheduler's answer
         ==================  =======================
-        ``beagle3``         now
+        ``gn``         now
         ``bigmem``          now
         ``amd``             in 4h 24m
         ``build``           in 8h
-        ``caslake``         in 18h
+        ``wide``         in 18h
         ==================  =======================
 
         All five said RUN NOW before this existed, and ``amd`` -- the largest
@@ -346,7 +346,7 @@ def evaluate(
 #: It used to be 4, applied by truncating the candidate list, and that was a
 #: **wrong-answer** bug rather than a slow one.  On a cluster where this user
 #: holds 34 associations and the general partitions set ``AllowAccounts=ALL``,
-#: the intersection is all 34 and the truncation tried the first 4.  `caslake`,
+#: the intersection is all 34 and the truncation tried the first 4.  `wide`,
 #: `gpu` and `bigmem` are all accepted with `rcc-staff` -- 32nd in that list --
 #: and all three were reported as *refused* and hidden.  Three partitions the
 #: user can genuinely submit to, including the 190-node CPU partition and a
@@ -387,7 +387,7 @@ class ProbeBudget:
         # wrong at both ends: too small when the caller named two queues and
         # wants them settled, too large when it is sweeping ninety. Naming two
         # queues out of a 150-probe budget buys 75 tries each, which is what
-        # makes `check -q caslake` able to reach the one account in thirty-four
+        # makes `check -q wide` able to reach the one account in thirty-four
         # that the control plane accepts -- the fixed ceiling of 12 stopped
         # twenty short of it and reported ACCOUNTS_UNTRIED for a queue the user
         # had explicitly asked about.
@@ -577,7 +577,7 @@ def rank(
         # teaches nothing until one of them lands. Evaluated in the scheduler's
         # own order, the 34-candidate queues came first, spent their per-queue
         # cap without reaching the account that works, and were written off --
-        # then `beagle3` accepted that very account one queue later. Cheapest
+        # then `gn` accepted that very account one queue later. Cheapest
         # first means it is known before the expensive queues are asked.
         shape_for_order = shape
         names = sorted(

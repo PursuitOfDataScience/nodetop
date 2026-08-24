@@ -25,7 +25,7 @@ import re
 import shutil
 import sys
 import unicodedata
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
 __all__ = [
@@ -1039,6 +1039,7 @@ def table(
     keep: int = 2,
     drop_empty: bool = True,
     header_role: str = "head",
+    header_paint: Sequence[Callable[[str], str] | None] | None = None,
     show_header: bool = True,
     underline: bool = True,
 ) -> str:
@@ -1146,8 +1147,23 @@ def table(
         # paint("head", ...) raises KeyError.
         wear = getattr(style, header_role, None) or (
             lambda t: style.paint(header_role, t))
+
+        def dress(i: int, text: str) -> str:
+            """Paint one header cell.
+
+            ``header_paint`` gives a column its own hue, which is how a table
+            with two `free` columns tells the reader which resource each one
+            belongs to before they read a word. Padding happens first, so the
+            colour covers the cell and not just the label.
+            """
+            if header_paint is not None and i < len(header_paint):
+                own = header_paint[i]
+                if own is not None:
+                    return own(text)
+            return wear(text)
+
         lines.append(indent + "  ".join(
-            wear(pad(h, sizes[i], aligns[i])) for i, h in enumerate(headers)
+            dress(i, pad(h, sizes[i], aligns[i])) for i, h in enumerate(headers)
         ))
         if underline:
             lines.append(
@@ -1249,7 +1265,7 @@ def wrap_indent(
         indent = indent + " " * (pad_to - width(indent))
     # break_on_hyphens=False is load-bearing: the default splits "--test-only"
     # into "--test-" / "only", which reads as a different flag entirely, and
-    # does the same to hyphenated node names like "beagle3-0001".
+    # does the same to hyphenated node names like "gn-0001".
     if raw_prefix:
         visible = width(indent)
         wrapped = textwrap.fill(

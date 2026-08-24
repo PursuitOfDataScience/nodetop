@@ -67,8 +67,8 @@ class TestExpand:
         # Verbatim from `scontrol show partition test`, which reported
         # TotalNodes=610 for exactly this string.
         real = (
-            "beagle3-[0001-0044],beagle3-bigmem[1-4],climate-[001-048],"
-            "midway3-[0001-0010,0012-0015,0017-0216,0219-0308,0310-0324,"
+            "gn-[0001-0044],gn-bigmem[1-4],climate-[001-048],"
+            "cn-[0001-0010,0012-0015,0017-0216,0219-0308,0310-0324,"
             "0329-0427,0429-0442,0444-0456,0501-0562,0600-0606]"
         )
         assert len(expand(real)) == 610
@@ -103,9 +103,9 @@ class TestCollapse:
         assert collapse(["n-1", "n-1", "n-2"]) == "n-[1-2]"
 
     def test_real_exclude_list(self):
-        names = ["midway3-0423", "midway3-0298", "midway3-0377", "midway3-0378",
-                 "midway3-0603", "midway3-0604", "midway3-0605", "midway3-0606"]
-        assert collapse(names) == "midway3-[0298,0377-0378,0423,0603-0606]"
+        names = ["cn-0423", "cn-0298", "cn-0377", "cn-0378",
+                 "cn-0603", "cn-0604", "cn-0605", "cn-0606"]
+        assert collapse(names) == "cn-[0298,0377-0378,0423,0603-0606]"
 
 
 class TestRoundTrip:
@@ -132,11 +132,11 @@ class TestCollapseExpandRoundTrip:
     """
 
     @pytest.mark.parametrize("names", [
-        [f"beagle3-{i:04d}" for i in range(1, 45)],
+        [f"gn-{i:04d}" for i in range(1, 45)],
         [f"climate-{i:03d}" for i in
          (1, 2, 3, 7, 10, 11, 13, 15, 17, 22, 24, 25, 27, 28, 29, 30, 33, 37,
           39, 40, 43, 45)],
-        ["midway3-0385"],
+        ["cn-0385"],
         ["a", "b", "c"],
         ["node1", "node10", "node2"],          # numeric vs lexical order
         ["n-1-1", "n-1-2", "n-2-1"],           # more than one number per name
@@ -155,7 +155,7 @@ class TestCollapseExpandRoundTrip:
         import random
 
         rng = random.Random(seed * 31 + width)
-        prefix = rng.choice(["nd", "beagle3-", "c", "mx-"])
+        prefix = rng.choice(["nd", "gn-", "c", "mx-"])
         names = [f"{prefix}{i:0{width}d}"
                  for i in rng.sample(range(200), rng.randint(1, 25))]
         assert sorted(set(expand(collapse(sorted(names))))) == sorted(set(names))

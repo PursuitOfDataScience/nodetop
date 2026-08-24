@@ -9,9 +9,9 @@ from nodetop.backends.slurm import SlurmBackend, parse_probe, parse_slurm_durati
 from nodetop.core.model import JobShape, VerdictCategory
 from nodetop.runner import RecordedRunner
 
-B1 = "beagle3-0001"
-BIGMEM = "beagle3-bigmem1"
-DEGRADED = "midway3-0385"
+B1 = "gn-0001"
+BIGMEM = "gn-bigmem1"
+DEGRADED = "cn-0385"
 
 
 def _parse(text, queue="p", account="a", rc=1):
@@ -60,7 +60,7 @@ class TestNodes:
     def test_accelerator_ness_is_from_gres_not_hostname(self, slurm_backend):
         # This host sits among 44 accelerator nodes and has none.
         n = {x.name: x for x in slurm_backend.load_nodes()}[BIGMEM]
-        assert n.name.startswith("beagle3")
+        assert n.name.startswith("gn")
         assert n.is_gpu_node is False
 
 
@@ -199,13 +199,13 @@ class TestPerNodeShares:
     DUMP = """JobId=53272514 JobName=_interactive
    NumNodes=42 NumCPUs=512
    JOB_GRES=(null)
-     Nodes=midway3-0002 CPU_IDs=33,35,37,39 Mem=4096 GRES=
-     Nodes=midway3-0114 CPU_IDs=41-47 Mem=7168 GRES=
+     Nodes=cn-0002 CPU_IDs=33,35,37,39 Mem=4096 GRES=
+     Nodes=cn-0114 CPU_IDs=41-47 Mem=7168 GRES=
 JobId=54465084 ArrayJobId=54462542 ArrayTaskId=65 JobName=ffgs
    NumNodes=1 NumCPUs=1
-     Nodes=midway3-0500 CPU_IDs=3 Mem=28672 GRES=gpu:1(IDX:1)
+     Nodes=cn-0500 CPU_IDs=3 Mem=28672 GRES=gpu:1(IDX:1)
 JobId=54480000 ArrayJobId=54480000 ArrayTaskId=1-20%10 JobName=pending-array
-     Nodes=midway3-[0521-0522] CPU_IDs=78-94 Mem=29750 GRES=gpu:2
+     Nodes=cn-[0521-0522] CPU_IDs=78-94 Mem=29750 GRES=gpu:2
 """
 
     def _by_key(self):
@@ -214,19 +214,19 @@ JobId=54480000 ArrayJobId=54480000 ArrayTaskId=1-20%10 JobName=pending-array
 
     def test_a_range_of_core_ids_is_counted_not_read(self):
         # `CPU_IDs=41-47` is seven cores, not the number 41.
-        got = self._by_key()[("53272514", "midway3-0114")]
+        got = self._by_key()[("53272514", "cn-0114")]
         assert (got.cpus, got.memory_mb) == (7, 7168)
 
     def test_a_comma_list_is_counted_too(self):
-        assert self._by_key()[("53272514", "midway3-0002")].cpus == 4
+        assert self._by_key()[("53272514", "cn-0002")].cpus == 4
 
     def test_an_array_task_is_registered_under_squeues_spelling(self):
         # `squeue` says `54462542_65`; `scontrol` says JobId=54465084 with the
         # array recorded separately. 1864 of 2928 jobs on the reference cluster
         # are array tasks, so keying on JobId alone found a share for none.
         keys = self._by_key()
-        assert ("54462542_65", "midway3-0500") in keys
-        assert ("54465084", "midway3-0500") in keys
+        assert ("54462542_65", "cn-0500") in keys
+        assert ("54465084", "cn-0500") in keys
 
     def test_a_pending_array_range_is_not_mistaken_for_a_task(self):
         keys = self._by_key()
@@ -235,12 +235,12 @@ JobId=54480000 ArrayJobId=54480000 ArrayTaskId=1-20%10 JobName=pending-array
     def test_a_collapsed_nodelist_applies_to_every_node_in_it(self):
         # Slurm collapses consecutive nodes that got the same shape.
         keys = self._by_key()
-        for node in ("midway3-0521", "midway3-0522"):
+        for node in ("cn-0521", "cn-0522"):
             assert keys[("54480000", node)].cpus == 17, node
 
     def test_gres_becomes_an_accelerator_count(self):
-        assert self._by_key()[("54462542_65", "midway3-0500")].gpus == 1
-        assert self._by_key()[("54480000", "midway3-0521")].gpus == 2
+        assert self._by_key()[("54462542_65", "cn-0500")].gpus == 1
+        assert self._by_key()[("54480000", "cn-0521")].gpus == 2
 
     def test_the_whole_cluster_is_one_call(self):
         # 0.6s for 2928 jobs against 0.13s for one: asking about five jobs
@@ -275,11 +275,11 @@ class TestPartitions:
         assert self._queues(slurm_backend)["test"].declared_nodes == 610
 
     def test_bracket_notation_in_an_unusual_position(self, slurm_backend):
-        # Nodes=beagle3-00[01-44]
-        assert len(self._queues(slurm_backend)["beagle3"].node_names) == 44
+        # Nodes=gn-00[01-44]
+        assert len(self._queues(slurm_backend)["gn"].node_names) == 44
 
     def test_allow_accounts(self, slurm_backend):
-        assert "rcc-staff" in self._queues(slurm_backend)["beagle3"].allow_accounts
+        assert "rcc-staff" in self._queues(slurm_backend)["gn"].allow_accounts
 
     def test_drain_state_accepts_but_does_not_start(self):
         # Slurm has one switch where PBS has two; DRAIN is the
@@ -293,7 +293,7 @@ class TestPartitions:
 
 class TestQos:
     def test_ceilings(self, slurm_backend):
-        limits = slurm_backend.load_limits()["beagle3"]
+        limits = slurm_backend.load_limits()["gn"]
         assert limits.max_walltime_seconds == 172800
         assert limits.per_job == {"gpu": 4}
         assert limits.per_user == {"cpu": 256, "gpu": 32, "node": 8}
@@ -307,7 +307,7 @@ class TestQos:
     def test_the_ceiling_the_dry_run_misses(self, slurm_backend):
         # sbatch --test-only returns PASSED with a start time for this shape,
         # and it then pends indefinitely.
-        limits = slurm_backend.load_limits()["beagle3"]
+        limits = slurm_backend.load_limits()["gn"]
         got = limits.blockers(JobShape(nodes=3, gpus_per_node=4, walltime="1h"))
         assert "MAX_GPU_JOB" in {b.code for b in got}
 
@@ -321,19 +321,19 @@ class TestProbeAccepted:
     def test_predicted_start_and_nodes(self):
         v = _parse(po.ACCEPTED, rc=0)
         assert v.predicted_start.isoformat() == "2026-08-21T17:00:12"
-        assert v.predicted_nodes == ("beagle3-0006",)
+        assert v.predicted_nodes == ("gn-0006",)
 
     def test_effective_qos_is_what_the_controller_chose(self):
-        # Asked for "beagle3"; the site auto-promoted to "beagle3-prio".
+        # Asked for "gn"; the site auto-promoted to "gn-prio".
         # Checking ceilings against the requested name checks the wrong ones.
         v = _parse(po.ACCEPTED, rc=0)
-        assert v.effective_qos == "beagle3-prio"
+        assert v.effective_qos == "gn-prio"
         assert v.effective_account == "rcc-staff"
 
     def test_shared_partition_preamble(self):
         v = _parse(po.SHARED_PARTITION, rc=0)
         assert v.allowed is True
-        assert v.predicted_nodes == ("midway3-0278",)
+        assert v.predicted_nodes == ("cn-0278",)
 
 
 class TestTwoLayerDisagreement:
@@ -386,7 +386,7 @@ class TestProbeTaxonomy:
 class TestProbeInvocation:
     def test_test_only_is_hard_coded(self):
         runner = RecordedRunner({"sbatch": (0, "", po.ACCEPTED)})
-        SlurmBackend(runner).probe("beagle3", JobShape(gpus_per_node=1), "acct")
+        SlurmBackend(runner).probe("gn", JobShape(gpus_per_node=1), "acct")
         cmd = runner.calls[0]
         assert cmd[0] == "sbatch"
         assert "--test-only" in cmd
@@ -395,29 +395,29 @@ class TestProbeInvocation:
         runner = RecordedRunner({"sbatch": (0, "", po.ACCEPTED)})
         shape = JobShape(nodes=2, gpus_per_node=4, cpus_per_task=8,
                          memory_gb=64, walltime="2-00:00:00")
-        SlurmBackend(runner).probe("beagle3", shape, "acct")
+        SlurmBackend(runner).probe("gn", shape, "acct")
         joined = " ".join(runner.calls[0])
         for flag in ["--nodes=2", "--gres=gpu:4", "--cpus-per-task=8",
-                     "--time=2-00:00:00", "--account=acct", "--partition=beagle3"]:
+                     "--time=2-00:00:00", "--account=acct", "--partition=gn"]:
             assert flag in joined
 
     def test_the_probe_account_wins_over_the_shape_account(self):
         runner = RecordedRunner({"sbatch": (0, "", po.ACCEPTED)})
-        SlurmBackend(runner).probe("beagle3", JobShape(account="from-shape"), "from-probe")
+        SlurmBackend(runner).probe("gn", JobShape(account="from-shape"), "from-probe")
         joined = " ".join(runner.calls[0])
         assert "--account=from-probe" in joined
         assert "--account=from-shape" not in joined
 
     def test_a_runner_failure_becomes_a_finding_not_a_crash(self):
-        v = SlurmBackend(RecordedRunner({})).probe("beagle3", JobShape())
+        v = SlurmBackend(RecordedRunner({})).probe("gn", JobShape())
         assert v.category == VerdictCategory.CONTROL_PLANE_DOWN
         assert v.durable is False
 
 
 class TestNodelist:
     def test_collapsed_bracket_notation(self, slurm_backend):
-        names = ["midway3-0298", "midway3-0377", "midway3-0378", "midway3-0423"]
-        assert slurm_backend.format_nodelist(names) == "midway3-[0298,0377-0378,0423]"
+        names = ["cn-0298", "cn-0377", "cn-0378", "cn-0423"]
+        assert slurm_backend.format_nodelist(names) == "cn-[0298,0377-0378,0423]"
 
 
 class TestTresMemoryScale:
@@ -469,7 +469,7 @@ class TestIdentityQuery:
         # empty identity silently disables every account and QOS access check,
         # because those are tri-state and read "nothing to compare against" as
         # "no verdict". Nothing errors; a whole analysis layer just stops.
-        runner = RecordedRunner({"sacctmgr": (0, "acct||beagle3\n", "")})
+        runner = RecordedRunner({"sacctmgr": (0, "acct||gn\n", "")})
         SlurmBackend(runner).load_identity()
         argv = next(c for c in runner.calls if c[0] == "sacctmgr")
         assert "where" in argv
@@ -512,12 +512,12 @@ class TestIdentityQuery:
         # Two accounts, an identical queue list: the templated-entitlements
         # signal this backend exists to surface.
         dump = (
-            "acct-a||aaz,beagle3,caslake\n"
-            "acct-b||aaz,beagle3,caslake\n"
+            "acct-a||aaz,gn,wide\n"
+            "acct-b||aaz,gn,wide\n"
         )
         ident = SlurmBackend(RecordedRunner({"sacctmgr": (0, dump, "")})).load_identity()
         assert set(ident.accounts) == {"acct-a", "acct-b"}
-        assert "beagle3" in ident.qos
+        assert "gn" in ident.qos
         assert ident.entitlements_look_templated is True
 
 
@@ -632,7 +632,7 @@ class TestAnExhaustedAllocationIsNotADeniedOne:
 
     def test_su_exhaustion_is_a_quota(self):
         v = parse_probe(
-            "caslake", "acct", 1,
+            "wide", "acct", 1,
             "sbatch: error: Verification: ***REJECTED***\n"
             "sbatch: error: Reason: No sufficient SU allocations for a shared partition\n",
             "allocation failure: Access/permission denied\n")

@@ -62,8 +62,8 @@ class TestParser:
         assert _args([alias]).command == alias
 
     def test_partition_flag_is_an_alias_for_queue(self):
-        assert _args(["queues", "-p", "beagle3"]).queue == "beagle3"
-        assert _args(["queues", "--queue", "beagle3"]).queue == "beagle3"
+        assert _args(["queues", "-p", "gn"]).queue == "gn"
+        assert _args(["queues", "--queue", "gn"]).queue == "gn"
 
 
 class TestRenderIntegration:
@@ -434,7 +434,23 @@ class TestAJobHasItsOwnView:
         deepest = "\n".join(
             self._frames(monkeypatch, capsys, job, [self.ROW, 0, 0])[3])
         assert "on n1" in deepest
+        # No `job total` and no `nodes` row on a one-node job: the share above
+        # IS the total, and the node is named in its own label, so both would
+        # restate what the reader just read.
+        assert "job total" not in deepest
+        assert "\nnodes" not in deepest
+
+    def test_a_spanning_job_gets_its_totals_and_its_nodelist(self, monkeypatch,
+                                                             capsys):
+        from nodetop.core.model import Job
+
+        job = Job(id="42", user="alice", cpus=512, gpus=8,
+                  nodes=("n1", "n2", "n3"))
+        deepest = "\n".join(
+            self._frames(monkeypatch, capsys, job, [self.ROW, 0, 0])[3])
         assert "job total" in deepest
+        assert "512 cores" in deepest
+        assert "3 nodes" in deepest
 
     def test_stepping_out_of_a_job_returns_to_the_job_list(self, monkeypatch,
                                                           capsys):
@@ -766,7 +782,7 @@ class TestZoomEdgeCases:
     def test_a_node_with_no_memory_left_reads_empty_too(self, capsys):
         # 44 of 48 cores idle and every byte of memory allocated: the same
         # phantom capacity as a drained node, and the biggest number on the
-        # screen. Real -- `caslake` had 47 of these behind a headline of 2322
+        # screen. Real -- `wide` had 47 of these behind a headline of 2322
         # free cores.
         # `_node` gives the node 100 MB; this allocates all of it.
         cluster = self._cluster([self._node(
@@ -1074,8 +1090,8 @@ class TestQueues:
         cmd_queues(cluster, _args(["--json", "queues", "--all"]), PLAIN)
         data = {q["name"]: q for q in json.loads(capsys.readouterr().out)}
         # The partition says unlimited; the QOS is what actually bites.
-        assert data["beagle3"]["max_walltime_queue"] == "unlimited"
-        assert data["beagle3"]["max_walltime_effective"] == "2-00:00:00"
+        assert data["gn"]["max_walltime_queue"] == "unlimited"
+        assert data["gn"]["max_walltime_effective"] == "2-00:00:00"
 
     def test_unresolved_nodes_are_reported(self, cluster, capsys):
         cmd_queues(cluster, _args(["--json", "queues", "-q", "test"]), PLAIN)
@@ -1084,8 +1100,8 @@ class TestQueues:
         assert data["nodes"] < 610
 
     def test_filter(self, cluster, capsys):
-        cmd_queues(cluster, _args(["--json", "queues", "-p", "beagle3"]), PLAIN)
-        assert [q["name"] for q in json.loads(capsys.readouterr().out)] == ["beagle3"]
+        cmd_queues(cluster, _args(["--json", "queues", "-p", "gn"]), PLAIN)
+        assert [q["name"] for q in json.loads(capsys.readouterr().out)] == ["gn"]
 
 
 class TestNodes:
@@ -1113,8 +1129,8 @@ class TestHealth:
     def test_json(self, cluster, capsys):
         cmd_health(cluster, _args(["--json", "health"]), PLAIN)
         data = json.loads(capsys.readouterr().out)
-        assert any(n["name"] == "midway3-0385" for n in data["unschedulable"])
-        assert "midway3" in data["unschedulable_nodelist"]
+        assert any(n["name"] == "cn-0385" for n in data["unschedulable"])
+        assert "cn" in data["unschedulable_nodelist"]
 
     def test_it_admits_what_the_keyword_scan_cannot_find(self, cluster, capsys):
         cmd_health(cluster, _args(["health"]), PLAIN)
@@ -1200,7 +1216,7 @@ class TestExclude:
         cmd_exclude(cluster, _args(["--json", "exclude", "--unschedulable"]), PLAIN)
         data = json.loads(capsys.readouterr().out)
         assert data["count"] >= 1
-        assert "midway3-0385" in data["nodes"]
+        assert "cn-0385" in data["nodes"]
 
 
 class TestShapeFlags:
@@ -1947,11 +1963,15 @@ class TestStatusIsNotFramedAroundGpus:
         assert "░" in gpu
         assert "█" * 10 not in gpu
 
-    def test_a_cpu_partition_has_a_blank_gpu_cell_not_a_dash(self, capsys):
+    def test_a_cpu_partition_says_the_question_does_not_arise(self, capsys):
+        # A dash, and not a blank. The column is headed `gpu free`, so it asks
+        # a question, and a partition with no accelerators is not answering it
+        # -- the same reading the node table uses. This assertion used to
+        # require the blank, from before the column had a name.
         out = self._out(capsys)
         row = next(ln for ln in out.splitlines() if "cpuq" in ln)
-        assert "—" not in row
-        assert "/0" not in row
+        assert "—" in row
+        assert "/0" not in row       # and never a fraction over nothing
 
     def test_ranking_is_by_free_nodes_not_free_gpus(self, capsys):
         out = self._out(capsys)
@@ -1966,30 +1986,41 @@ class TestStatusIsNotFramedAroundGpus:
     def test_the_gpu_column_still_appears_where_there_are_gpus(self, capsys):
         out = self._out(capsys)
         row = next(ln for ln in out.splitlines() if "bigq" in ln)
-        # Two cells now, not "4/32": a single fraction cannot say which side is
-        # free, and "4/4 100%" was read as plausibly meaning all four are BUSY.
-        assert " 32 " in row or row.rstrip().endswith("32")
-        assert " 4 " in row
+        # One cell, `free/total`, under a header that names the numerator.
+        assert "4/32" in row
 
-    def test_no_column_packs_free_and_total_into_one_fraction(self, capsys):
-        out = self._out(capsys)
-        # `share` used to label a percentage column. It is gone: a bar drawn
-        # from one notion of free beside a number expressing another was
-        # unreadable, so there is one quantity per column now.
-        header = next(ln for ln in out.splitlines() if "cores" in ln)
-        assert "free" in header and "nodes" in header
-        assert "share" not in header
-        # No cell is a bare "free/total" fraction. The first version split the
-        # row on a double space and looked at element zero, which is the leading
-        # indent -- so it checked nothing and a mutation recombining the columns
-        # sailed through it.
+    def test_every_fraction_sits_under_a_header_that_names_it(self, capsys):
+        """`free/total` in one cell, and the header says which side is free.
+
+        This assertion used to be the opposite: no cell could hold a fraction
+        at all, because `4/4` cannot say which number is the free one -- "4/4
+        100%" was once read as meaning all four are BUSY. Splitting them fixed
+        that and created a worse one: two columns headed plainly `free`, one
+        for cores and one for accelerators, so the word covered two resources
+        at once. "why free appears twice on the column title? what does it
+        mean?" The header carries the answer instead, and every fraction in the
+        table is under one.
+        """
         import re
 
-        for row in [ln for ln in out.splitlines()
-                    if any(q in ln for q in ("bigq", "cpuq"))]:
+        out = self._out(capsys)
+        header = next(ln for ln in out.splitlines() if "cores free" in ln)
+        # No COLUMN is headed by a bare `free`: every one names its resource.
+        cells = [c for c in re.split(r"\s{2,}", header.strip("│ ")) if c]
+        assert "free" not in cells, cells
+        assert "share" not in cells
+        for want in ("nodes idle", "cores free", "gpu free"):
+            assert want in cells, (want, cells)
+        # And the numbers under them are fractions, not lone counts.
+        rows = [ln for ln in out.splitlines()
+                if any(q in ln for q in ("bigq", "cpuq"))]
+        assert rows
+        for row in rows:
             fractions = [tok for tok in row.split()
                          if re.fullmatch(r"\d+/\d+", tok)]
-            assert not fractions, f"packed fraction in {row!r}: {fractions}"
+            # `nodes idle` and `cores free` always; `gpu free` only where there
+            # are accelerators to count.
+            assert 2 <= len(fractions) <= 3, (row, fractions)
 
 
 class TestQueuesIsNotFramedAroundGpus:
@@ -2118,7 +2149,7 @@ class TestStatusFiltersToWhatWillTakeTheJob:
     65 partitions with room down to 12, every drop confirmed ACCOUNT_MISMATCH.
     It is nowhere near sufficient though -- of the 12 it keeps, a dry-run
     accepts 3. The association table lists this user in `ssd`,
-    `pi-sriesenfeld`, `pi-aaz` and three more, and the submit plugin rejects
+    `pi-okafor`, `pi-tanaka` and three more, and the submit plugin rejects
     all of them with "Invalid membership". So the dry-run runs by default too,
     and it is cheap because the allowlist filter goes first.
     """
@@ -2375,8 +2406,10 @@ class TestAFullPartitionYouCanUseIsStillListed:
         assert "roomy" in self._out(capsys)
 
     def test_the_full_one_reports_zero_free(self, capsys):
+        # `0/8`, not a lone `0`: the columns hold `free/total` now, so the
+        # denominator says how much is there to be full of.
         row = next(ln for ln in self._out(capsys).splitlines() if "full" in ln)
-        assert " 0 " in row
+        assert "0/8" in row
 
     def test_the_roomy_one_comes_first(self, capsys):
         # Still ordered by where the room is; the full one is not promoted.

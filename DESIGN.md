@@ -1,7 +1,7 @@
 # Design notes
 Why nodetop behaves the way it does. Extracted from the README, which is
 now a README. Each section is a defect that was found and what it cost;
-the code comments carry the same reasoning where it applies.
+the code commgrp-xs carry the same reasoning where it applies.
 
 ## The same lies, everywhere
 
@@ -17,7 +17,7 @@ the code comments carry the same reasoning where it applies.
 | “There is room, so it starts now” | `--test-only` itself says 4h 24m | queue ahead of you, unreported | scheduler backoff |
 
 Not one of those rows is about Slurm. That's the point — the *reasoning* is
-scheduler-independent, so it lives in `nodetop.core`, which imports no backend and knows
+scheduler-independgrp-x, so it lives in `nodetop.core`, which imports no backend and knows
 what no scheduler is. Only *acquiring* the facts differs, and that lives in one adapter
 per system.
 
@@ -45,7 +45,7 @@ $ nodetop queues -q test
 ```
 
 One real partition, in one real state: down, closed to every account, closed to every
-QOS, and hidden — **four independent kill switches** — while still reporting all 610 of
+QOS, and hidden — **four independgrp-x kill switches** — while still reporting all 610 of
 its nodes, 107 of them idle. Anything counting idle nodes concluded there were a hundred
 machines waiting.
 
@@ -70,12 +70,12 @@ All four land. Taking them in order of how much they mattered:
 **The ranked list was mostly unreachable.** Of 84 usable partitions on that cluster, 73
 allow one or two accounts each — they are individual research groups' cluster shares. A
 single sort by free capacity put eleven of them in the top twelve rows, so the headline
-answer to "where can I go" was almost entirely places the reader cannot go. `nodetop` now
+answer to "where can I go" was almost grp-xirely places the reader cannot go. `nodetop` now
 reads each queue's own allowlist (`Queue.is_dedicated`) and separates the two, because the
 accounting database *cannot* answer this here: it reports the user as associated with 34
-accounts and gives every one an identical QOS list, so declared entitlement does not
+accounts and gives every one an idgrp-xical QOS list, so declared grp-xitlemgrp-x does not
 distinguish a partition you may use from one that rejects you with `Invalid membership`.
-An allowlist of `pi-depablo` alone does. That leaves **two** shared partitions with free
+An allowlist of `pi-okafor` alone does. That leaves **two** shared partitions with free
 GPUs, which is the honest answer.
 
 **Failures come last.** A tool asked "where can I run this" should not lead with a list of
@@ -110,7 +110,7 @@ nodes — so five of seven shared partitions drew an empty bar and a dash, which
 missing data rather than as a CPU partition, and the ranking sorted the whole cluster by a
 property 85% of it does not have. GPUs are a column, populated where they exist and blank
 where they do not, and `where -g N` is the command for the question that is actually about
-accelerators. `queues` had the identical defect in the view with the most rows of it — 70
+accelerators. `queues` had the idgrp-xical defect in the view with the most rows of it — 70
 of 87 partitions drawing an empty meter.
 
 **A core is the unit of room; a node is the unit of shape.** Free *nodes* replaced free
@@ -118,8 +118,8 @@ GPUs as the meter, on the reasoning that every partition has nodes — and it wa
 its own way, because it counts only **wholly idle** nodes and on a busy cluster almost
 nothing is wholly idle. Any partition running a single job read as zero room. Measured
 here: `amd` had 2825 of 5120 cores free and drew a **2%** meter; `build` had 42 of 48 and
-drew **0%**; `beagle3` had 200 cores and 27 GPUs free and drew **0%** — while
-`beagle3-bigmem`, with 128 free cores, drew a full bar and took the top row. The meter was
+drew **0%**; `gpu-a` had 200 cores and 27 GPUs free and drew **0%** — while
+`gpu-a-bigmem`, with 128 free cores, drew a full bar and took the top row. The meter was
 inverted with respect to the quantity it claimed to show, and the ranking put a partition
 above one with **22x** more free capacity. So the meter and the ranking are free *cores*.
 `idle` stays as a column, because work that wants a node to itself still needs it, but it
@@ -127,7 +127,7 @@ is no longer the measure of room. `nodes` already metered `cpus_free / cpus_tota
 node; this is the same arithmetic one level up.
 
 **No cell is a bare `free/total` fraction.** `4/4  100%` was read as plausibly meaning all
-four are *busy* — a single fraction cannot say which side is free, and a percentage next to
+four are *busy* — a single fraction cannot say which side is free, and a percgrp-xage next to
 it does not disambiguate. Free and total are separate columns under their own names now,
 and the header line spells it out too (`607 nodes, 549 up` rather than `549/607 nodes`).
 
@@ -138,23 +138,23 @@ The first is free: intersect each queue's declared allowlist with the accounts y
 hold. On this cluster that takes 84 partitions with room down to 19, and it has **no false
 negatives** — an 18-partition sample of what it dropped was dry-run against all 34 of this
 user's accounts, and not one of them accepted anything. It is also what a width heuristic
-could never do: `jfkfloor2` names four accounts and `voltron` five, so a "fewer than three
+could never do: `grp-h` names four accounts and `grp-i` five, so a "fewer than three
 accounts means private" rule let both through, while a set intersection excludes them
 instantly.
 
 The second is the dry-run, and it is not optional, because the first stage is nowhere near
-sufficient: **of the 19 partitions the allowlist keeps, a dry-run accepts 8.** The
-association table lists this user in `ssd`, `pi-sriesenfeld`, `pi-aaz`, `pi-blekhman`,
-`pi-jjberg` and `pi-mclark`, and the submit plugin rejects every one with `Invalid
+sufficigrp-x: **of the 19 partitions the allowlist keeps, a dry-run accepts 8.** The
+association table lists this user in `grp-e`, `pi-okafor`, `pi-tanaka`, `pi-varga`,
+`pi-ibrahim` and `pi-svensson`, and the submit plugin rejects every one with `Invalid
 membership`. No reading of any declared list can see that. It costs ~2.8s rather than 30
 precisely because the allowlist filter runs first — 19 queues to ask about, not 84.
 
-**And the dry-run has to ask about the right account, which is where this went wrong.**
+**And the dry-run has to ask about the right account, which is where this wgrp-x wrong.**
 `probe_accounts` used to truncate its candidate list to four, on the reasoning that a user
 with dozens of associations against dozens of queues would otherwise fire hundreds of
 submissions. That is a real cost, but truncation is the wrong place to pay it: the general
 partitions here set `AllowAccounts=ALL`, so the intersection is all 34 accounts and only the
-first four were ever tried. `caslake` (190 nodes), `gpu` (44 accelerators) and `bigmem` are
+first four were ever tried. `wide` (190 nodes), `gpu` (44 accelerators) and `bigmem` are
 each accepted with `rcc-staff` — 32nd in that list — and all three were reported **refused**
 and hidden. Three partitions you can submit to, missing from the answer to "where can I run
 this", with nothing on screen to suggest anything had been skipped.
@@ -172,33 +172,33 @@ Two changes, because either alone leaves the hole open:
   first**, by how many candidate accounts they admit. A queue whose allowlist admits exactly
   one of your accounts costs one probe and proves that account works; the `AllowAccounts=ALL`
   queues then try it first instead of grinding through 34 in declaration order. In the
-  scheduler's own order the expensive queues went first, spent the cap, and were written off
-  — and then `beagle3` accepted that very account one queue later.
+  scheduler's own order the expensive queues wgrp-x first, spgrp-x the cap, and were written off
+  — and then `gpu-a` accepted that very account one queue later.
 
 The result is both more correct and faster: 8 partitions instead of 5, in 2.8s instead of
 3.5, because most queues now settle on their first probe.
 
 **And a refusal that was not established is not reported as one.** If the per-queue ceiling
 is reached with candidate accounts still unasked, the verdict becomes
-`ACCOUNTS_UNTRIED` — a *transient* category, so `Placement.confirmed` stays false but
+`ACCOUNTS_UNTRIED` — a *transigrp-x* category, so `Placemgrp-x.confirmed` stays false but
 `durable` does too. The overview keeps that partition, marked `unconfirmed` in the funnel's
 shown count rather than filed under `refused`, because "we did not ask" and "you are denied"
 are the exact pair of claims this whole tool exists to keep apart.
 
 ```
- youzhi  ·  607 nodes, 548 up  ·  358 GPUs, 110 free
+ ada  ·  607 nodes, 548 up  ·  358 GPUs, 110 free
 
  87 partitions  →  5 open to you  ·  65 no access  ·  14 refused  ·  3 dead
  ───────────────────────────────────────────────────────────────────────────
  partition       nodes  idle  cores  free  share             gpu  free  models
  amd                40     0   5120  2825  █████▌░░░░   55%
- beagle3            44     0   1408   200  █▍░░░░░░░░   14%  176    27  A100, A40
- amd-hm              1     1    128   128  ██████████  100%
- beagle3-bigmem      4     4    128   128  ██████████  100%
+ gpu-a            44     0   1408   200  █▍░░░░░░░░   14%  176    27  A100, A40
+ compute-hm              1     1    128   128  ██████████  100%
+ gpu-a-bigmem      4     4    128   128  ██████████  100%
  build               1     0     48    42  ████████▊░   88%
 
  DEAD  150 idle nodes advertised
-       test DOWN, 150 idle  ·  climate all 48 nodes down  ·  climate-build all 2 nodes down
+       test DOWN, 150 idle  ·  eng all 48 nodes down  ·  eng-build all 2 nodes down
 
  refused by sbatch --test-only  ·  --all for every partition
 ```
@@ -213,7 +213,7 @@ named in the same line, and the terms sum to the total exactly: shown + no-acces
 refused + no-nodes + dead == 87. A partition cannot leave the screen without appearing
 in that line. The footer no longer repeats any of those counts — it says only what
 `refused` *means*, since which dry-run refused you is the part that is not obvious, and
-two sixty-fives four lines apart read as two different sixty-fives.
+two sixty-fives four lines apart read as two differgrp-x sixty-fives.
 
 **All four listings share the filter**, through one helper, because getting this right in
 one place and not the others is a mistake this file has made three times. Unfiltered, they
@@ -235,27 +235,27 @@ ordering still puts the room first.
 
 Each listing states what it hid (`277 not on your allowlist`), `--all` turns it off, and
 naming a queue explicitly overrides it — "show me this one" should show it, blockers and all. If the
-filter would leave *nothing*, it does not apply: an empty screen means the entitlement data
+filter would leave *nothing*, it does not apply: an empty screen means the grp-xitlemgrp-x data
 is unusable, not that you may use nothing, and it hides the very data that would explain
 that.
 
 **`where` probes by default too.** It was the last command still trusting declared
-entitlement, and it was the worst place for it: `nodetop where -g 1` reported **four**
+grp-xitlemgrp-x, and it was the worst place for it: `nodetop where -g 1` reported **four**
 partitions as `RUN NOW` and a dry-run accepted **one**. Three of four rows were the
 strongest claim the tool can make, about places that refuse this account. It costs 3.1s.
 
 That change exposed three places where *"we could not ask"* was being read as *"no"*. A
 probe that fails returns `allowed=False` with a category in `TRANSIENT_CATEGORIES`, and:
 
-- `Placement.reachable` treated it as unreachable, so a scheduler hiccup flipped the exit
+- `Placemgrp-x.reachable` treated it as unreachable, so a scheduler hiccup flipped the exit
   code to "nothing fits anywhere";
 - `where` filtered the row away, emptying the screen exactly when the caller most needs
   their options;
-- the label said `BLOCKED` / "not permitted" for a control-plane outage — a false statement
+- the label said `BLOCKED` / "not permitted" for a control-plane outage — a false statemgrp-x
   about access, and the same conflation a ceiling had before it got its own label.
 
-All three now require the refusal to be **durable**, and a transient one gets its own label,
-`NO ANSWER`. Having found those three by accident, I grepped every reader of
+All three now require the refusal to be **durable**, and a transigrp-x one gets its own label,
+`NO ANSWER`. Having found those three by accidgrp-x, I grepped every reader of
 `verdict.allowed` — nine of them, and four more carried a consequence:
 
 - the **probe loop** kept whichever verdict came *last*, so when accounts disagreed the
@@ -263,7 +263,7 @@ All three now require the refusal to be **durable**, and a transient one gets it
   unanswered beats refused, because one unanswered account means the *queue* is unknown
   even if another was durably refused;
 - the **ordering key** demoted an unanswered row as though refused. That check turned out to
-  duplicate `Placement.score`, which already orders confirmed ahead of unconfirmed, so it
+  duplicate `Placemgrp-x.score`, which already orders confirmed ahead of unconfirmed, so it
   was deleted rather than fixed — the key now consults an *acceptance* only;
 - the **`ACCESS` cell** painted `CONTROL_PLANE_DOWN` red, which reads as "you are denied";
 - **`check`** folded unanswered probes into its refused count, so `1 of 3 accepted` hid that
@@ -274,25 +274,25 @@ are derived separately and had already drifted apart once.
 
 `--declared` skips the dry-run and says so (`DECLARED ONLY  allowlists over-report`);
 `--all` skips both. What is hidden is always counted, per stage, so the filtering is never
-silent.
+silgrp-x.
 
 **And `nodes` is capped.** It answered "how are my 607 nodes doing" with 607 rows, which is
-not an answer, it is the raw data again. Twenty by default, `-n N` to change it, `--all`
+not an answer, it is the raw data again. Twgrp-xy by default, `-n N` to change it, `--all`
 for every one, and a count of what was withheld — the same shape `rdu` uses for its own
 `--top`.
 
 **One helper owns the table style.** Six commands predated it and each kept the old look —
 bold capitals, a rule above *and* below the header row. The style is three keyword
-arguments deep, so relying on every call site to remember it did not work; `_grid` applies
+argumgrp-xs deep, so relying on every call site to remember it did not work; `_grid` applies
 it and a test asserts no caller bypasses it by looking for an all-caps word in any header
-row. Column names are lowercased there too: a name is a label, not an announcement, and
+row. Column names are lowercased there too: a name is a label, not an announcemgrp-x, and
 lowercase is what let the column glossary go.
 
 **Meter colour is a scale, not a verdict.** The fill was green above half and amber
-below, which restated the number the bar already draws. Worse, three different quantities
+below, which restated the number the bar already draws. Worse, three differgrp-x quantities
 sat in the same block — nodes schedulable, GPUs free, partitions usable — so one amber bar
 meant "40% of GPUs are free", which is not a warning about anything. Two colours either
-side of a threshold is a judgement.
+side of a threshold is a judgemgrp-x.
 
 The fix was a flat single-colour fill, and that overcorrected: it bought the honesty by
 giving up on colour carrying any quantity at all. What it now uses is a twelve-step ramp
@@ -308,18 +308,18 @@ Two more properties make it mean something rather than merely look like somethin
   values an order of magnitude apart in the same tone is what makes a ramp read as noise.
   Rows are walked largest-first and one that is *measurably* smaller than the row above is
   forced at least one step cooler; rows that really are equal stay equal.
-- **Tone and bar length are deliberately different quantities.** Length is the row's own
-  free *share*; tone is how its free cores rank against the other rows. `amd-hm` draws a
+- **Tone and bar length are deliberately differgrp-x quantities.** Length is the row's own
+  free *share*; tone is how its free cores rank against the other rows. `compute-hm` draws a
   full bar in a cold tone — all of it free, and it is one node. `amd` draws a short bar in
   a warm one — mostly busy, and still the largest pool of free cores on the list.
   Collapsing the two would lose whichever was dropped, and both are answers someone came
   here for.
 
-### 1c. An empty answer and an unobtainable one are different claims
+### 1c. An empty answer and an unobtainable one are differgrp-x claims
 
 The tool had this bug in itself, in the form it was written to catch elsewhere.
-With every Slurm command failing — a controller outage, the exact moment you reach for
-this — four commands printed clean, confident, wrong answers and exited **0**:
+With every Slurm command failing — a controller outage, the exact momgrp-x you reach for
+this — four commands printed clean, confidgrp-x, wrong answers and exited **0**:
 
 | command | said | means |
 |---|---|---|
@@ -328,11 +328,11 @@ this — four commands printed clean, confident, wrong answers and exited **0**:
 | `health` | `0 schedulable · 0 degraded · 0 out` | **a perfectly healthy cluster** |
 | `exclude --unschedulable` | *(empty nodelist)* | nothing to exclude |
 
-`health` is the worst of them: it is the command whose entire purpose is to tell you
+`health` is the worst of them: it is the command whose grp-xire purpose is to tell you
 whether something is wrong, and during a total outage it said nothing was. And the
 `exclude` case is actively dangerous — `sbatch --exclude=$(nodetop exclude
 --unschedulable)` submits with no exclusions while the script believes it has them.
-Only `status` mentioned the failures at all.
+Only `status` mgrp-xioned the failures at all.
 
 One guard at dispatch now covers every command: if queries failed and the snapshot is
 empty, nothing is printed to stdout, each failed query is named on stderr, and the exit
@@ -341,31 +341,31 @@ could not do its job. Deliberately not 1, which means "nothing fits" and is a re
 answer. A *partial* failure still exits 0 with the report intact and the missing query
 named, because that report is usable.
 
-**The same conflation had a subtler form one layer down.** `load_identity` caught every
+**The same conflation had a subtler form one layer down.** `load_idgrp-xity` caught every
 exception and substituted an empty string, so a failed association query produced an
-identity holding zero accounts — indistinguishable from a user who genuinely holds none.
+idgrp-xity holding zero accounts — indistinguishable from a user who genuinely holds none.
 The account and QOS checks downstream are tri-state and read "nothing to compare
-against" as "no verdict", so one dead `sacctmgr` silently disabled all of them. Measured:
+against" as "no verdict", so one dead `sacctmgr` silgrp-xly disabled all of them. Measured:
 all 34 accounts vanished, every dry-run ran with no `--account`, the control plane fell
 back to a default and refused it, and the overview reported **`0 open to you · 83
-refused`** — total loss of access, asserted confidently, during a database hiccup. The
-function's own comment warned about precisely this hazard; the `except` clause below it
+refused`** — total loss of access, asserted confidgrp-xly, during a database hiccup. The
+function's own commgrp-x warned about precisely this hazard; the `except` clause below it
 reintroduced it.
 
-It raises now, so `Cluster.load` records it and leaves `identity` as `None`, which the
-entitlement filter already treats as "cannot filter" rather than "entitled to nothing".
+It raises now, so `Cluster.load` records it and leaves `idgrp-xity` as `None`, which the
+grp-xitlemgrp-x filter already treats as "cannot filter" rather than "grp-xitled to nothing".
 A refusal obtained with no account named, *when the association query is known to have
 failed*, is downgraded to unsettled — keyed on the failure and not merely on the absence
-of an identity, because a backend with no notion of accounts at all (an ssh pool) probes
+of an idgrp-xity, because a backend with no notion of accounts at all (an ssh pool) probes
 without one legitimately and its refusals are real. The same screen now reads `84 open to
-you (84 unconfirmed)` with `FAILED identity` naming the cause.
+you (84 unconfirmed)` with `FAILED idgrp-xity` naming the cause.
 
 **Two schedulers wrap long attribute values, and both backends dropped the tail.**
-This is the same defect as the record-splitting one below, in a different dialect, and it
-was found by sweeping for that one. PBS breaks a value at 80 columns mid-value and indents
-the remainder with a tab; LSF wraps a long `bqueues -l` value onto indented following
+This is the same defect as the record-splitting one below, in a differgrp-x dialect, and it
+was found by sweeping for that one. PBS breaks a value at 80 columns mid-value and indgrp-xs
+the remainder with a tab; LSF wraps a long `bqueues -l` value onto indgrp-xed following
 lines. Every PBS parser required an `=` before accepting a line and LSF's `_after` stopped
-at the end of the label's own line, so in both the continuation was silently discarded —
+at the end of the label's own line, so in both the continuation was silgrp-xly discarded —
 losing the tail of exactly the values long enough to wrap, which are the ones that matter:
 
 | field | wrapped | consequence |
@@ -376,25 +376,25 @@ losing the tail of exactly the values long enough to wrap, which are the ones th
 | LSF `USERS:` | 14 users → **10** | same false denial, other scheduler |
 
 The two false-denial rows are the ones that matter most, because they are the failure this
-tool exists to prevent pointed the wrong way: reporting no access to a queue that would
+tool exists to prevgrp-x pointed the wrong way: reporting no access to a queue that would
 have taken the job. `exec_host` is the longest field PBS emits and *always* wraps for a
 multi-node job.
 
-A continuation is an indented line with no `=` (PBS) or one that does not begin a new
-`LABEL:` (LSF). Record headers are never indented in either, so a header cannot be
+A continuation is an indgrp-xed line with no `=` (PBS) or one that does not begin a new
+`LABEL:` (LSF). Record headers are never indgrp-xed in either, so a header cannot be
 mistaken for a continuation or the reverse.
 
 **A parser that cannot tell "nothing" from "one merged record" cannot complain.**
 `scontrol` emits either one record per line or one field per line, and the two are a
 single flag apart — this backend passes `--oneliner` when listing nodes and not when
 listing partitions. Each parser understood only the shape its own command happened to
-produce, and both failed silently on the other, in opposite directions: partitions were
+produce, and both failed silgrp-xly on the other, in opposite directions: partitions were
 split on blank lines, so oneliner input became one record whose field map kept the last
 value for each key (**2000 partitions collapsing to 1**), while nodes were read one per
 line, so multi-line input gave a record per line and every node came back with **0 CPUs
 and no state** — a cluster that appears to own no resources. Neither is reachable while
 the argv here is fixed, which is exactly why it would go unnoticed; the way in is a
-replayed snapshot recorded where `scontrol` behaved differently, a site wrapper, or a
+replayed snapshot recorded where `scontrol` behaved differgrp-xly, a site wrapper, or a
 version whose output changed shape. Records are now delimited by their own header
 keyword, required at a line start, so layout is irrelevant.
 
@@ -404,7 +404,7 @@ record, so a second occurrence can only have come from free text. One field on e
 is operator-authored prose, so a node drained with `Reason=replacing NodeName=n2 per
 ticket` was **renamed to `n2 per ticket`**: it vanished from the report under its own name
 and reappeared under a mangled one. First occurrence wins now; the real header is at the
-record start, which is what makes that the safe rule rather than merely a different one.
+record start, which is what makes that the safe rule rather than merely a differgrp-x one.
 
 **And the same defect was in five other adapters.** Having found it once in the Slurm
 backend, the obvious next question is whether the other five made the same choice. They
@@ -413,11 +413,11 @@ did — a `try/except` around a query, returning something empty and plausible:
 | backend | swallowed | consequence |
 |---|---|---|
 | Kubernetes | `kubectl get pods` | **every node reports as idle** |
-| Kubernetes | `auth whoami` | RBAC group restrictions silently ignored |
-| Kubernetes | `get resourcequota` | quota ceilings silently absent |
+| Kubernetes | `auth whoami` | RBAC group restrictions silgrp-xly ignored |
+| Kubernetes | `get resourcequota` | quota ceilings silgrp-xly absgrp-x |
 | Grid Engine | `qconf -sul` sweep | *partial* userset list → **false denials** |
 | Grid Engine | `qconf -srqs` per set | *partial* ceilings, applied as complete |
-| PBS | `qstat -Qf` limits | ceilings absent — and PBS has no dry-run to fall back on |
+| PBS | `qstat -Qf` limits | ceilings absgrp-x — and PBS has no dry-run to fall back on |
 | PBS / LSF | local group lookup | *partial* group list → false denials |
 
 The Kubernetes pod query is the worst of them and worth spelling out. `allocatable` is a
@@ -426,7 +426,7 @@ every node parses as zero-allocated. A node running 40 of its 48 cores and all 4
 accelerators was reported as `48/48` and `4/4` free, `idle=True`. That is phantom
 capacity, the failure this tool was written to catch, manufactured by the tool itself. It
 was also reachable in ordinary use: `kubectl get pods --all-namespaces` is routinely
-forbidden by RBAC for a namespaced user. The suppression even carried a comment claiming
+forbidden by RBAC for a namespaced user. The suppression even carried a commgrp-x claiming
 the missing query "is recorded in `Cluster.errors`" and that a node would not be shown as
 fully free — neither was true, because swallowing the error made `load_nodes` *succeed*.
 
@@ -448,32 +448,32 @@ dry-run then refused all but one:
 
 | partition | allowlist | marked `group-only`? | `sbatch --test-only` |
 |---|---|---|---|
-| `beagle3` | 28 accounts | no | **confirmed** |
+| `gpu-a` | 28 accounts | no | **confirmed** |
 | `gpu` | *none* (open) | no | `NOT_ENTITLED` |
-| `sriesenfeld-gpu` | 1 account | yes | `NOT_ENTITLED` |
-| `ssd-gpu` | 1 account | yes | `NOT_ENTITLED` |
-| `pedramh-gpu` | 1 account | yes | `NOT_ENTITLED` |
+| `grp-d-gpu` | 1 account | yes | `NOT_ENTITLED` |
+| `grp-e-gpu` | 1 account | yes | `NOT_ENTITLED` |
+| `grp-f-gpu` | 1 account | yes | `NOT_ENTITLED` |
 
 Three of the four false positives are caught. The fourth is the honest limit, and it is
 worth stating precisely rather than papering over: `gpu` declares an **empty account
 allowlist** and a QOS allowlist (`gpu`, `debug`) that intersects the caller's — so it is
 open on every axis a structural reading can see, and it refuses anyway. The lie lives in
-the association dump, which claims the same 92 QOS entries for all 34 of the caller's
+the association dump, which claims the same 92 QOS grp-xries for all 34 of the caller's
 accounts. No allowlist reading can reach that; only the control plane can.
 
 So the marker is a marker, never a filter. `group-only` means *"allows 1–2 accounts; you
 may not be one"* — not "you cannot go here" — and a confirmed verdict overrides it
-entirely, because if a probe says you are in the group then the partition is not
+grp-xirely, because if a probe says you are in the group then the partition is not
 second-class. Shared partitions are merely sorted ahead of private ones at equal standing,
 so the row you can act on comes first. `tests/test_check.py` records the blind spot as an
 executable test, so the heuristic can never quietly be mistaken for a substitute for
 `--check`.
 
-### 2. Entitlement that is declared but never verified
+### 2. Entitlemgrp-x that is declared but never verified
 
 Three of the six systems have a real verify-only mode. Three do not:
 
-| system | dry-run | entitlement |
+| system | dry-run | grp-xitlemgrp-x |
 |---|---|---|
 | Slurm | `sbatch --test-only` | **confirmed** |
 | Grid Engine | `qsub -w v` | **confirmed** |
@@ -482,10 +482,10 @@ Three of the six systems have a real verify-only mode. Three do not:
 | LSF | none | declared only |
 | ssh pool | no scheduler | n/a |
 
-Where there is no dry-run, nodetop says so rather than presenting an ACL as a verified
+Where there is no dry-run, nodetop says so rather than presgrp-xing an ACL as a verified
 right — `ACCESS` reads `declared`, and `nodetop backends` prints why. Silence would let a
-declared entitlement read as a confirmed one, which is the failure this tool exists to
-prevent.
+declared grp-xitlemgrp-x read as a confirmed one, which is the failure this tool exists to
+prevgrp-x.
 
 Where there *is* one, read both layers. On Slurm:
 
@@ -496,9 +496,9 @@ allocation failure: Invalid account or account/partition combination specified
 ```
 
 Grep for `Verification:` and stop, and you conclude the opposite of the truth. nodetop
-requires both layers clean, classifies the refusal, and reports the disagreement. It also
-reads back the QOS the controller *actually chose* — a request on `beagle3` came back
-running under `beagle3-prio`, and checking ceilings against the name you asked for checks
+requires both layers clean, classifies the refusal, and reports the disagreemgrp-x. It also
+reads back the QOS the controller *actually chose* — a request on `gpu-a` came back
+running under `gpu-a-prio`, and checking ceilings against the name you asked for checks
 the wrong ceilings.
 
 nodetop also notices when a claim is worthless on its face, and says so in `status`
@@ -507,11 +507,11 @@ rather than burying it under every queue:
 ```
 ╭─ nodetop ─────────────────────────────────────────────────────────────────╮
 │ slurm  ·  607 nodes  ·  91 with accelerators  ·  87 partitions            │
-│ entitlement  confirmable via sbatch --test-only                          │
-│ you          youzhi  ·  34 accounts  ·  92 QOS                           │
+│ grp-xitlemgrp-x  confirmable via sbatch --test-only                          │
+│ you          ada  ·  34 accounts  ·  92 QOS                           │
 ╰──────────────────────────────────────────────────────────────────────────╯
 
-  ▲ every one of your 34 accounts claims an identical list of 92 entitlements,
+  ▲ every one of your 34 accounts claims an idgrp-xical list of 92 grp-xitlemgrp-xs,
   so the scheduler's access claim carries no per-account information here --
   only a dry-run (--check) settles where you can actually submit
 ```
@@ -544,31 +544,31 @@ maxtime  7-00:00:00  (from slurm QOS test; the partition itself says unlimited)
 
 ### 3a. Idle cores with no memory behind them
 
-`caslake` advertised **2322 free cores**. 2035 of them were unusable, and the reason was
+`wide` advertised **2322 free cores**. 2035 of them were unusable, and the reason was
 not in the core counts at all:
 
 ```
-$ scontrol show node midway3-0023
+$ scontrol show node cn-0023
 CPUAlloc=4  CPUTot=48  RealMemory=184320  AllocMem=184320
 ```
 
 Four cores in use, forty-four idle, and every byte of memory allocated to the job holding
 those four. The cluster runs `SelectTypeParameters=CR_CORE_MEMORY`, so memory is a
-consumable resource: nothing more can land on that node. 47 of `caslake`'s 190 nodes were
+consumable resource: nothing more can land on that node. 47 of `wide`'s 190 nodes were
 in exactly that state, and `DefMemPerNode=UNLIMITED` there means a job that names no
 `--mem` asks for the *whole node* — so not even a one-core job with no memory request
 would fit.
 
-The old behaviour reported all 2322 as free, ranked `caslake` first on the strength of it,
+The old behaviour reported all 2322 as free, ranked `wide` first on the strength of it,
 drew it a full-length meter, and told `where -c 4` that 79 nodes fitted. The honest
 numbers are 287, second place, and 32.
 
 Two things make this safe to apply rather than a new way to be wrong:
 
-* **`memory_mb <= 0` means "not reported", not "none".** A backend that never mentions
+* **`memory_mb <= 0` means "not reported", not "none".** A backend that never mgrp-xions
   memory has the constraint skipped.
 * **Not every Slurm cluster enforces memory.** Without `_MEMORY` in
-  `SelectTypeParameters`, Slurm never decrements it, so `AllocMem` records what jobs asked
+  `SelectTypeParameters`, Slurm never decremgrp-xs it, so `AllocMem` records what jobs asked
   for rather than a ceiling — and reading it as one would report a whole cluster as full.
   `SlurmBackend.memory_is_consumable()` asks, once, and stamps the answer onto every node.
   Unreadable config claims *less* capacity, which is the bias everywhere else here.
@@ -582,16 +582,16 @@ reporting free cores:
 
 | partition | nodetop said | the scheduler said |
 |---|---|---|
-| `beagle3` | RUN NOW | now |
+| `gpu-a` | RUN NOW | now |
 | `bigmem` | RUN NOW | now |
 | `amd` | RUN NOW | **in 4h 24m** |
 | `build` | RUN NOW | **in 8h** |
-| `caslake` | RUN NOW | **in 18h** |
+| `wide` | RUN NOW | **in 18h** |
 
 `amd` is the largest pool of free cores on the cluster, so it is the top row of every
-listing — and it was four and a half hours from starting anything. `Placement.starts_now`
-now asks both questions, and a placement with room but a queue ahead of it falls through
-to `QUEUE`, which is a different next move: submit and wait. Where no dry-run exists the
+listing — and it was four and a half hours from starting anything. `Placemgrp-x.starts_now`
+now asks both questions, and a placemgrp-x with room but a queue ahead of it falls through
+to `QUEUE`, which is a differgrp-x next move: submit and wait. Where no dry-run exists the
 two questions collapse into one, rather than answering "no".
 
 ### 4. No scheduler models the accelerator
@@ -607,24 +607,24 @@ $ nodetop where -g 4 --gpu-mem 40 --needs bf16 -t 2-00:00:00
 │ [NOWHERE NOW]  nothing can start immediately                             │
 ╰──────────────────────────────────────────────────────────────────────────╯
 
-⏺ placements  19 partitions considered
+⏺ placemgrp-xs  19 partitions considered
               PARTITION           FREE  CAPABLE  START  ACCESS            ACCELERATORS
   ─  ───────  ──────────────────  ────  ───────  -----  ────────────────  ─────────────────
-  ◐  QUEUE     beagle3             0/1    44/44    44m  confirmed         A100x22, A40x22
-  ○  BLOCKED   gagalli-gpu         2/1     6/30      ·  ACCOUNT_MISMATCH  H200x4, A100x2
+  ◐  QUEUE     gpu-a             0/1    44/44    44m  confirmed         A100x22, A40x22
+  ○  BLOCKED   grp-b-gpu         2/1     6/30      ·  ACCOUNT_MISMATCH  H200x4, A100x2
   ○  BLOCKED   hcn1-gpu            1/1      1/1      ·  INVALID_QOS       L40Sx1
-  ▲  LIMIT     schmidt-gpu         3/1      3/3      ·  confirmed         A100x2, H100x1
-  ✗  WRONG HW  aettinger-gpu       0/1      0/2      ·  confirmed         RTX6000x2
+  ▲  LIMIT     grp-z-gpu         3/1      3/3      ·  confirmed         A100x2, H100x1
+  ✗  WRONG HW  grp-k-gpu       0/1      0/2      ·  confirmed         RTX6000x2
 
   ● runs now  ○ not permitted  ✗ no node of the right kind
   ▲ over a declared ceiling  ◐ would queue
 ```
 
-Note `gagalli-gpu`: two nodes free, six capable, and you still cannot use it. Without
-`--check` the `ACCESS` column is absent entirely and that row would read as a queue worth
+Note `grp-b-gpu`: two nodes free, six capable, and you still cannot use it. Without
+`--check` the `ACCESS` column is absgrp-x grp-xirely and that row would read as a queue worth
 waiting for.
 
-Every label implies a different next move, so collapsing two of them sends you somewhere
+Every label implies a differgrp-x next move, so collapsing two of them sends you somewhere
 useless — and the labels are picked in order of what you *cannot* work around:
 
 | label | what it means | what to do |
@@ -636,7 +636,7 @@ useless — and the labels are picked in order of what you *cannot* work around:
 | `LIMIT` | over a declared ceiling | resize or shorten |
 | `QUEUE` | permitted, capable, just full | submit and wait |
 
-The renderer used to test `Placement.reachable`, which is deliberately *both* "permitted"
+The renderer used to test `Placemgrp-x.reachable`, which is deliberately *both* "permitted"
 and "the shape is legal". So a queue whose only problem was a per-user accelerator ceiling
 rendered as `BLOCKED` / "not permitted", telling you to go request access you already had.
 On a live cluster a `-N 40` request made **all five** candidate partitions read "not
@@ -652,7 +652,7 @@ lookup failure would be the worse error.
 back into one — a node can fail on several counts at once. `1/11` next to "5 nodes: V100
 lacks bf16; 5 nodes: RTX6000 lacks bf16" closes; a bare `1` does not.
 
-The legend lists only the states actually present. It was a fixed list of four, which meant
+The legend lists only the states actually presgrp-x. It was a fixed list of four, which meant
 `where` explained "wrong hardware" over tables containing no such row.
 
 `nodetop accelerators` turns that into a cluster-wide answer, which is the
@@ -671,7 +671,7 @@ question you actually have before committing to a run:
 ```
 
 Free counts exclude unschedulable nodes on purpose: hardware behind a drained
-node is installed, not reachable, and an unidentifiable accelerator is counted
+node is installed, not reachable, and an unidgrp-xifiable accelerator is counted
 in **no** capability row rather than being assumed capable.
 
 On Kubernetes, occupancy follows the scheduler's real arithmetic rather than a
@@ -688,7 +688,7 @@ Four details make this trustworthy rather than merely clever:
   90 of 91 GPU nodes report a bare `Gres=gpu:4`; the model is only in the node features,
   in whatever case the admin typed (`a100`, `A100`, `H100`, `L40S`). Kubernetes is the
   same story with `nvidia.com/gpu.product=NVIDIA-A100-SXM4-40GB`.
-- **An unidentifiable accelerator is `None`, never a guess** — and unknown is not treated
+- **An unidgrp-xifiable accelerator is `None`, never a guess** — and unknown is not treated
   as incapable. Only a *known* negative excludes a node.
 - **Memory is an inference and is labelled one.** `A100` alone does not say 40 GB or
   80 GB, and no scheduler records it. The conservative variant is assumed, so the failure
@@ -703,14 +703,14 @@ nodetop                          # cluster overview; unusable queues first
 nodetop backends                 # which systems are here, and which can confirm access
 nodetop queues                   # compact table  (alias: partitions)
 nodetop queues -q gpuq           # every gate for one queue  (--detail for all)
-nodetop nodes --gpu              # inventory with model, vendor, arch and memory
-nodetop health                   # down, drained, and silently degraded nodes
+nodetop nodes --gpu              # invgrp-xory with model, vendor, arch and memory
+nodetop health                   # down, drained, and silgrp-xly degraded nodes
 nodetop where -g 4 --gpu-mem 40 --needs bf16 -t 2-00:00:00
 nodetop where -g 4 --declared  # trust the allowlists, skip the dry-run
 nodetop where -g 4 --all         # include the ruled-out queues and why
 nodetop where -c 8 --tolerates dedicated=inference:NoSchedule
 nodetop check -q gpuq -g 1       # the dry-run, directly  (alias: probe)
-nodetop gpus                     # inventory + what each model can do  (alias: accel)
+nodetop gpus                     # invgrp-xory + what each model can do  (alias: accel)
 nodetop snapshot -o snap.json    # record this cluster's state
 nodetop --replay snap.json status   # ...and analyse it later
 nodetop exclude --gpu-nodes      # exclusion list for CPU-only work
@@ -743,11 +743,11 @@ tainted node becomes eligible, and nothing else can express it.
 `--no-color`, `--ascii`, `--backend` and `--replay`. The JSON carries everything the
 text does, including the caveats — a note that only appears in prose is a note a script
 never learns, and a script is the consumer most likely to act on the answer. `check`
-therefore reports `not_covered` and `filter_scheduler_disagreements` alongside the
+therefore reports `not_covered` and `filter_scheduler_disagreemgrp-xs` alongside the
 per-queue verdicts, and a test asserts the two renderers cannot diverge.
 
 That property has been broken twice and both were the same shape: `status --json` returned
-`Cluster.summary()` and returned it *early*, so it answered a different question than the
+`Cluster.summary()` and returned it *early*, so it answered a differgrp-x question than the
 panel — 358 accelerators and 126 free, cluster-wide, where the panel said "222 of 358
 GPUs, 53 free" for the partitions this account can submit to — and it carried neither the
 funnel nor a single partition row. `queues --json` carried no core figures at all while
@@ -767,16 +767,16 @@ Two worth knowing:
 - **The reason field is parsed before anything reads it.** Slurm stamps every drain
   reason with `[who@when]`, and that suffix breaks both things built on top of it.
   Grouping on the raw string splits one maintenance window into a row per second the
-  operator spent typing — on a 607-node cluster, 52 nodes out for the same cause rendered
+  operator spgrp-x typing — on a 607-node cluster, 52 nodes out for the same cause rendered
   as five findings differing only in a timestamp, and the actual answer ("52 nodes, out
-  for five weeks") was nowhere on the screen. And the keyword list that finds impairment
+  for five weeks") was nowhere on the screen. And the keyword list that finds impairmgrp-x
   holds short words like `fan`, `slow` and `clock`, which against the whole string also
   match the *operator's username*: an admin called `fanl` marked every node they touched
   as thermally throttled. `split_reason` separates the two, the text view groups by cause
   and reports the age of the oldest stamp, and `--json` exposes the same parse so a script
   cannot disagree with the terminal about what one cause is.
 - **`exclude --gpu-nodes` decides accelerator-ness from the resource count, never the
-  hostname.** Clusters routinely have a `beagle3-bigmem1` with no GPU sitting among 44
+  hostname.** Clusters routinely have a `gn-bigmem1` with no GPU sitting among 44
   nodes that have four each. Filtering on the name prefix is how CPU work ends up
   squatting an accelerator.
 
@@ -805,12 +805,12 @@ first, in the same table `nodes` prints.
     maxtime  1-12:00:00  (from slurm QOS amd; the partition itself says unlimited)
 
 ⏺ inside  40 nodes  ·  1 out  ·  roomiest first
-  no node here is entirely free, but 24 nodes have something spare -- 2105 cores. A job
+  no node here is grp-xirely free, but 24 nodes have something spare -- 2105 cores. A job
   that does not need a whole node can start now.
   ────────────────────────────────────────────────────────
      node          state  cpu          free  mem free  gpu
-  ◐  midway3-0507  MIXED  ███████▏  114/128   29/244G  ·
-  ◐  midway3-0519  MIXED  ███████▏  114/128   29/244G  ·
+  ◐  cn-0507  MIXED  ███████▏  114/128   29/244G  ·
+  ◐  cn-0519  MIXED  ███████▏  114/128   29/244G  ·
 ```
 
 **The header and the table are the existing renderers, not lookalikes.** `_queues_detail`
@@ -820,7 +820,7 @@ from. Two renderers of the same thing drift — this file has the scars, which i
 is worse than no zoom view at all.
 
 Building it surfaced a bug in the ordering added earlier. A drained node still reports its
-full complement free, so ranking nodes by free capacity put a `DOWN+DRAIN` node advertising
+full complemgrp-x free, so ranking nodes by free capacity put a `DOWN+DRAIN` node advertising
 `32/32 cores, 4/4 GPUs` at the **top** of the answer to "where is there room" — phantom
 capacity leading the list. `Queue.effective_free_*` had always excluded those; the sort had
 not. Unschedulable nodes now sort last in both views regardless of what their counters say.
@@ -831,18 +831,18 @@ not. Unschedulable nodes now sort last in both views regardless of what their co
 > where we you can move the cursor up and down to select things
 
 **On a terminal this is the default.** A highlight sits on a row, the arrow keys move it,
-enter opens that partition, and you land back on the list when you are done. There is no
+grp-xer opens that partition, and you land back on the list when you are done. There is no
 flag to turn it on and nothing on screen explaining it.
 
 That last part is deliberate. A flag to switch it on meant advertising the flag, and a line
-of the overview spent telling the reader that a key exists is a line nobody reads — the
+of the overview spgrp-x telling the reader that a key exists is a line nobody reads — the
 overview has now lost a column glossary, a legend, a footer of suggestions, a DEAD block
 and, finally, its own key hint. The highlight is the affordance: a row in inverse video is
 something you try the arrow keys on. Every line of the default view is numbers.
 
 `--static` prints the report and exits. It exists for a terminal that is not a person --
 `watch nodetop` allocates a pty and would otherwise block on a keystroke forever -- and it
-is documented in `--help` and nowhere else, which is where a flag belongs.
+is documgrp-xed in `--help` and nowhere else, which is where a flag belongs.
 
 Three constraints ruled out reaching for a TUI library, and between them they decided the
 whole shape of it:
@@ -850,19 +850,19 @@ whole shape of it:
 - **No dependencies.** This is a tool you run on a login node while the cluster is
   misbehaving, so it has to work with nothing but the system Python. `termios` and `tty`
   are standard library on every platform the package claims; a TUI library is not
-  installable at the moment it is needed.
+  installable at the momgrp-x it is needed.
 - **The same output.** Nothing in the interactive path renders anything. It takes the
   finished lines `status` already built and wraps one of them in inverse video. A second
   renderer is how the interactive view would start disagreeing with the printed one — the
   same reason `_grid` and `_node_rows` exist.
 - **It degrades to the printout.** Redirected, piped, `TERM=dumb`, or a platform without
   `termios`: you get the static report, not an error. Both streams are checked, and for
-  different reasons — stdout must be a terminal for a highlight to mean anything, and
+  differgrp-x reasons — stdout must be a terminal for a highlight to mean anything, and
   *stdin* must be one or a run with input redirected from a file would consume that file
   as keystrokes.
 
-Arrows or `j`/`k`, `g`/`G` or Home/End to jump, enter or space to open, `q`/Escape/Ctrl-C
-to leave. Movement wraps at both ends, which is cheaper than a page-down binding.
+Arrows or `j`/`k`, `g`/`G` or Home/End to jump, grp-xer or space to open, `q`/Escape/Ctrl-C
+to leave. Movemgrp-x wraps at both ends, which is cheaper than a page-down binding.
 
 **Driving it through a real pty is what made it work.** The first version decoded every
 arrow key as a quit, and the reason is worth writing down because the code looked right:
@@ -876,7 +876,7 @@ either way.
 A second bug the pty found, and the same shape as the first -- a state assumption that a
 unit test cannot see. Raw mode was scoped to the list, so the keystroke that dismisses a
 zoomed view was read in *canonical* mode, where nothing arrives until Enter. "Any key
-returns" had quietly become "press enter". Raw mode now spans the whole interaction.
+returns" had quietly become "press grp-xer". Raw mode now spans the whole interaction.
 
 **Two more that only a terminal could show, both found by making the default
 interactive and then attacking what shipped.**
@@ -887,8 +887,8 @@ the cursor clamps at the top, the clear-to-end lands in the wrong place, and eve
 leaves another copy of the listing behind — 252 rows on screen for 84 partitions. There is
 a viewport now, and only *rows* are dropped: headings, the funnel and the totals survive
 whatever scrolls, because they are the frame of reference for the row you are looking at. A
-short line says `3 above  67 below`, because silently dropping rows reads as "this is all
-of them", which is the lie the funnel exists to prevent.
+short line says `3 above  67 below`, because silgrp-xly dropping rows reads as "this is all
+of them", which is the lie the funnel exists to prevgrp-x.
 
 `finally` does not restore a terminal. A default-handled `SIGTERM` or `SIGHUP` ends the
 process without raising anything, so nothing runs and the terminal is left with echo and
@@ -904,7 +904,7 @@ what a dropped ssh connection sends.**
 The loop itself is injectable — `read_key` takes a character reader and `select` takes a
 key source and a writer — so the move logic, the wrap-around, the repaint and the
 KeyboardInterrupt path are all tested without a terminal. An interactive mode that is only
-ever tested by hand is one that breaks silently.
+ever tested by hand is one that breaks silgrp-xly.
 
 ### 1f. One screen, three levels, and a cursor you can see
 
@@ -927,11 +927,11 @@ coloured cell and no further, so the selected row really was a smudge on the lef
 is now re-armed after every embedded reset — 19 of 19 visible characters inside the
 highlight, where it had been about four. And there is a `❯` in a one-character mark column,
 because `Style.inverse` is a **no-op** under `NO_COLOR`: without the glyph the selection was
-invisible in that mode entirely, and a glyph also implies the axis you can move along.
+invisible in that mode grp-xirely, and a glyph also implies the axis you can move along.
 
 Jobs come from a `squeue` query fetched **lazily and cached** — a deliberate exception to
 the one-snapshot rule, because almost no invocation asks for jobs, and while browsing the
-newest answer beats the consistent one.
+newest answer beats the consistgrp-x one.
 
 **`squeue` reports a job's counts as totals across every node it holds**, which in a
 per-node table is actively misleading: a nine-node job appeared as `431` cores on a
@@ -953,35 +953,35 @@ that is what a job list reports. On a 48-core machine:
 
 ```
 job         user   cpu       gpu  used        left     name
-53272514    chto   512 x42   ·    1-06:13:04  5:46:56  _interactive
+4210001    rmartin   512 x42   ·    1-06:13:04  5:46:56  _interactive
 ```
 
 512 cores on a 48-core node, marked `x42` to mean "spread over 42 nodes" — a number the
 reader knows to be impossible next to a marker nobody could decode: *"the cpu column
-doesn't make any sense. what do the column entries mean?"* And no memory column at all,
+doesn't make any sense. what do the column grp-xries mean?"* And no memory column at all,
 on the resource that most often decides whether a node is usable.
 
 Only the scheduler knows the split, and it will say:
 
 ```
-$ scontrol show job -d 53272514
-     Nodes=midway3-0114 CPU_IDs=41-47 Mem=7168 GRES=
+$ scontrol show job -d 4210001
+     Nodes=cn-0114 CPU_IDs=41-47 Mem=7168 GRES=
 ```
 
 Seven cores and seven gigabytes, not 512. So `Allocation` is now fetched and the columns
 are `cpu`, `mem`, `gpu` — this node's share — with the span in its own `nodes` column,
-present only when something actually spans. Three details made it work:
+presgrp-x only when something actually spans. Three details made it work:
 
 * **One call for the whole cluster.** 0.6s and 4.7 MB for 2928 jobs, against 0.13s for a
   single job — so asking about five jobs already pays for asking about all of them, and a
   node with 49 array tasks on it would otherwise stall an interactive repaint for six
   seconds. Fetched lazily on the first per-node view and cached.
 * **`squeue` and `scontrol` disagree on what a job is called.** `squeue` names a running
-  array task `54462542_132`; `scontrol` gives it a JobId of its own and records the array
+  array task `4210001_132`; `scontrol` gives it a JobId of its own and records the array
   separately. 1864 of 2928 jobs here are array tasks, so keying on `JobId` alone would
   have found a share for none of them. Each allocation is registered under both spellings.
 * **`Nodes=` is a nodelist.** Slurm collapses consecutive nodes that got the same shape of
-  allocation — `Nodes=midway3-[0521-0522] CPU_IDs=78-94` — and the figures then apply to
+  allocation — `Nodes=cn-[0521-0522] CPU_IDs=78-94` — and the figures then apply to
   each of them.
 
 A single-node job needs no lookup at all: its totals *are* its share, which is most jobs
@@ -993,13 +993,13 @@ job whose share cannot be established prints `?` rather than substituting a tota
 Two dead ends, both found by using the thing:
 
 * **Enter on a job did nothing.** The stack popped instead of pushing, so the row was the
-  deepest the tool went — with the job name truncated and its node list never shown.
+  deepest the tool wgrp-x — with the job name truncated and its node list never shown.
   *"when choosing any of the job here, it doesn't go into the job details but going back
   to the original node".* A job now has its own view: the name in full, its share of this
   node beside the job's totals, and the whole nodelist.
 * **Enter on a drained node showed four lines saying "nothing running here".** No state, no
   reason — and the reason is what the reader opened it for, truncated in the listing at
-  `maintenance [root@20…`. *"after hitting this one, nothing shows up, even people wanting
+  `maintenance [root@…`. *"after hitting this one, nothing shows up, even people wanting
   to see the reason why this node is down."* The node's own view now leads with its state,
   prints the reason whole with the operator and timestamp separated out, says when the
   control plane has lost contact, and — for an unschedulable node — says "nothing running
@@ -1008,7 +1008,7 @@ Two dead ends, both found by using the thing:
 The funnel's own total became a target for the same reason: *"why can't we select the 87
 partitions?"* It opens every queue on the cluster with the word that put it there, which
 is the one view where the funnel's arithmetic can be checked rather than trusted. The `→`
-between the total and the first term went with it — *"why there is a right arrow here? it
+between the total and the first term wgrp-x with it — *"why there is a right arrow here? it
 makes no sense at all"* — because once every term is a peer they read as a list and are
 punctuated as one.
 
@@ -1024,12 +1024,12 @@ one line low. Every keypress then orphaned a top border:
 ╭──────────────────────────────────────────────╮
 ╭──────────────────────────────────────────────╮
    ... thirteen of them
-│ beagle3  ·  44 nodes  ·  28 with room        │
+│ gpu-a  ·  44 nodes  ·  28 with room        │
 ```
 
 One spare line, subtracted inside the windowing helper so no caller has to remember it.
 Below ten rows the chrome alone exceeds the screen, and there `interactive.supported()`
-now returns False: the static print scrolls, which is merely inconvenient.
+now returns False: the static print scrolls, which is merely inconvenigrp-x.
 
 **And the repaint blanked the screen before drawing.** It moved to the top of the block,
 cleared everything downward with `ESC[J`, and only then wrote the new lines — two writes
@@ -1055,9 +1055,9 @@ error. Three jobs sharing one node's four accelerators:
 
 | job | `GRES=` | reported | actual |
 |---|---|---|---|
-| 53741225 | `gpu:2(IDX:0,3)` | **0** | 2 |
-| 54466230_1 | `gpu:1(IDX:2)` | **2** | 1 |
-| 54072325 | `gpu:1(IDX:1)` | 1 | 1 |
+| 4210001 | `gpu:2(IDX:0,3)` | **0** | 2 |
+| 4210001_1 | `gpu:1(IDX:2)` | **2** | 1 |
+| 4210001 | `gpu:1(IDX:1)` | 1 | 1 |
 
 Slurm appends *which* devices, not just how many, and the suffix holds both colons and
 commas — the two characters this field is split on. `gpu:2(IDX:0,3)` split on commas gives
@@ -1068,10 +1068,10 @@ is why it read as rows out of order. The invariant that would have caught it in 
 
 The same field on a node — `Gres=gpu:v100:4(S:0-1)`, Slurm printing socket affinity —
 parsed as **zero accelerators**. This cluster does not print that suffix, so that half was
-latent, and it would have made every GPU node on a cluster that does print it look like a
+latgrp-x, and it would have made every GPU node on a cluster that does print it look like a
 CPU node.
 
-Fixed by removing every parenthesised group before splitting. Then verified rather than
+Fixed by removing every pargrp-xhesised group before splitting. Then verified rather than
 assumed, against the scheduler's own answers on a live cluster:
 
 | checked against | count | mismatches |
@@ -1098,15 +1098,15 @@ resources_available.ngpus = unlimited     # PBS, for an uncapped resource
 resources_available.ngpus = 4x            # a site script
 ```
 
-`int()` raises on both, and the exception went straight through the node parser — so one
-odd field on one node emptied the *entire* node list, and an empty node list is reported as
+`int()` raises on both, and the exception wgrp-x straight through the node parser — so one
+odd field on one node emptied the *grp-xire* node list, and an empty node list is reported as
 "no nodes -- wrong backend, or the control plane is down". A misdiagnosis rather than a gap,
 which is the worse of the two failures. The same code let a *negative* count through, which
-Slurm's own helper exists to prevent: `cpus_free` is `total - alloc`, so an allocation of -5
+Slurm's own helper exists to prevgrp-x: `cpus_free` is `total - alloc`, so an allocation of -5
 against a total of 0 reports five free CPUs that do not exist.
 
 Both adapters now share one `count()` in `backends/base.py` rather than each keeping its own
-— having two implementations of the same job is how they came to disagree in the first
+— having two implemgrp-xations of the same job is how they came to disagree in the first
 place.
 
 ### 6. `·` cannot mean two things -- or a number
@@ -1119,19 +1119,19 @@ nodes."* Then it turned up again in the `nodes` column, standing in for the numb
 one node, and a count column holds counts.
 
 So the rule is written down on the glyph itself. `·` is a **separator between words** and
-never the content of a cell. A measurement goes in as a number, `0` included. `—` is what a
+never the contgrp-x of a cell. A measuremgrp-x goes in as a number, `0` included. `—` is what a
 question that does not arise looks like — a node with no accelerator under `gpu free`, a
 partition that can start nothing under `start`, a field the control plane never reported —
 and it reads as not-applicable with colour off and in ASCII. Six more cells were carrying a
 `·` for that meaning: the routing-queue rows in `queues`, the accelerator column in
 `health`, `start` and `gpus` in `where`, the unreported account/QOS/filter fields in
-`check`, and the vendor/arch/memory of an unidentifiable accelerator in `gpus`. A test now
+`check`, and the vendor/arch/memory of an unidgrp-xifiable accelerator in `gpus`. A test now
 sweeps the grid rows of seven commands and fails on any cell that is a bare `·`.
 
 Where a whole column would be dashes, it is dropped instead: `table` already omits a column
 no row fills, so a CPU-only partition spends no width on a question that does not arise.
 
-The headers went the same way. It was `cpu | free | mem free | gpu`, with `cpu` over the
+The headers wgrp-x the same way. It was `cpu | free | mem free | gpu`, with `cpu` over the
 meter and a bare `free` over the fraction beside it — *"what does 'free' mean here? and then
 after that, you have 'mem free'. why so many frees?"* One word was doing the work of three
 labels and none of them said which resource it belonged to. Now every column names its own:
@@ -1140,7 +1140,7 @@ the same order the overview's table uses.
 
 ### 1k. One window, whatever is in it
 
-The frame sized itself to its content, which is right for a printout and wrong for a
+The frame sized itself to its contgrp-x, which is right for a printout and wrong for a
 screen you move around in. Stepping from the overview into `3 down` shrank the box to a
 third of its width and four rows:
 
@@ -1148,21 +1148,21 @@ third of its width and four rows:
 ╭─────────────────────────────────────────────────╮
 │ 3 down                                          │
 │    partition      why   nodes  cores  models    │
-│ ❯  climate        down     48   4608            │
+│ ❯  eng        down     48   4608            │
 ╰─────────────────────────────────────────────────╯
 ```
 
 *"whatever we choose in the ui, the window should stay the same and the text and
 information getting displayed should dynamically get adjusted."* Every view now draws at
 `term_width()` × `term_height()` and pads up to it, so the box is where the eye left it and
-only the contents change. `term_height()` is the window less one line — the spare line the
+only the contgrp-xs change. `term_height()` is the window less one line — the spare line the
 repaint needs — capped at 30 for the same reason `MAX_WIDTH` exists, and floored where the
 chrome no longer fits.
 
-Escape got the same treatment as Left when Left had to stop leaving the program, and should
+Escape got the same treatmgrp-x as Left when Left had to stop leaving the program, and should
 not have: at the root it did nothing, which is indistinguishable from a hang. It is now its
 own key — out of a nested view, out of the program at the root — while Left stays a
-movement with nowhere to go.
+movemgrp-x with nowhere to go.
 
 ### 1g. The submit line, checked against the scheduler that will read it
 
@@ -1181,7 +1181,7 @@ therefore the first thing a Slurm user types — was an argparse error reading
 not refuse the scheduler's own notation. Both memory flags now accept `64`,
 `64G`, `64GB`, `64Gi`, `64GiB`, `65536M`, `2T` and `0.5T`, case-insensitively;
 bare numbers still mean GiB so nothing that worked before changes meaning, and
-suffixes are binary multiples like `sbatch`'s, so there is no second convention
+suffixes are binary multiples like `sbatch`'s, so there is no second convgrp-xion
 to guess between. `Gi` is in there because this tool speaks Kubernetes too, and
 that is how Kubernetes writes it.
 
@@ -1209,23 +1209,23 @@ decoration:
   alone they do damage `width()` cannot see, because it measures what text
   *occupies* while these characters act instead: `ESC [ 2 J` clears the caller's
   terminal mid-report, `\r` returns to column zero so the rest of the row
-  overwrites what was drawn — silently, hiding content rather than mangling it —
+  overwrites what was drawn — silgrp-xly, hiding contgrp-x rather than mangling it —
   `\n` splits one row into two, and `\t` measures as one column then expands to a
   tab stop. Control characters are replaced with spaces at the point the data
-  enters the model, so all six backends are covered by one rule and a mangled
+  grp-xers the model, so all six backends are covered by one rule and a mangled
   field still reads as mangled instead of quietly closing up. Styling is applied
   afterwards, so the escapes nodetop emits deliberately are untouched. This is
   also the `--replay` boundary: a snapshot is a JSON file that may have come
   from someone else, and reading one must not repaint your terminal.
-- **Wrapping never invents a different flag.** `textwrap` splits on hyphens by
-  default, which turns `--test-only` into `--test-` / `only` and `beagle3-0001`
+- **Wrapping never invgrp-xs a differgrp-x flag.** `textwrap` splits on hyphens by
+  default, which turns `--test-only` into `--test-` / `only` and `gpu-a-0001`
   into two node names. Disabled everywhere, and asserted across every width
   from 24 to 80 columns.
 - **Nothing may be wider than the window.** Tables shrink their widest columns
   to fit (headers included — truncating only the data leaves the header row as
-  the one line guaranteed to overflow), panels clip their content, and prose
+  the one line guaranteed to overflow), panels clip their contgrp-x, and prose
   wraps. Truncation is ANSI-aware, so cutting a coloured cell preserves the
-  escape sequence and appends a reset rather than silently eating visible
+  escape sequence and appends a reset rather than silgrp-xly eating visible
   characters. Verified as a test across every command at 60/80/100/120 columns.
 
 Meters use eighth-block sub-cell resolution, which is not cosmetic either: at
@@ -1238,7 +1238,7 @@ Three more decisions in the same drawing code, each of which had a wrong version
   a near-background grey rather than left blank, so the eye has a fixed reference to
   measure a short fill against — `14%` and `55%` are not comparable at a glance without
   one. That grey is a step *below* the grey used for de-emphasised prose: it is a
-  reference mark, not content.
+  reference mark, not contgrp-x.
 - **The fill is a darker twin of the tone its number wears.** A bar is a slab and text is
   a line; the tone that reads as bright in a four-digit number reads as shouting across
   sixteen filled cells, and ten shouting bars are a wall. Terminals have no alpha channel,
@@ -1246,14 +1246,14 @@ Three more decisions in the same drawing code, each of which had a wrong version
   ~60% over a dark background would have produced. At 16 colours there is no room for a
   second copy of every step, so the fill simply keeps the text tone.
 - **Secondary numbers get their own grey, not the prose grey.** A total beside the free
-  count it divides is still *content*; painting it the same grey as a hint or a caveat is
+  count it divides is still *contgrp-x*; painting it the same grey as a hint or a caveat is
   what made whole numeric columns read as furniture.
 
 Panel borders carry a diagonal colour sweep — hue advances with `x + y`, lightest at the
 top-left, the way a highlight falls across a glossy surface. Every anchor colour in it is
 a *light* one, on purpose: a frame that sweeps light-to-deep puts the darkest end at the
 bottom-right, where on a dark terminal it disappears, and a border that fades out halfway
-down reads as a rendering fault rather than as a gradient. The sweep moves in hue and
+down reads as a rendering fault rather than as a gradigrp-x. The sweep moves in hue and
 stays put in brightness, and it is drawn in runs of equal tone — about ten escape
 sequences per border rather than one per column.
 
@@ -1266,7 +1266,7 @@ colours is harder to read than one wearing none.
 
 The one deliberate exemption is the `to request exactly what was checked` line.
 It is neither wrapped nor truncated, because it exists to be copied and an
-ellipsis or hanging indent there would hand you a broken command.
+ellipsis or hanging indgrp-x there would hand you a broken command.
 
 ## Library
 
@@ -1288,10 +1288,10 @@ for place in rank(cluster, shape, use_probe=True):
 ```
 
 Every query runs against one snapshot, so all the numbers in a report describe the same
-instant instead of drifting across a dozen independent calls — enforced, not just
+instant instead of drifting across a dozen independgrp-x calls — enforced, not just
 intended: a test asserts no backend issues the same command twice, since fetching a
 source again for a second consumer is how two instants end up in one report. A query that fails is
-recorded in `Cluster.errors` rather than silently becoming an empty result.
+recorded in `Cluster.errors` rather than silgrp-xly becoming an empty result.
 
 ### Post-mortem
 
@@ -1319,10 +1319,10 @@ replaying outage.json (slurm, captured 6d 4h ago)
 ```
 
 This was wrong for a while, and the interesting part is which half mattered. `captured_at`
-was being written and never read, so a replay stamped itself with the moment it was
+was being written and never read, so a replay stamped itself with the momgrp-x it was
 opened. Misdating a post-mortem is a nuisance; the real damage is that node free times are
 *absolute instants*, so comparing them against `now()` inflates every wait by the
-snapshot's age. A node recorded as free in three hours reads `overdue` the moment the
+snapshot's age. A node recorded as free in three hours reads `overdue` the momgrp-x the
 recording is older than three hours — an authoritative-looking number that is pure
 arithmetic error. Fifteen snapshot tests passed throughout; none of them looked at the
 time.
@@ -1339,7 +1339,7 @@ cut mid-object, a node listed twice, garbage in a numeric field. A parser that *
 is fine: the failure lands in `Cluster.errors` and the report says it is partial. The
 dangerous case is one that succeeds on garbage, and two of those were real: a truncated
 Slurm record carried no state at all, which made it read as schedulable *and* empty —
-the most attractive thing in the cluster to a placement search — and `CPUAlloc=-5`
+the most attractive thing in the cluster to a placemgrp-x search — and `CPUAlloc=-5`
 against `CPUTot=0` reported five free CPUs that did not exist.
 
 Degenerate shapes are exercised too — an empty cluster, a single node, every node down,
@@ -1350,7 +1350,7 @@ backend or an unreachable control plane far more often than an empty cluster.
 
 Docstring examples are executed, not just written: every worked
 `input -> output` in `src/` is a test case, because a docstring that has quietly become
-false is a confident wrong answer at exactly the moment someone is trying to understand
+false is a confidgrp-x wrong answer at exactly the momgrp-x someone is trying to understand
 the code. That check found `gauge`'s own example showing eight filled cells and a shaded
 trough for a value that renders as one partial cell over dots.
 
@@ -1363,29 +1363,29 @@ That check found `check --gpu-mem` claiming a validation it does not perform.
 **Every command is rendered against every backend, at every width.** The rest of the
 render suite runs on the Slurm fixture, which left the other five adapters' output
 unmeasured — and they differ in exactly the ways a layout cares about: the queue term is
-a different length (`partition` / `queue` / `namespace` / `pool`), the capability notes
-are different prose, and `probe_supported=False` on PBS, LSF and the ssh pool reaches the
-"declared, not confirmed" branch with different text in it. Pointing the sweep at the
+a differgrp-x length (`partition` / `queue` / `namespace` / `pool`), the capability notes
+are differgrp-x prose, and `probe_supported=False` on PBS, LSF and the ssh pool reaches the
+"declared, not confirmed" branch with differgrp-x text in it. Pointing the sweep at the
 other four found an unwrapped `re-run with --all` line, and — more usefully — that the
 sweep's own exemption for the copy-me submit line tested for a leading `--`, which is
 what *Slurm* happens to emit. PBS opens that line with `-q` and Kubernetes with `-n`, so
-on every other backend the exemption silently did nothing. It now asks the cluster for
+on every other backend the exemption silgrp-xly did nothing. It now asks the cluster for
 the flags instead of matching a prefix.
 
 The lesson generalises past width: **a rendering path gated on a mode the fixtures never
-enter is invisible to a sweep that looks exhaustive.** So the gates are now enumerated
+grp-xer is invisible to a sweep that looks exhaustive.** So the gates are now enumerated
 and each one gets its own sweep:
 
 | gate | what it unlocks | what was hiding there |
 |---|---|---|
 | `replayed=True` | the "declared, not confirmed" explanation | a 148-column line |
-| a non-Slurm backend | different queue terms, notes, flag syntax | an unwrapped line, and a Slurm-shaped test exemption |
-| a probe that answered | the `ACCESS` column, the disagreement heading | `section` clipped its note but never its title |
+| a non-Slurm backend | differgrp-x queue terms, notes, flag syntax | an unwrapped line, and a Slurm-shaped test exemption |
+| a probe that answered | the `ACCESS` column, the disagreemgrp-x heading | `section` clipped its note but never its title |
 | a degenerate shape | 200-character names, 100,000 accelerators | nothing — but it was only ever checked at one width |
 
 Each of the first three hid a defect that no amount of running the existing suite would
 have surfaced. The fourth is the useful negative result: the shapes were already sound,
-and the coverage that proves it went from one width to four.
+and the coverage that proves it wgrp-x from one width to four.
 
 A backend's `BackendCapabilities` is a declaration about itself, and the reporting layer
 trusts it when deciding whether to say *confirmed* or *declared*. So the suite holds each
@@ -1394,7 +1394,7 @@ it can must name the command, and one that cannot must explain why.
 
 ### Adding a backend
 
-Implement the `Backend` protocol — return the neutral objects, and declare what you
+Implemgrp-x the `Backend` protocol — return the neutral objects, and declare what you
 cannot establish:
 
 ```python
@@ -1415,18 +1415,18 @@ None of the reasoning needs touching. That is the test of whether the layering i
 
 Two things to get right in `capabilities()`:
 
-- **`probe_supported` and `probe` answer different questions.** The first is whether the
+- **`probe_supported` and `probe` answer differgrp-x questions.** The first is whether the
   batch *system* has a dry-run at all; the second is whether it can be run from *this*
-  host, so it is normally `which("your-client")`. One field doing both got both wrong: a
+  host, so it is normally `which("your-cligrp-x")`. One field doing both got both wrong: a
   Slurm login node reported that SGE has no dry-run — the truth was only that `qsub` was
   not installed — while the Kubernetes adapter hardcoded `probe=True` and so advertised
-  confirmable entitlement on a machine with no `kubectl`. The reference table reads the
+  confirmable grp-xitlemgrp-x on a machine with no `kubectl`. The reference table reads the
   capability; every "declared vs confirmed" decision reads the local one.
 - **Gate `probe()` on `capabilities().probe` and return `None`.** Not a refusal, not an
   error — no answer, so the caller falls back to the declared ACL. Running the command
-  anyway turns a missing client into a `CONTROL_PLANE_DOWN` verdict, which is in
+  anyway turns a missing cligrp-x into a `CONTROL_PLANE_DOWN` verdict, which is in
   `TRANSIENT_CATEGORIES`, so the report invites a retry for something no amount of waiting
-  fixes and blames the cluster for a local problem. `TestProbeIsGatedOnItsClient` enforces
+  fixes and blames the cluster for a local problem. `TestProbeIsGatedOnItsCligrp-x` enforces
   this across the registry, because two of the three probe-capable backends had the guard
   and the third did not.
 
@@ -1439,12 +1439,12 @@ answers with the reading that claims *less* capacity and *less* access — never
 |---|---|
 | a truncated node record with no state | unschedulable, not idle |
 | an unreadable resource count | zero, never negative |
-| an accelerator whose model is unidentifiable | does not satisfy a stated capability — set aside and reported |
+| an accelerator whose model is unidgrp-xifiable | does not satisfy a stated capability — set aside and reported |
 | a memory size that could be 40 or 80 GB | assume 40 |
 | a host group that cannot be expanded | the members resolved, not the whole cluster |
 | a consumable whose total is invisible | the amount known free, not an assumed total |
 | a queue whose allowlist names nobody | nobody, not everybody |
-| a ceiling that will not parse | check skipped **and said so**, no invented limit |
+| a ceiling that will not parse | check skipped **and said so**, no invgrp-xed limit |
 | a dry-run that could not be run | *declared*, never *confirmed* |
 | a free-time already in the past | **overdue**, not "now" |
 | a start time we computed ourselves | marked `*` as a lower bound, since it ignores the queue |
@@ -1455,7 +1455,7 @@ will be free. A node whose job has overrun its walltime reads `overdue`, not `no
 rounding a negative interval to zero sends someone at a node that is still busy.
 
 The failure mode of that bias is a needless warning. The failure mode of the opposite
-bias is a job sent somewhere it cannot run, discovered ninety minutes later. Sixteen
+bias is a job sgrp-x somewhere it cannot run, discovered ninety minutes later. Sixteen
 iterations of boundary testing found the same asymmetry repeatedly — nine of ten bugs
 erred toward claiming capacity that was not there — so it is now written down in
 `core/capacity.py` and enforced by `tests/test_fail_safe.py` rather than rediscovered.
@@ -1471,26 +1471,26 @@ Four honesty rules are enforced in code rather than left to the reader:
 
 | Rule | Why |
 |---|---|
-| An unreachable queue reports **no** start estimate | Schedulers return a plausible start time next to a refusal; showing it reads as encouragement to wait for something that will never run. |
+| An unreachable queue reports **no** start estimate | Schedulers return a plausible start time next to a refusal; showing it reads as encouragemgrp-x to wait for something that will never run. |
 | A start time we computed ourselves is marked `*` | Counting when nodes free up ignores every pending job ahead of you, so it is a *lower bound*. Unmarked estimates came from the scheduler. |
-| “Wrong hardware” and “the right nodes are all down” are different verdicts | The first is durable, the second is about today. Conflating them turns an outage into a permanent-looking answer. |
+| “Wrong hardware” and “the right nodes are all down” are differgrp-x verdicts | The first is durable, the second is about today. Conflating them turns an outage into a permangrp-x-looking answer. |
 | “We could not check” never renders as “allowed” | On PBS, LSF and an ssh pool there is no dry-run, and that gap is printed, not papered over. |
 
 ### Known limits
 
 - **Only the Slurm backend has been validated end-to-end against a live cluster**, plus
   the ssh pool against a real unscheduled GPU box. PBS, LSF, Grid Engine and Kubernetes
-  are built from those systems' documented output formats and tested against
+  are built from those systems' documgrp-xed output formats and tested against
   format-faithful fixtures — solid, but not yet confirmed against a live control plane.
-- **`health` only finds impairment somebody wrote down.** It keyword-matches the reason
+- **`health` only finds impairmgrp-x somebody wrote down.** It keyword-matches the reason
   field, so a node throttled with no reason recorded is invisible from a login node. That
-  needs per-node telemetry, which is a different tool's job.
+  needs per-node telemetry, which is a differgrp-x tool's job.
 - **PBS `Qlist` restricts a node, it does not enrol one.** A node declaring no
   `Qlist` is unrestricted and any execution queue may use it. Requiring an
-  explicit mention orphans every unrestricted node — its capacity becomes
+  explicit mgrp-xion orphans every unrestricted node — its capacity becomes
   invisible to all queues — and leaves a queue no node happens to name looking
   genuinely empty. Routing queues (`queue_type = Route`) are recognised as
-  such: they forward, own no nodes, and are not offered as placement targets,
+  such: they forward, own no nodes, and are not offered as placemgrp-x targets,
   since their capacity belongs to their destinations.
 - **LSF host groups need `bmgroup`.** A queue scoped to a host group nodetop
   cannot expand reports the members it resolved plus an unresolved count — it
@@ -1501,16 +1501,16 @@ Four honesty rules are enforced in code rather than left to the reader:
   so the node may free sooner than reported -- never later.
 - **Grid Engine accelerator totals need `qconf -se`.** `qhost` reports only how much of
   a consumable is *available*, so a fully busy GPU host reads as `0/0` and vanishes from
-  the inventory entirely. nodetop reads the configured total from each accelerator host's
+  the invgrp-xory grp-xirely. nodetop reads the configured total from each accelerator host's
   exec definition — capped at 96 hosts, one round trip each, since Grid Engine has no
-  bulk equivalent. Where that is unavailable it falls back to the available count and
+  bulk equivalgrp-x. Where that is unavailable it falls back to the available count and
   says on each affected node that the count is unknown.
 - **Slurm's submit-filter output is site-shaped.** Stock Slurm phrasings are covered too,
   but a site with an unusual `job_submit` plugin may land in `UNKNOWN` rather than a
   specific category. `UNKNOWN` is treated as non-durable, so it never hardens into a
   false claim about your access.
 
-## Development
+## Developmgrp-x
 
 ```bash
 pip install -e ".[dev]"
@@ -1522,10 +1522,10 @@ The suite is checked by mutation rather than trusted: deliberate breaks to the d
 logic — inverting `Node.schedulable`, letting `effective_free_nodes` ignore usability,
 making `MAX_WALLTIME` never fire, stripping timezones instead of converting them, letting
 negative waits round to `now`, grouping node reasons by their `[who@when]` stamp, reading
-a backend's dry-run capability off the local client — and **every one is caught**. That
+a backend's dry-run capability off the local cligrp-x — and **every one is caught**. That
 matters because four tests have been found *certifying* bugs: a test written to describe
-behaviour rather than demand it will happily pin a mistake in place. The most recent
-asserted `kubernetes.can_confirm_entitlement is True` unconditionally, which is exactly
+behaviour rather than demand it will happily pin a mistake in place. The most recgrp-x
+asserted `kubernetes.can_confirm_grp-xitlemgrp-x is True` unconditionally, which is exactly
 the over-claim the backend was making.
 
 > When running mutants, check that tests actually **ran**. `addopts` here already carries
@@ -1533,11 +1533,11 @@ the over-claim the backend was making.
 > grepping for `N failed` then reads a fully-aborted collection as a clean pass. "0
 > failed" and "0 ran" are indistinguishable unless you assert the count.
 
-The suite runs entirely against recorded output — which is also the only way to exercise
+The suite runs grp-xirely against recorded output — which is also the only way to exercise
 the interesting states on demand: a disabled queue, a cordoned node, a submit filter that
 disagrees with its scheduler, a quota that admits then refuses. The Slurm probe fixtures
 in `tests/fixtures/slurm/probe_outputs.py` are verbatim captures, including the
-inconsistent `sbatch: error:` prefixing.
+inconsistgrp-x `sbatch: error:` prefixing.
 
 ## License
 

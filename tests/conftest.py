@@ -53,7 +53,7 @@ def slurm_backend(slurm_nodes, slurm_partitions, slurm_qos):
             "scontrol show node": (0, slurm_nodes, ""),
             "scontrol show partition": (0, slurm_partitions, ""),
             "show qos": (0, slurm_qos, ""),
-            "show assoc": (0, "acct-a||beagle3\nacct-b||gpu\n", ""),
+            "show assoc": (0, "acct-a||gn\nacct-b||gpu\n", ""),
             "squeue": (0, "", ""),
         })
     )

@@ -491,10 +491,10 @@ class TestHyphenSafeWrapping:
                 assert not line.rstrip().endswith("-"), (size, line)
 
     def test_a_hyphenated_node_name_survives(self):
-        text = "the node beagle3-0001 is drained until maintenance completes here"
+        text = "the node gn-0001 is drained until maintenance completes here"
         for size in range(24, 80):
             joined = " ".join(wrap_indent(text, indent="  ", size=size).split())
-            assert "beagle3-0001" in joined, size
+            assert "gn-0001" in joined, size
 
     def test_kv_values_wrap_without_splitting_flags(self):
         out = kv([("k", "pass --gres=gpu:4 and --cpus-per-task=8 to sbatch here")],

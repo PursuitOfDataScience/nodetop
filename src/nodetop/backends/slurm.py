@@ -401,7 +401,7 @@ class SlurmBackend:
         a consumable resource: a node whose `AllocMem` has reached its
         `RealMemory` can host nothing more, whatever its idle core count says.
         On the cluster this was written against that is the difference between
-        `caslake` advertising **2322 free cores** and the 287 it could actually
+        `wide` advertising **2322 free cores** and the 287 it could actually
         hand out -- 2035 of them sat on 47 nodes whose memory was entirely
         allocated to a handful of four-core jobs, and `DefMemPerNode=UNLIMITED`
         there means a job that names no `--mem` asks for the whole node.
@@ -569,7 +569,7 @@ class SlurmBackend:
 
     #: One allocation block from ``scontrol show job -d``::
     #:
-    #:     Nodes=midway3-[0521-0522] CPU_IDs=78-94 Mem=29750 GRES=gpu:1(IDX:1)
+    #:     Nodes=cn-[0521-0522] CPU_IDs=78-94 Mem=29750 GRES=gpu:1(IDX:1)
     #:
     #: ``Nodes`` is a nodelist, not a name: Slurm collapses consecutive nodes
     #: that got the same shape of allocation, and the CPU/memory figures then

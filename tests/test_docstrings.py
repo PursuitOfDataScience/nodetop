@@ -23,11 +23,11 @@ class TestHostlistExamples:
         assert split_groups("a-[1-2,4],b-[1-3]") == ["a-[1-2,4]", "b-[1-3]"]
 
     def test_the_module_example_really_is_two_groups(self):
-        # module: 'midway3-[0001-0010,0012-0015],beagle3-bigmem[1-4]' is two
+        # module: 'cn-[0001-0010,0012-0015],gn-bigmem[1-4]' is two
         # groups, not five.
         from nodetop.hostlist import split_groups
 
-        text = "midway3-[0001-0010,0012-0015],beagle3-bigmem[1-4]"
+        text = "cn-[0001-0010,0012-0015],gn-bigmem[1-4]"
         assert len(split_groups(text)) == 2
 
     def test_range_body_example(self):

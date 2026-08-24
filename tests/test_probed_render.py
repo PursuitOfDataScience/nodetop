@@ -30,8 +30,8 @@ ARGVS = [
     ["where", "-g", "1"],
     ["where", "-g", "1", "--all"],
     ["where", "-c", "2"],
-    ["check", "-q", "beagle3", "-g", "1"],
-    ["check", "-q", "beagle3", "-g", "8", "--needs", "fp8", "--gpu-mem", "999"],
+    ["check", "-q", "gn", "-g", "1"],
+    ["check", "-q", "gn", "-g", "8", "--needs", "fp8", "--gpu-mem", "999"],
 ]
 
 FIXTURES = ["accepting_cluster", "refusing_cluster", "disagreeing_cluster",
@@ -78,13 +78,13 @@ class TestTheProbedPathsAreActuallyReached:
     def test_the_disagreement_heading_is_reached(self, disagreeing_cluster, capsys):
         # The 46-column heading that section() was not clipping.
         cmd_check(disagreeing_cluster,
-                  _args(["check", "-q", "beagle3", "-g", "1"]), PLAIN)
+                  _args(["check", "-q", "gn", "-g", "1"]), PLAIN)
         out = " ".join(capsys.readouterr().out.split())
         assert "disagree" in out
 
     def test_a_refusal_is_reported_as_such(self, refusing_cluster, capsys):
         cmd_check(refusing_cluster,
-                  _args(["check", "-q", "beagle3", "-g", "1"]), PLAIN)
+                  _args(["check", "-q", "gn", "-g", "1"]), PLAIN)
         assert capsys.readouterr().out.strip()
 
 

@@ -1,4 +1,4 @@
 gpu|1-12:00:00|cpu=192,gres/gpu=16,node=4|||12|0|
-caslake|1-12:00:00|cpu=4800,node=100|cpu=4800,node=100||1000|0|
+wide|1-12:00:00|cpu=4800,node=100|cpu=4800,node=100||1000|0|
 test|7-00:00:00|||||100000000|
-beagle3|2-00:00:00|cpu=256,gres/gpu=32,node=8|gres/gpu=4|12|100|0|
+gn|2-00:00:00|cpu=256,gres/gpu=32,node=8|gres/gpu=4|12|100|0|
