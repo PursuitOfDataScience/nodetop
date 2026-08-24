@@ -26,6 +26,15 @@ misbehaving, so it runs on a login node with nothing but the system Python.
 
 ## What you get
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/nodetop/main/docs/demo.gif"
+       alt="nodetop: the overview, then a partition, a node, and the job holding it"
+       width="900">
+</p>
+
+Arrow keys, enter to open, `q` to leave. The same screen the whole way down —
+partitions, then the nodes inside one, then the jobs on a node, then a job.
+
 ```
 ╭──────────────────────────────────────────────────────────────────────────────────────╮
 │ nodetop · slurm  ·  ada  ·  328 of 607 nodes, 326 up  ·  222 of 358 GPUs, 53 free    │
