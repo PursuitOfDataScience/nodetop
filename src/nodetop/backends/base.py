@@ -27,6 +27,7 @@ reported, not papered over.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Protocol, runtime_checkable
@@ -42,7 +43,43 @@ from ..core.model import (
     Verdict,
 )
 
-__all__ = ["Backend", "BackendCapabilities"]
+__all__ = ["Backend", "BackendCapabilities", "count"]
+
+
+#: The leading integer in a field, as an adapter should read one.
+_LEADING_INT = re.compile(r"-?\d+")
+
+
+def count(value: object, default: int = 0) -> int:
+    """A resource count from whatever a scheduler put in the field.
+
+    Every adapter needs this and each one wrote its own, which is how they
+    diverged.  Two properties, both learned from a defect:
+
+    * **A value that is not a number is not a crash.**  PBS reports
+      ``resources_available.ngpus = unlimited`` for an uncapped resource, and
+      site scripts emit ``4x`` and ``8gb``.  ``int()`` on any of those raised
+      straight through the node parser, so one odd field on one node emptied
+      the entire node list -- and an empty node list is reported as "wrong
+      backend, or the control plane is down", which is a misdiagnosis rather
+      than a gap.
+    * **A count below zero is meaningless, and letting one through is actively
+      harmful.**  ``cpus_free`` is ``total - alloc``, so an allocation of -5
+      against a total of 0 reports five free CPUs that do not exist.
+
+    Accepts the JSON scalars a ``-F json`` or REST backend yields as well as
+    the strings a text one does.
+    """
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value))
+    m = _LEADING_INT.match(str(value).strip())
+    if not m:
+        return default
+    return max(0, int(m.group()))
 
 
 @runtime_checkable

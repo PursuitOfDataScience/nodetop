@@ -225,3 +225,64 @@ class TestCheckHelpMatchesCheckBehaviour:
     @pytest.mark.parametrize("flag", ["--gpu-mem", "--needs"])
     def test_the_two_commands_describe_them_differently(self, flag):
         assert self._check_action(flag).help != self._where_action(flag).help
+
+
+class TestMemorySizesAcceptTheSchedulersOwnSpelling:
+    """`--mem 64G` is what a Slurm user types, because `sbatch` takes it.
+
+    The argument was a bare float in GiB, so the natural thing to type was an
+    argparse error -- a tool whose premise is scheduler fluency refusing the
+    scheduler's own notation. `Gi` is accepted too, because this tool speaks
+    Kubernetes and that is how Kubernetes writes it.
+    """
+
+    @pytest.mark.parametrize("text,expected", [
+        ("64", 64.0),          # bare numbers still mean GiB: nothing changes
+        ("64G", 64.0),
+        ("64GB", 64.0),
+        ("64Gi", 64.0),
+        ("64GiB", 64.0),
+        ("40g", 40.0),         # case-insensitive
+        ("65536M", 64.0),
+        ("65536Mi", 64.0),
+        ("2T", 2048.0),
+        ("2Ti", 2048.0),
+        ("0.5T", 512.0),
+        (" 64G ", 64.0),       # whitespace from a shell
+    ])
+    def test_it_parses(self, text, expected):
+        from nodetop.cli import memory_gb
+
+        assert memory_gb(text) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("text", ["", "bogus", "64X", "G", "--", "1.2.3",
+                                      "64 GB extra", "-8G"])
+    def test_garbage_is_refused_with_a_useful_message(self, text):
+        import argparse
+
+        from nodetop.cli import memory_gb
+
+        with pytest.raises(argparse.ArgumentTypeError) as exc:
+            memory_gb(text)
+        # The message has to say what good input looks like; "invalid float
+        # value" did not.
+        assert "64G" in str(exc.value)
+
+    def test_the_suffixes_are_binary_like_sbatch(self):
+        # There is no second convention to guess between: sbatch's K/M/G/T are
+        # binary multiples, so these are too.
+        from nodetop.cli import memory_gb
+
+        assert memory_gb("1024M") == pytest.approx(1.0)
+        assert memory_gb("1T") == pytest.approx(1024.0)
+
+    @pytest.mark.parametrize("flag", ["--mem", "--gpu-mem"])
+    def test_both_memory_flags_accept_it(self, flag):
+        args = build_parser().parse_args(["where", flag, "64G"])
+        assert getattr(args, flag.lstrip("-").replace("-", "_")) == 64.0
+
+    def test_a_bad_size_is_a_usage_error_not_a_traceback(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            build_parser().parse_args(["where", "--mem", "banana"])
+        assert exc.value.code == 2
+        assert "64G" in capsys.readouterr().err

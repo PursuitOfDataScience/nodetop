@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from .duration import format_duration
 from .model import (
+    Allocation,
     BackendCapabilities,
     Identity,
     Job,
@@ -63,6 +64,8 @@ class Cluster:
 
     #: Running jobs, fetched on first use rather than with the snapshot.
     _jobs: list[Job] | None = field(default=None, repr=False, compare=False)
+    _allocations: dict[tuple[str, str], Allocation] | None = field(
+        default=None, repr=False, compare=False)
 
     # -- construction -------------------------------------------------------
     @classmethod
@@ -220,6 +223,44 @@ class Cluster:
                     self._jobs = []
         return self._jobs
 
+    def allocations(self) -> dict[tuple[str, str], Allocation]:
+        """``(job id, node) -> that job's share of that node``, fetched once.
+
+        Lazy for the same reasons as :meth:`jobs`, and cached for a stronger
+        one: it is one whole-cluster query, so the first per-node view pays for
+        every later one. A backend with no answer returns nothing and the caller
+        says so, rather than showing a total in a column that means a share.
+        """
+        if self._allocations is None:
+            got: list[Allocation] = []
+            loader = getattr(self._backend, "load_allocations", None)
+            if loader is not None:
+                try:
+                    got = list(loader())
+                except Exception as exc:
+                    # Recorded, not raised: this refines a view that works
+                    # without it.
+                    self.errors["allocations"] = f"{type(exc).__name__}: {exc}"
+            self._allocations = {(a.job, a.node): a for a in got}
+        return self._allocations
+
+    def share_of(self, job: Job, node: str) -> Allocation | None:
+        """What ``job`` holds on ``node``, or ``None`` if nothing can say.
+
+        A job on one node needs no query -- its totals *are* its share -- which
+        is most of them, and the whole answer on a backend that models a job as
+        living on a single machine. Memory still comes from the allocation where
+        one is available, because a job list reports what was requested rather
+        than what was given.
+        """
+        got = self.allocations().get((job.id, node))
+        if got is not None:
+            return got
+        if len(job.nodes) <= 1 and (not job.nodes or job.nodes[0] == node):
+            return Allocation(job=job.id, node=node, cpus=job.cpus,
+                              memory_mb=0, gpus=job.gpus)
+        return None
+
     def jobs_on(self, node: str) -> list[Job]:
         """Running jobs occupying ``node``, biggest first.
 
@@ -308,8 +349,12 @@ class Cluster:
             "nodes": len(self.nodes),
             "accelerator_nodes": len(self.gpu_nodes),
             "accelerators_total": sum(n.gpus_total for n in self.nodes),
+            # `effective_free_gpus`, so this agrees with every other free
+            # figure in the tool: an accelerator on a node whose memory is
+            # fully allocated cannot be given to anyone.
             "accelerators_free": sum(
-                n.gpus_free for n in self.reachable_nodes() if n.schedulable
+                n.effective_free_gpus for n in self.reachable_nodes()
+                if n.schedulable
             ),
             "unschedulable_nodes": len(self.unschedulable_nodes),
             "degraded_nodes": [n.name for n in self.degraded_nodes],

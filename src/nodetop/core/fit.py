@@ -44,6 +44,16 @@ class Placement:
     caveats: list[str] = field(default_factory=list)
     #: True when the backend has no dry-run, so entitlement is declared only.
     entitlement_unconfirmed: bool = False
+    #: The instant the snapshot describes, against which a predicted start is
+    #: judged near or far.  ``None`` falls back to the wall clock, which is the
+    #: same thing outside a replay.
+    as_of: datetime | None = None
+
+    #: How far past :attr:`as_of` a predicted start can be and still count as
+    #: immediate.  Slurm answers a dry-run with a start time two or three
+    #: seconds out when it means "right now", so an exact comparison would call
+    #: every placement a queue.
+    START_SLACK_SECONDS = 120
 
     @property
     def partition(self) -> str:
@@ -87,6 +97,41 @@ class Placement:
     def runnable_now(self) -> bool:
         """Reachable and there is room right now."""
         return bool(self.reachable and self.capacity and self.capacity.satisfies(self.shape))
+
+    @property
+    def starts_now(self) -> bool:
+        """Room here *and* nothing ahead of you in the queue.
+
+        :attr:`runnable_now` is a statement about hardware: nodes matching this
+        shape are free this instant. That is not the same as the job starting,
+        because the scheduler runs the queue in priority order -- and where it
+        offers its own estimate, that estimate outranks our arithmetic, exactly
+        as :attr:`earliest_start` already says.
+
+        Measured on the cluster this was written against, for a four-core
+        ten-minute job with every partition reporting free cores:
+
+        ==================  =======================
+        partition           the scheduler's answer
+        ==================  =======================
+        ``beagle3``         now
+        ``bigmem``          now
+        ``amd``             in 4h 24m
+        ``build``           in 8h
+        ``caslake``         in 18h
+        ==================  =======================
+
+        All five said RUN NOW before this existed, and ``amd`` -- the largest
+        pool of free cores on the cluster and so the top row of every listing
+        -- was four and a half hours from starting anything.
+        """
+        if not self.runnable_now:
+            return False
+        predicted = self.verdict.predicted_start if self.verdict else None
+        if predicted is None:
+            return True
+        base = self.as_of or datetime.now()
+        return (predicted - base).total_seconds() <= self.START_SLACK_SECONDS
 
     @property
     def hardware_incompatible(self) -> bool:
@@ -290,6 +335,7 @@ def evaluate(
         accelerator_models=queue.accelerator_models,
         caveats=caveats,
         entitlement_unconfirmed=unconfirmed,
+        as_of=cluster.taken_at,
     )
 
 

@@ -29,7 +29,7 @@ from ..core.duration import parse_timestamp
 from ..core.hardware import identify_accelerator
 from ..core.model import Identity, Job, JobShape, Limits, Node, Queue, Verdict
 from ..runner import Runner, SubprocessRunner, which
-from .base import BackendCapabilities
+from .base import BackendCapabilities, count
 
 __all__ = ["PbsBackend"]
 
@@ -142,12 +142,12 @@ class PbsBackend:
                     name=name,
                     state_raw=str(n.get("state", "")),
                     conditions=frozenset(conditions),
-                    cpus_total=int(avail.get("ncpus") or 0),
-                    cpus_alloc=int(used.get("ncpus") or 0),
+                    cpus_total=count(avail.get("ncpus")),
+                    cpus_alloc=count(used.get("ncpus")),
                     memory_mb=_mem_to_mb(avail.get("mem")),
                     memory_alloc_mb=_mem_to_mb(used.get("mem")),
-                    gpus_total=int(avail.get("ngpus") or 0),
-                    gpus_alloc=int(used.get("ngpus") or 0),
+                    gpus_total=count(avail.get("ngpus")),
+                    gpus_alloc=count(used.get("ngpus")),
                     accelerator=identify_accelerator(None, model or labels),
                     labels=tuple(labels),
                     queues=tuple(
@@ -183,21 +183,19 @@ class PbsBackend:
                     name=name,
                     state_raw=fields.get("state", ""),
                     conditions=frozenset(conditions),
-                    cpus_total=int(
+                    cpus_total=count(
                         fields.get("resources_available.ncpus")
                         or fields.get("pcpus")
                         or fields.get("np")
-                        or 0
                     ),
-                    cpus_alloc=int(fields.get("resources_assigned.ncpus") or 0),
+                    cpus_alloc=count(fields.get("resources_assigned.ncpus")),
                     memory_mb=_mem_to_mb(fields.get("resources_available.mem")),
                     memory_alloc_mb=_mem_to_mb(fields.get("resources_assigned.mem")),
-                    gpus_total=int(
+                    gpus_total=count(
                         fields.get("resources_available.ngpus")
                         or fields.get("gpus")
-                        or 0
                     ),
-                    gpus_alloc=int(fields.get("resources_assigned.ngpus") or 0),
+                    gpus_alloc=count(fields.get("resources_assigned.ngpus")),
                     accelerator=identify_accelerator(None, model or labels),
                     labels=tuple(labels),
                     queues=tuple(

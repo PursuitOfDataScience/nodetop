@@ -13,6 +13,8 @@ scheduler underneath it.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from nodetop.cli import cmd_check, cmd_where
@@ -84,3 +86,41 @@ class TestTheProbedPathsAreActuallyReached:
         cmd_check(refusing_cluster,
                   _args(["check", "-q", "beagle3", "-g", "1"]), PLAIN)
         assert capsys.readouterr().out.strip()
+
+
+class TestAQueueAheadOfYouIsNotARunNow:
+    """The scheduler's own start time outranks "there are free nodes".
+
+    The `ACCEPTED` fixture predicts a start at 2026-08-22T18:00. Read against a
+    snapshot taken six hours earlier, that is a wait -- and it used to render
+    as RUN NOW / `now` because the row was decided by free hardware alone.
+    """
+
+    @staticmethod
+    def _out(cluster, capsys, taken):
+        cluster.taken_at = taken
+        cmd_where(cluster, _args(["where", "-g", "1"]), PLAIN)
+        return " ".join(capsys.readouterr().out.split())
+
+    def test_a_predicted_wait_renders_as_a_queue(self, accepting_cluster, capsys):
+        out = self._out(accepting_cluster, capsys, datetime(2026, 8, 22, 12))
+        assert "QUEUE" in out
+        assert "RUN NOW" not in out
+        # And the wait itself, not a bare "now".
+        assert "6h" in out
+
+    def test_the_headline_says_nothing_starts_immediately(self, accepting_cluster,
+                                                          capsys):
+        out = self._out(accepting_cluster, capsys, datetime(2026, 8, 22, 12))
+        assert "NOWHERE NOW" in out
+
+    def test_the_submit_line_does_not_claim_it_starts_now(self, accepting_cluster,
+                                                          capsys):
+        out = self._out(accepting_cluster, capsys, datetime(2026, 8, 22, 12))
+        assert "submit (queues)" in out
+
+    def test_a_prediction_already_past_still_reads_as_now(self, accepting_cluster,
+                                                          capsys):
+        out = self._out(accepting_cluster, capsys, datetime(2026, 8, 22, 23))
+        assert "RUN NOW" in out
+        assert "QUEUE" not in out

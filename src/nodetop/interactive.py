@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import sys
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -38,7 +39,12 @@ class Key:
     UP = "up"
     DOWN = "down"
     ENTER = "enter"
+    RIGHT = "right"
     BACK = "back"
+    #: Escape, told apart from Left. Both step out of a nested view, but at the
+    #: root they differ: Left there is a movement with nowhere to go, while
+    #: Escape is how a reader leaves.
+    ESCAPE = "escape"
     QUIT = "quit"
     TOP = "top"
     BOTTOM = "bottom"
@@ -46,15 +52,20 @@ class Key:
 
 
 #: Single characters that mean each action.  ``j``/``k`` alongside the arrows
-#: because anyone who lives in a terminal reaches for them, and both ``q`` and
-#: Escape quit because there is no consensus and no cost to accepting either.
+#: because anyone who lives in a terminal reaches for them.
 _KEYS = {
     "\r": Key.ENTER, "\n": Key.ENTER, " ": Key.ENTER,
     "k": Key.UP, "j": Key.DOWN,
     # Escape and Backspace step OUT rather than quitting. Once the view has
     # depth, "out" is what a reader means by both, and a key that leaves the
     # program from three levels down is a key you press once and then distrust.
-    "\x1b": Key.BACK, "\x7f": Key.BACK, "h": Key.BACK,
+    #
+    # At the ROOT there is nothing to step out of, and there the two part ways:
+    # Escape leaves the program, Left does nothing. Left had to stop leaving
+    # because a stray press took the whole thing down; Escape has no such
+    # excuse -- it is the key a reader reaches for to get out, and doing
+    # nothing is indistinguishable from a hang.
+    "\x1b": Key.ESCAPE, "\x7f": Key.BACK, "h": Key.BACK,
     "q": Key.QUIT, "\x03": Key.QUIT, "\x04": Key.QUIT,
     "g": Key.TOP, "G": Key.BOTTOM,
 }
@@ -65,8 +76,20 @@ _KEYS = {
 _ESCAPE_GRACE = 0.05
 
 #: The tails of the CSI sequences an arrow key sends.  Read after ``ESC [``.
-_ARROWS = {"A": Key.UP, "B": Key.DOWN, "C": Key.ENTER, "D": Key.BACK,
+_ARROWS = {"A": Key.UP, "B": Key.DOWN, "C": Key.RIGHT, "D": Key.BACK,
            "H": Key.TOP, "F": Key.BOTTOM}
+
+
+#: Rows a full-screen view needs before it is worth entering.
+#:
+#: Not a taste judgement -- below this the redraw is destructive.  A frame is
+#: repainted by moving the cursor up by its own height, and the chrome alone
+#: (two borders, the facts line, a blank, the funnel, a rule, the column names,
+#: one row and the position line) is nine rows that nothing is allowed to drop.
+#: On a shorter terminal the cursor clamps at the top of the screen, the
+#: clear-to-end lands in the wrong place, and every keypress leaves another copy
+#: behind.  The static print scrolls, which is merely inconvenient.
+MIN_LINES = 10
 
 
 def supported(stream: object | None = None) -> bool:
@@ -78,6 +101,10 @@ def supported(stream: object | None = None) -> bool:
     from a file would otherwise consume that file as keystrokes.  ``NO_COLOR``
     is not consulted: a highlight is structure, not decoration, and inverse
     video is how it degrades.
+
+    A terminal too short to hold one frame counts as unsupported, and falls
+    back to the static print rather than to a screen that repaints on top of
+    itself.  See :data:`MIN_LINES`.
     """
     out = stream if stream is not None else sys.stdout
     if os.environ.get("TERM", "") == "dumb":
@@ -86,6 +113,8 @@ def supported(stream: object | None = None) -> bool:
         import termios  # noqa: F401
         import tty  # noqa: F401
     except Exception:  # pragma: no cover - non-POSIX
+        return False
+    if shutil.get_terminal_size().lines < MIN_LINES:
         return False
     return bool(
         getattr(out, "isatty", lambda: False)()
@@ -123,6 +152,32 @@ def stdin_reader() -> Callable[[float | None], str]:
     return readch
 
 
+#: Frames a burst of keypresses may swallow before one is drawn anyway.
+_MAX_SKIPPED_FRAMES = 24
+
+
+def input_pending() -> bool:
+    """Is another keystroke already queued?
+
+    Used to coalesce a held key into one repaint. Polling the descriptor is
+    only correct because :func:`stdin_reader` reads it directly -- with
+    ``sys.stdin.read`` the bytes would sit in Python's own buffer where
+    ``select`` cannot see them, which is the same trap documented there.
+
+    False whenever stdin is not a terminal, so an injected key source in a test
+    is never treated as an endless burst and starved of repaints.
+    """
+    try:
+        if not sys.stdin.isatty():
+            return False
+        import select as _select
+
+        ready, _, _ = _select.select([sys.stdin.fileno()], [], [], 0)
+        return bool(ready)
+    except Exception:  # pragma: no cover - closed or non-selectable descriptor
+        return False
+
+
 def read_key(readch: Callable[[float | None], str] | None = None) -> str:
     """One keypress, as a :class:`Key` name.
 
@@ -137,7 +192,7 @@ def read_key(readch: Callable[[float | None], str] | None = None) -> str:
         return Key.QUIT
     if ch == "\x1b":
         if read(_ESCAPE_GRACE) != "[":
-            return Key.BACK          # a lone Escape
+            return Key.ESCAPE        # a lone Escape
         return _ARROWS.get(read(_ESCAPE_GRACE), Key.OTHER)
     return _KEYS.get(ch, Key.OTHER)
 
@@ -280,6 +335,9 @@ def select(
     raw: bool = True,
     initial: int = 0,
     erase: bool = True,
+    rows: Sequence[int] | None = None,
+    escapable: bool = True,
+    pending: Callable[[], bool] | None = None,
 ) -> int | str:
     """Move a highlight over ``count`` rows; return the chosen index or ``None``.
 
@@ -302,6 +360,20 @@ def select(
     interaction happen in one place: each level replaces the last rather than
     scrolling it away, so there is one screen and not a transcript of screens.
 
+    ``rows`` gives the display row each entry belongs to, which is what makes
+    the arrows mean what they look like. **Several entries can share a row** --
+    the overview's funnel is one line carrying four counts -- and with a flat
+    list, Down moved between two things on the same line while the cursor
+    appeared not to move at all. With ``rows``, Up and Down step between *rows*
+    and Left and Right move *within* one; Right at the end of a row opens, which
+    is what it does everywhere else.
+
+    ``escapable`` is False at the root of a stack, where there is nothing to step
+    back to. Left there does nothing: it used to return, and returning at the
+    root exits, so a stray press took the whole program down -- "when pressing
+    the left arrow, the entire app is gone". Escape is not a movement, so at the
+    root it means what a reader means by it and leaves.
+
     ``keys`` and ``write`` are injectable so the loop can be driven by a test
     without a terminal, which is the only way this path gets exercised at all.
     """
@@ -309,41 +381,106 @@ def select(
         return Key.BACK
     keys = keys or read_key
     out = write or (lambda s: (sys.stdout.write(s), sys.stdout.flush()))
+    pending = pending or input_pending
     index = max(0, min(initial, count - 1))
     painted = 0
+    # Entry -> display row, and the entries on each row in order. A flat list
+    # behaves as one entry per row, which is the old behaviour exactly.
+    at_row = list(rows) if rows is not None else list(range(count))
+    by_row: dict[int, list[int]] = {}
+    for entry, row in enumerate(at_row[:count]):
+        by_row.setdefault(row, []).append(entry)
+    order = sorted(by_row)
+
+    def step_row(delta: int) -> int:
+        """The entry one row up or down, holding the column where possible."""
+        here = at_row[index]
+        column = by_row[here].index(index)
+        target = order[(order.index(here) + delta) % len(order)]
+        siblings = by_row[target]
+        return siblings[min(column, len(siblings) - 1)]
 
     def paint() -> None:
+        """Repaint the block in place, without ever blanking the screen.
+
+        **Overwrite, do not erase-then-write.** This used to move to the top of
+        the previous block, clear everything downward with `ESC[J`, and only
+        then write the new lines -- two writes with the screen empty in
+        between. A terminal that renders anything in that gap shows a blank
+        box, and holding an arrow key down turns that into a strobe: "when
+        pressing down arrow constantly, the app is flickering".
+
+        Each line is written over the old one and cleared only to end-of-line
+        as it goes, so no cell is ever empty and there is one write per frame.
+        A block that shrank still has to have its tail wiped, and the cursor
+        put back where the next repaint expects it: one line below the block.
+        """
         nonlocal painted
-        if painted:
-            # Back to the top of the previous block and clear downward, so a
-            # block that shrinks does not leave the old tail on screen.
-            out(f"\033[{painted}F\033[J")
         block = list(render(index))
-        out("\n".join(block) + "\n")
+        buf: list[str] = []
+        if painted:
+            buf.append(f"\033[{painted}F")
+        buf.extend(f"{line}\033[K\n" for line in block)
+        stale = painted - len(block)
+        if stale > 0:
+            buf.append("\033[K\n" * stale)
+            buf.append(f"\033[{stale}F")
+        out("".join(buf))
         painted = len(block)
 
     mode = _RawMode() if raw else None
     try:
         if mode is not None:
             mode.__enter__()
+        paint()
+        skipped = 0
         while True:
-            paint()
             try:
                 key = keys()
             except KeyboardInterrupt:
                 return Key.QUIT
-            if key in (Key.QUIT, Key.BACK):
+            if key == Key.QUIT:
                 return key
             if key == Key.ENTER:
                 return index
-            if key == Key.UP:
-                index = (index - 1) % count
+            if key == Key.ESCAPE:
+                # Out of this view, or out of the program when this is the only
+                # view there is.
+                return Key.BACK if escapable else Key.QUIT
+            if key == Key.BACK:
+                # Left inside a row moves left; only at the leftmost edge does it
+                # mean "out of here", and at the root there is no out.
+                siblings = by_row[at_row[index]]
+                column = siblings.index(index)
+                if column > 0:
+                    index = siblings[column - 1]
+                elif escapable:
+                    return key
+            elif key == Key.UP:
+                index = step_row(-1)
             elif key == Key.DOWN:
-                index = (index + 1) % count
+                index = step_row(+1)
+            elif key == Key.RIGHT:
+                siblings = by_row[at_row[index]]
+                column = siblings.index(index)
+                if column + 1 < len(siblings):
+                    index = siblings[column + 1]
+                else:
+                    return index          # nothing further right: open it
             elif key == Key.TOP:
-                index = 0
+                index = by_row[order[0]][0]
             elif key == Key.BOTTOM:
-                index = count - 1
+                index = by_row[order[-1]][0]
+            # Coalesce a burst. A held arrow key arrives as a stream of escape
+            # sequences and only the last position matters, so drawing a frame
+            # per repeat is work whose only visible effect is flicker. The cap
+            # is insurance: a screen that never updates would be worse than one
+            # that updates too often.
+            if pending() and skipped < _MAX_SKIPPED_FRAMES:
+                skipped += 1
+                continue
+            skipped = 0
+            paint()
     finally:
         if erase and painted:
             # Wind the cursor back over the block so whatever the caller draws

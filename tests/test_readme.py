@@ -1,13 +1,15 @@
-"""The README, checked against the code.
+"""The prose docs, checked against the code.
 
 This file exists because of a specific failure. The snapshot/replay capability
 was silently dropped during a package rename: the README went on advertising
 it, the code no longer had it, and nothing noticed until someone read both.
 Documentation that nothing verifies is documentation that will drift.
 
-So every command the README shows must parse with the real argument parser,
-every name it imports must exist, and every method it tells a contributor to
-implement must be on the actual protocol.
+So every command the docs show must parse with the real argument parser, every
+name they import must exist, and every method they tell a contributor to
+implement must be on the actual protocol.  README.md is the short front door
+and DESIGN.md holds the long-form rationale; both are checked, because either
+one drifting is the same defect.
 """
 
 from __future__ import annotations
@@ -20,12 +22,15 @@ import pytest
 from nodetop import backends
 from nodetop.cli import build_parser
 
-README = pathlib.Path(__file__).resolve().parents[1] / "README.md"
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+README = ROOT / "README.md"
+DESIGN = ROOT / "DESIGN.md"
 TEXT = README.read_text()
+DOCS = TEXT + "\n" + DESIGN.read_text()
 
 
-def _blocks(lang: str | None = None) -> list[str]:
-    found = re.findall(r"```(\w*)\n(.*?)```", TEXT, re.S)
+def _blocks(lang: str | None = None, text: str = DOCS) -> list[str]:
+    found = re.findall(r"```(\w*)\n(.*?)```", text, re.S)
     return [body for tag, body in found if lang is None or tag == lang]
 
 

@@ -159,6 +159,72 @@ class TestStartEstimates:
         assert p.start_estimate_from_scheduler is False
 
 
+class TestFreeNodesAreNotAStartTime:
+    """Room here is a fact about hardware; starting is the scheduler's call.
+
+    Measured for a four-core ten-minute job on a cluster where every partition
+    reported free cores: `beagle3` and `bigmem` started now, `amd` was 4h 24m
+    out, `build` 8h, `caslake` 18h. All five reported RUN NOW.
+    """
+
+    TAKEN = datetime(2026, 8, 21, 12)
+
+    def _place(self, predicted, taken=None):
+        q = Queue(name="q", nodes=[_node("n1")])
+        cl = _cluster([q])
+        cl.taken_at = taken or self.TAKEN
+        cl._backend = _FakeBackend(Verdict(
+            queue="q", allowed=True, category=VerdictCategory.OK,
+            predicted_start=predicted,
+        ))
+        return evaluate(cl, JobShape(gpus_per_node=4), q, use_probe=True)
+
+    def test_a_prediction_hours_out_is_not_now(self):
+        p = self._place(datetime(2026, 8, 21, 16, 24))
+        assert p.runnable_now is True     # the hardware is free
+        assert p.starts_now is False      # and the queue is ahead of you
+        assert p.earliest_start == datetime(2026, 8, 21, 16, 24)
+
+    def test_a_prediction_at_the_reference_time_is_now(self):
+        assert self._place(self.TAKEN).starts_now is True
+
+    def test_a_few_seconds_of_scheduler_jitter_is_still_now(self):
+        # `sbatch --test-only` answers two or three seconds out when it means
+        # immediately; an exact comparison would call every placement a queue.
+        assert self._place(datetime(2026, 8, 21, 12, 0, 3)).starts_now is True
+
+    def test_a_prediction_in_the_past_is_now(self):
+        assert self._place(datetime(2026, 8, 21, 11)).starts_now is True
+
+    def test_no_prediction_falls_back_to_the_hardware(self):
+        # A backend with no dry-run has nothing better to offer, so the two
+        # questions collapse into one rather than answering "no".
+        q = Queue(name="q", nodes=[_node("n1")])
+        p = evaluate(_cluster([q], probe=False), JobShape(gpus_per_node=4), q)
+        assert p.runnable_now is True
+        assert p.starts_now is True
+
+    def test_no_room_is_never_now_whatever_the_prediction_says(self):
+        q = Queue(name="q", nodes=[_node("n1", alloc=4)])
+        cl = _cluster([q])
+        cl.taken_at = self.TAKEN
+        cl._backend = _FakeBackend(Verdict(
+            queue="q", allowed=True, category=VerdictCategory.OK,
+            predicted_start=self.TAKEN,
+        ))
+        p = evaluate(cl, JobShape(gpus_per_node=4), q, use_probe=True)
+        assert p.runnable_now is False
+        assert p.starts_now is False
+
+    def test_the_reference_time_is_the_snapshot_not_the_wall_clock(self):
+        # On a replay those differ by however old the snapshot is, and judging
+        # a recorded prediction against today's clock would call every
+        # placement a queue.
+        p = self._place(datetime(2026, 8, 21, 12, 0, 30))
+        assert p.as_of == self.TAKEN
+        assert p.starts_now is True
+
+
 class TestHardwareVerdicts:
     def test_wrong_hardware_everywhere(self):
         q = Queue(name="q", nodes=[_node("n1", model="V100")])
@@ -262,6 +328,67 @@ class TestRanking:
     def test_a_missing_queue_name_is_ignored(self):
         cl = _cluster(self._mixed(), probe=False)
         assert rank(cl, JobShape(gpus_per_node=4), queues=["nope"]) == []
+
+
+class TestAJobsShareOfOneNode:
+    """A job list reports totals; a per-node view needs the share."""
+
+    @staticmethod
+    def _cluster(allocations=()):
+        cl = _cluster([Queue(name="q", nodes=[_node("n1"), _node("n2")])])
+        cl._allocations = {(a.job, a.node): a for a in allocations}
+        return cl
+
+    def test_a_single_node_job_needs_no_lookup(self):
+        from nodetop.core.model import Job
+
+        cl = self._cluster()
+        job = Job(id="1", cpus=8, gpus=2, nodes=("n1",))
+        got = cl.share_of(job, "n1")
+        assert (got.cpus, got.gpus) == (8, 2)
+
+    def test_a_multi_node_job_uses_the_allocation(self):
+        from nodetop.core.model import Allocation, Job
+
+        cl = self._cluster([Allocation(job="1", node="n1", cpus=7,
+                                       memory_mb=7168, gpus=1)])
+        job = Job(id="1", cpus=512, gpus=8, nodes=("n1", "n2"))
+        got = cl.share_of(job, "n1")
+        assert (got.cpus, got.memory_mb, got.gpus) == (7, 7168, 1)
+
+    def test_an_allocation_beats_the_totals_even_on_one_node(self):
+        # Memory is the reason: a job list reports what was requested, the
+        # allocation what was given.
+        from nodetop.core.model import Allocation, Job
+
+        cl = self._cluster([Allocation(job="1", node="n1", cpus=8,
+                                       memory_mb=28672)])
+        got = cl.share_of(Job(id="1", cpus=8, nodes=("n1",)), "n1")
+        assert got.memory_mb == 28672
+
+    def test_a_multi_node_job_with_no_allocation_admits_it(self):
+        # None, not the total: a total in a column that means a share is the
+        # impossible number this exists to stop.
+        from nodetop.core.model import Job
+
+        cl = self._cluster()
+        assert cl.share_of(Job(id="1", cpus=512, nodes=("n1", "n2")), "n1") is None
+
+    def test_a_backend_with_no_allocations_records_nothing_and_raises_nothing(self):
+        cl = _cluster([Queue(name="q", nodes=[_node("n1")])])
+        assert cl.allocations() == {}
+        assert "allocations" not in cl.errors
+
+    def test_a_failing_query_is_recorded_not_raised(self):
+        cl = _cluster([Queue(name="q", nodes=[_node("n1")])])
+
+        class _Boom:
+            def load_allocations(self):
+                raise RuntimeError("scontrol died")
+
+        cl._backend = _Boom()
+        assert cl.allocations() == {}
+        assert "allocations" in cl.errors
 
 
 class TestClusterHelpers:

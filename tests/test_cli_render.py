@@ -130,7 +130,7 @@ class TestContent:
         assert "slurm" in out
         # The funnel, not a DEAD block: what is broken is a count on this view,
         # and `queues` / `health` carry the detail. See TestStatus.
-        assert "partitions" in out and "dead" in out
+        assert "partitions" in out and "down" in out
         assert "advertised" not in out
 
     def test_queues_table_summarises_the_blockers(self, cluster, capsys):
@@ -184,10 +184,21 @@ class TestContent:
         cmd_health(cluster, _args(["health"]), MODES["plain"])
         assert "reason-field" in _prose(capsys.readouterr().out)
 
-    def test_nodes_flags_inferred_accelerator_memory(self, cluster, capsys):
-        cmd_nodes(cluster, _args(["nodes", "--gpu"]), MODES["plain"])
-        # A100 could be 40 or 80 GB; the "?" is the disclosure.
+    def test_accelerator_memory_is_flagged_where_it_is_reported(self, cluster,
+                                                                capsys):
+        # An A100 could be 40 or 80 GB and no scheduler says which, so the
+        # figure is an inference and has to be marked as one.
+        cmd_accelerators(cluster, _args(["accelerators"]), MODES["plain"])
         assert "?" in capsys.readouterr().out
+
+    def test_the_node_table_does_not_repeat_it_per_row(self, cluster, capsys):
+        # Accelerator memory is a property of the MODEL, so it was the same
+        # string down every row, carrying a `?` the table has no room to
+        # explain: "why is there a ton of 40G? why do they have '?'?"
+        cmd_nodes(cluster, _args(["nodes", "--gpu"]), MODES["plain"])
+        out = capsys.readouterr().out
+        assert "A100" in out          # the model is still named
+        assert "40G" not in out       # its memory is one command away
 
     def test_accelerators_reports_capability_reach(self, cluster, capsys):
         cmd_accelerators(cluster, _args(["accelerators"]), MODES["plain"])

@@ -266,6 +266,76 @@ class TestStructure:
         out = panel(["x"], "t", ASCII, size=20)
         out.encode("ascii")
 
+    def test_a_divider_inside_a_panel_spans_the_panel(self):
+        # `_grid` rules to its own widest column. Inside a frame whose width
+        # comes from a longer line -- the cluster facts header -- that left a
+        # separator stopping short of the border, which reads as a rendering
+        # fault: "i hope the ui is completely sealed".
+        rows = panel(["a much longer line than the rule", "  " + PLAIN.g.h * 4],
+                     "", PLAIN, size=60).splitlines()
+        dashes = [line for line in rows[1:-1] if PLAIN.g.h * 4 in line]
+        assert len(dashes) == 1
+        # Same right edge as every other content line.
+        assert len({width(line) for line in rows}) == 1
+        # Filled out to the inner width, less the indent it came with.
+        assert dashes[0].count(PLAIN.g.h) == width(rows[0]) - 4 - 2
+
+    def test_a_divider_stretches_in_ascii_too(self):
+        rows = panel(["a much longer line than the rule", "  " + ASCII.g.h * 4],
+                     "", ASCII, size=60).splitlines()
+        assert len({width(line) for line in rows}) == 1
+        assert rows[2].count(ASCII.g.h) == width(rows[0]) - 4 - 2
+
+    def test_content_that_merely_starts_with_a_dash_is_left_alone(self):
+        # The stretch must key on "this line is nothing but rule characters",
+        # not on "this line contains one", or a node named `a-b` or a bar of
+        # dashes would be blown out to the full width.
+        body = PLAIN.g.h + " left alone"
+        rows = panel(["a much longer line than the rule", body],
+                     "", PLAIN, size=60).splitlines()
+        assert "left alone" in rows[2]
+        assert rows[2].count(PLAIN.g.h) == 1
+
+    def test_a_frame_is_one_row_shorter_than_the_window(self, monkeypatch):
+        """The spare line is load-bearing, not taste.
+
+        A frame exactly as tall as the terminal scrolls it by one on its final
+        newline, so the repaint's cursor-up lands a line low and every keypress
+        orphans the top border -- a growing stack of `╭────╮`.
+        """
+        import os
+        import shutil
+
+        from nodetop.render import term_height
+
+        monkeypatch.setattr(shutil, "get_terminal_size",
+                            lambda *_a, **_k: os.terminal_size((100, 24)))
+        assert term_height() == 23
+
+    def test_a_frame_is_capped_like_the_width_is(self, monkeypatch):
+        # A box ruled out to sixty rows around eight rows of content reads as
+        # an empty room.
+        import os
+        import shutil
+
+        from nodetop.render import MAX_HEIGHT, term_height
+
+        monkeypatch.setattr(shutil, "get_terminal_size",
+                            lambda *_a, **_k: os.terminal_size((100, 200)))
+        assert term_height() == MAX_HEIGHT
+
+    def test_a_frame_has_a_floor(self, monkeypatch):
+        # Below its own chrome the frame cannot be drawn at all; the caller
+        # falls back to the static print rather than asking for two rows.
+        import os
+        import shutil
+
+        from nodetop.render import MIN_HEIGHT, term_height
+
+        monkeypatch.setattr(shutil, "get_terminal_size",
+                            lambda *_a, **_k: os.terminal_size((100, 3)))
+        assert term_height() == MIN_HEIGHT
+
     def test_rule_fills_the_width(self):
         assert width(rule("", PLAIN, size=30)) == 30
 

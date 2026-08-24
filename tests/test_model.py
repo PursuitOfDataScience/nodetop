@@ -160,6 +160,100 @@ class TestPhantomCapacity:
         assert q.unresolved_nodes == 609
 
 
+class TestCoresWithNoMemoryBehindThem:
+    """Idle cores on a node whose memory is spoken for are not room.
+
+    Real and large: `caslake` advertised 2322 free cores, 2035 of them on 47
+    nodes with every byte of memory allocated to a handful of four-core jobs.
+    The scheduler gives every job memory -- the site default if the job names
+    no figure -- so those cores can start nothing, and they were the biggest
+    number on the screen.
+    """
+
+    def _node(self, alloc_mb: int, **kw):
+        return Node(name="n", cpus_total=48, cpus_alloc=4, memory_mb=184320,
+                    memory_alloc_mb=alloc_mb, **kw)
+
+    def test_a_node_with_memory_left_offers_its_free_cores(self):
+        n = self._node(4096)
+        assert n.memory_exhausted is False
+        assert n.effective_free_cpus == 44
+        assert n.has_room is True
+
+    def test_a_node_with_no_memory_left_offers_nothing(self):
+        n = self._node(184320)
+        assert n.memory_exhausted is True
+        # The claimed count is still there for diagnosis...
+        assert n.cpus_free == 44
+        # ...and what any summary shows is zero.
+        assert n.effective_free_cpus == 0
+        assert n.has_room is False
+
+    def test_its_accelerators_are_unreachable_too(self):
+        # A GPU job needs host memory like any other.
+        n = self._node(184320, gpus_total=4, gpus_alloc=1)
+        assert n.gpus_free == 3
+        assert n.effective_free_gpus == 0
+        assert n.has_room is False
+
+    def test_a_backend_that_reports_no_memory_is_not_penalised(self):
+        # "Cannot tell" is not "none": inventing a shortage on a system that
+        # never mentioned memory would be its own kind of lie.
+        n = Node(name="n", cpus_total=48, cpus_alloc=4, memory_mb=0)
+        assert n.memory_exhausted is False
+        assert n.effective_free_cpus == 44
+        assert n.has_room is True
+
+    def test_a_scheduler_that_does_not_enforce_memory_is_not_penalised_either(self):
+        # Slurm without `_MEMORY` in `SelectTypeParameters` never decrements
+        # memory, so `AllocMem` records what jobs asked for rather than a
+        # ceiling. Reading it as one would report a whole cluster as full.
+        n = self._node(184320, memory_consumable=False)
+        assert n.memory_exhausted is False
+        assert n.effective_free_cpus == 44
+        assert n.has_room is True
+
+    def test_an_unschedulable_node_has_no_room_whatever_it_reports(self):
+        n = Node(name="n", cpus_total=48, memory_mb=1000,
+                 conditions=frozenset({"DRAIN"}))
+        assert n.effective_free_cpus == 48   # the claim
+        assert n.has_room is False           # the answer
+
+    def test_a_queue_counts_only_cores_it_can_hand_out(self):
+        starved = self._node(184320)
+        spare = Node(name="m", cpus_total=48, cpus_alloc=44, memory_mb=184320,
+                     memory_alloc_mb=4096)
+        q = Queue(name="q", nodes=[starved, spare])
+        assert q.cpus_free == 48             # 44 + 4, as the scheduler says
+        assert q.effective_free_cpus == 4    # what can actually be allocated
+
+    def test_a_queue_of_starved_nodes_reports_zero(self):
+        q = Queue(name="q", nodes=[self._node(184320) for _ in range(47)])
+        assert q.cpus_free == 47 * 44
+        assert q.effective_free_cpus == 0
+
+    def test_a_node_with_nothing_running_and_no_memory_is_not_a_free_node(self):
+        """"Nothing is running here" is not "something could run here".
+
+        Reachable on Kubernetes, where a pod may request memory with no CPU
+        request at all: the node reports zero allocated CPU -- so `idle` is
+        true -- and no allocatable memory. It was counted in the one column
+        that claims a node is wholly free.
+        """
+        n = Node(name="n", cpus_total=48, cpus_alloc=0, memory_mb=184320,
+                 memory_alloc_mb=184320)
+        assert n.idle is True            # nothing is running
+        assert n.has_room is False       # and nothing can
+        q = Queue(name="q", nodes=[n])
+        assert len(q.idle_nodes) == 1    # the raw claim survives
+        assert q.effective_free_nodes == 0
+
+    def test_a_genuinely_idle_node_still_counts(self):
+        n = Node(name="n", cpus_total=48, memory_mb=184320)
+        q = Queue(name="q", nodes=[n])
+        assert q.effective_free_nodes == 1
+
+
 class TestQueueAccessGates:
     def test_account_not_in_allowlist(self):
         q = Queue(name="q", allow_accounts=("alice", "bob"))

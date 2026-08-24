@@ -123,6 +123,31 @@ class TestNodeFits:
         fit = node_fits(node, JobShape(gpus_per_node=4))
         assert len(fit.reasons) == len(set(fit.reasons))
 
+    def test_a_node_with_no_allocatable_memory_fits_nothing(self):
+        # The check used to be conditional on the shape naming a memory
+        # figure, so a cores-only job was told a node with 28 of 32 cores idle
+        # and all of its memory allocated would take it. The scheduler gives
+        # every job memory -- the site default when the job names none -- so
+        # it would not.
+        node = _node(cpus_alloc=4, mem_alloc=256 * 1024, gpus=0)
+        assert node.cpus_free == 28
+        fit = node_fits(node, JobShape(cpus_per_task=4))
+        assert fit.fits is False
+        assert "no memory free" in fit.reasons
+
+    def test_the_shortage_is_reported_once_not_twice(self):
+        # Both memory branches must not fire on the same node.
+        node = _node(mem_alloc=256 * 1024, gpus=0)
+        fit = node_fits(node, JobShape(memory_gb=64))
+        assert len(fit.reasons) == len(set(fit.reasons))
+        assert sum("memory" in r or "RAM" in r for r in fit.reasons) == 1
+
+    def test_a_node_that_reports_no_memory_at_all_still_fits(self):
+        # "Cannot tell" is not "none" -- a backend that never mentions memory
+        # must not have a shortage invented for it.
+        node = _node(mem=0, gpus=0)
+        assert node_fits(node, JobShape(cpus_per_task=4)).fits
+
 
 class TestCapacityBuckets:
     def _mixed(self):

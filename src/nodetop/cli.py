@@ -13,7 +13,7 @@ import argparse
 import difflib
 import json
 import pathlib
-import shutil
+import re
 import sys
 from collections.abc import Callable, Sequence
 from datetime import datetime
@@ -38,7 +38,7 @@ from .core.fit import (
     unsettled,
 )
 from .core.hardware import supports
-from .core.model import JobShape, Queue, split_reason
+from .core.model import Allocation, JobShape, Queue, split_reason
 from .exceptions import NoBackendError
 from .hostlist import expand
 from .render import (
@@ -56,6 +56,7 @@ from .render import (
     plural,
     section,
     table,
+    term_height,
     term_width,
     tree,
     truncate,
@@ -260,8 +261,17 @@ def _reject_unknown_queues(cluster: Cluster, args: argparse.Namespace,
 #: `_browse`, and it can only do that safely if column 0 is a plain space. When
 #: it wrote over the *glyph* column instead it was overwriting the first byte of
 #: that cell's colour escape, and the row rendered as `❯[38;5;111m◐  node...`.
-NODE_HEADS = ["", "", "node", "state", "cpu", "free", "mem free", "gpu", "reason"]
-NODE_ALIGNS = ["left", "left", "left", "left", "left", "right", "right", "left",
+#: One `<resource> free` per column, and the meter unlabelled beside the number
+#: it draws -- the same shape as the overview's table.
+#:
+#: It was `cpu | free | mem free | gpu`, with `cpu` over the meter and a bare
+#: `free` over the fraction beside it: "what does 'free' mean here? and then
+#: after that, you have 'mem free'. why so many frees?" The word was doing the
+#: work of three different labels, and none of the three said which resource it
+#: belonged to.
+NODE_HEADS = ["", "", "node", "state", "cpu free", "", "mem free", "gpu free",
+              "reason"]
+NODE_ALIGNS = ["left", "left", "left", "left", "right", "left", "right", "left",
                "left"]
 NODE_LIMITS = [0, 0, 24, 18, 0, 0, 0, 0, 34]
 
@@ -275,29 +285,54 @@ def _node_rows(nodes: Sequence, st: Style) -> list[list[object]]:
     disagree with the listing it zooms out to is worse than no zoom view.
     """
     heat = dict(zip([n.name for n in nodes],
-                    heat_steps([n.cpus_free for n in nodes]), strict=False))
+                    heat_steps([n.effective_free_cpus for n in nodes]),
+                    strict=False))
+    any_gpu = any(n.is_gpu_node for n in nodes)
     rows: list[list[object]] = []
     for n in nodes:
         if not n.schedulable:
             mark, state = st.dim(st.g.off), st.dim(n.state_raw)
         elif n.degraded:
             mark, state = st.warn(st.g.warn), st.warn(n.state_raw)
+        elif not n.has_room:
+            # Before `idle`, deliberately. A node with nothing running on it and
+            # no allocatable memory left is idle by the core count and can host
+            # nothing, and the green "free" mark is the one thing on the row a
+            # reader trusts without checking the numbers beside it.
+            mark, state = st.info(st.g.partial), n.state_raw
         elif n.idle:
             mark, state = st.ok(st.g.ok), n.state_raw
         else:
             mark, state = st.info(st.g.partial), n.state_raw
 
-        accel = st.dim(st.g.sep)
+        # A dash, not the `·` used everywhere else for an empty cell. This
+        # column says how many accelerators are free, and a node with none
+        # installed is not answering that question at all -- "the . in the gpu
+        # column is a very confusing thing ... putting a dot there means
+        # nothing." A dash reads as not-applicable in any terminal, with colour
+        # off, in ASCII.
+        #
+        # Empty rather than a dash when NOTHING in this listing has an
+        # accelerator: `table` drops a column no row fills, so a CPU-only
+        # partition spends no width at all on a question that does not arise.
+        accel = st.dim(st.g.dash) if any_gpu else ""
         if n.is_gpu_node:
             if n.accelerator:
-                mem = f"{n.accelerator.memory_gb}G"
-                if not n.accelerator.memory_certain:
-                    mem += st.dim("?")
+                # The MODEL, and not its memory.
+                #
+                # Accelerator memory is a property of the model, not of the
+                # node, so it was the same string repeated down fifty-six rows
+                # -- and for a part that ships in more than one size it carried
+                # a `?` that this table has no room to explain: "why is there a
+                # ton of 40G? why do they have '?'? that's very confusing."
+                # `nodetop gpus` prints it once per model, which is once, with
+                # the inference marked. Same argument that moved `maxtime` out
+                # of the partition table.
                 accel = (
                     st.heat(str(n.gpus_free),
                             n.gpus_free / n.gpus_total if n.gpus_total else 0)
                     + st.muted(f"/{n.gpus_total} ")
-                    + f"{st.accent(n.accelerator.model)} {st.dim(mem)}"
+                    + st.accent(n.accelerator.model)
                 )
             else:
                 accel = f"{n.gpus_free}/{n.gpus_total} {st.warn('UNKNOWN')}"
@@ -310,7 +345,14 @@ def _node_rows(nodes: Sequence, st: Style) -> list[list[object]]:
         # phantom capacity -- the mark and the state say so, but a meter shouts
         # louder than a glyph. The numbers are still shown: they are what the
         # scheduler claims, and hiding them would be its own kind of lie.
-        cpu_share = (n.cpus_free / n.cpus_total) if n.cpus_total else 0.0
+        # `effective_free_cpus`, not `cpus_free`: the same argument as the
+        # unschedulable case below. A node with 44 of 48 cores idle and no
+        # allocatable memory left drew a nearly-full bright meter beside
+        # `0/180G`, which reads as the roomiest row on the screen and is the
+        # single most misleading thing this table could say. The claimed core
+        # count stays in the column beside it; the meter measures room.
+        cpu_share = ((n.effective_free_cpus / n.cpus_total)
+                     if n.cpus_total else 0.0)
         if n.schedulable:
             meter = bar(cpu_share, 8, st, step=heat[n.name])
             cpus = st.tint(str(n.cpus_free), heat[n.name])
@@ -326,13 +368,48 @@ def _node_rows(nodes: Sequence, st: Style) -> list[list[object]]:
             cpus = st.dim(str(n.cpus_free))
             mem = st.dim(str(n.memory_free_mb // 1024))
         rows.append([
-            " ", mark, n.name, state, meter,
+            " ", mark, n.name, state,
+            # The number, then the meter that draws it: same order as the
+            # overview's table, so one habit reads both.
             cpus + st.muted(f"/{n.cpus_total}"),
+            meter,
             mem + st.muted(f"/{n.memory_mb // 1024}G"),
             accel,
             st.dim(n.reason) if n.reason else "",
         ])
     return rows
+
+
+#: `64G`, `64GB`, `64Gi`, `65536M`, `2T`, or a bare number meaning GiB.
+#:
+#: `Gi` is in there because this tool speaks Kubernetes too, and that is how
+#: Kubernetes writes it. Both notations mean the same binary multiple, so
+#: accepting each costs nothing and refusing one is a papercut for whichever
+#: half of the audience is used to it.
+_MEMORY = re.compile(
+    r"^\s*(?P<n>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTP]?)(?:iB?|B)?\s*$",
+    re.IGNORECASE)
+_MEMORY_SCALE = {"": 1.0, "K": 1 / 1024 / 1024, "M": 1 / 1024, "G": 1.0,
+                 "T": 1024.0, "P": 1024.0 * 1024}
+
+
+def memory_gb(text: str) -> float:
+    """Parse a memory size to GiB, accepting the scheduler's own spellings.
+
+    ``--mem 64G`` is what a Slurm user types, because it is what ``sbatch``
+    takes. This argument used to be a bare ``float`` in GiB, so the natural
+    thing to type was an argparse error -- a tool whose whole premise is
+    scheduler fluency rejecting the scheduler's own notation.
+
+    Bare numbers still mean GiB, so nothing that worked before changes meaning.
+    Suffixes are binary (``K``/``M``/``G``/``T``/``P``, optional trailing ``B``),
+    matching ``sbatch``: there is no second convention to guess between.
+    """
+    m = _MEMORY.match(text or "")
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a memory size -- try 64, 64G, 64GB or 65536M")
+    return float(m.group("n")) * _MEMORY_SCALE[m.group("unit").upper()]
 
 
 def _window(data: list[str], index: int, st: Style,
@@ -349,8 +426,24 @@ def _window(data: list[str], index: int, st: Style,
     times, once per level, and three copies of a scroll calculation is three
     chances for one of them to be off by one.
     """
-    room = shutil.get_terminal_size().lines - reserved
-    if room < 3 or len(data) <= room:
+    # Clamped, not abandoned. This used to give up when fewer than three rows
+    # would fit and return the whole list -- which is the one case where doing
+    # so is destructive: the redraw moves the cursor up by the height of the
+    # last frame, so a 67-line frame on a 10-line terminal clamps at the top of
+    # the screen, the clear-to-end lands in the wrong place, and every keypress
+    # leaves another copy behind. One visible row and a position line is a
+    # usable screen; forty are not, and nothing is hidden silently either way.
+    #
+    # **One spare line beyond the chrome, and it is load-bearing.** `reserved`
+    # is what the caller draws around these rows, so without the spare the
+    # frame comes out *exactly* as tall as the terminal -- and a frame that
+    # tall does not fit: the last line's newline scrolls the screen by one, the
+    # repaint's cursor-up lands one line low, and each keypress orphans the top
+    # border. That is the stack of `╭────╮` lines a node listing used to grow,
+    # one per repaint, at every terminal size. Subtracted here rather than
+    # added to each caller's `reserved`, so no caller has to remember it.
+    room = max(1, term_height() - reserved)
+    if len(data) <= room:
         return data
     lo = max(0, min(index - room // 2, len(data) - room))
     shown = data[lo:lo + room]
@@ -433,8 +526,8 @@ def _add_shape_args(p: argparse.ArgumentParser, *, dry_run_only: bool = False) -
                    help="CPUs per task")
     g.add_argument("--tasks-per-node", type=int, default=1, metavar="N",
                    help="tasks per node (default: 1)")
-    g.add_argument("--mem", type=float, default=0.0, metavar="GB",
-                   help="host memory per node, in GB")
+    g.add_argument("--mem", type=memory_gb, default=0.0, metavar="SIZE",
+                   help="host memory per node: 64, 64G, 64GB or 65536M")
     g.add_argument("-t", "--time", default="01:00:00", metavar="WALLTIME",
                    help="walltime: 4:00:00, 2-00:00:00, 90m, 36h "
                         "(a bare number is minutes)")
@@ -454,7 +547,7 @@ def _add_shape_args(p: argparse.ArgumentParser, *, dry_run_only: bool = False) -
             "it is checked against the hardware model"
         )
         needs_help = "comma-separated capabilities: bf16,fp8,tf32,flash"
-    g.add_argument("--gpu-mem", type=float, default=0.0, metavar="GIB",
+    g.add_argument("--gpu-mem", type=memory_gb, default=0.0, metavar="SIZE",
                    help=gpu_mem_help)
     g.add_argument("--needs", default="", metavar="CAPS", help=needs_help)
     g.add_argument("--exclude", default="", metavar="NODES",
@@ -752,9 +845,45 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     word in capitals; column names are lowercase and dim; nothing is explained.
     If a column needs a legend it needs a better name.
     """
+    # `--json` is emitted from the SAME population as the panel, further down,
+    # not from `cluster.summary()` here.
+    #
+    # It used to return early with the cluster digest, which answers a
+    # different question than the text does: the panel said "222 of 358 GPUs,
+    # 53 free" -- your partitions -- while the JSON said 358 total and 126
+    # free, counting accelerators in partitions this account cannot submit to,
+    # and carried neither the funnel nor a single partition row. The README
+    # promises `--json` carries what the text does. Paying for the same
+    # dry-runs the text pays for is the price of that being true; `--declared`
+    # skips them for both forms alike.
     summary = cluster.summary()
-    if args.json:
-        print(json.dumps(summary, indent=2, default=str))
+
+    def status_json(
+        yours: dict[str, int] | None = None,
+        funnel: dict[str, int] | None = None,
+        listed: Sequence[dict[str, object]] = (),
+        excluded: Sequence[tuple[str, str]] = (),
+    ) -> int:
+        """One schema, whichever path reaches it.
+
+        The degenerate paths -- no nodes at all, a control plane that answered
+        nothing -- return before the population is known, and a `--json` that
+        prints nothing there is worse than one that prints zeros: the caller
+        cannot tell "no nodes" from "the command crashed".
+        """
+        print(json.dumps({
+            **summary,
+            "yours": yours or {
+                "nodes": 0, "nodes_schedulable": 0, "accelerators_total": 0,
+                "accelerators_free": 0, "cpus_total": 0,
+                "cpus_free_advertised": 0, "effective_free_cpus": 0,
+            },
+            "funnel": funnel or {
+                "total": len(cluster.queues), "shown": 0, "unconfirmed": 0,
+            },
+            "listed": list(listed),
+            "excluded": [{"name": name, "reason": why} for name, why in excluded],
+        }, indent=2, default=str))
         return 0
 
     term = cluster.queue_term
@@ -770,7 +899,11 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # "358 GPUs, 117 free" above five partitions holding 230 of them -- the
     # same mixing of two populations that made `gpus` report a total nobody
     # could use.
-    facts = []
+    # The tool and backend lead the facts line rather than sitting on a line of
+    # their own: now that the title is content instead of part of the border, a
+    # separate line for two words is a line spent on nothing.
+    facts = [f"{st.head('nodetop')} {st.dim(st.g.sep)} "
+             f"{st.accent(cluster.backend_name)}"]
     if ident is not None and ident.user:
         facts.append(st.head(ident.user))
     # Nodes first, GPUs after. Only 91 of this cluster's 607 nodes have an
@@ -793,10 +926,12 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             body.append(f"{st.bad('FAILED')} {st.dim(name)}  {truncate(why, 60)}")
 
     if not cluster.nodes:
+        if args.json:
+            return status_json()
         body.append(st.warn(
             "no nodes -- wrong backend, or the control plane is down"
         ) + st.dim("  nodetop backends"))
-        print(panel(body, f"nodetop {st.dim(st.g.sep)} {st.accent(cluster.backend_name)}", st))
+        print(panel(body, "", st))
         return 0
 
     # Every partition that owns nodes -- NOT only the ones with room right now.
@@ -931,12 +1066,12 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         # resource than the other rows have -- so a warm row is where the room
         # is, at a glance, without reading a single number.
         #
-        # Tone and bar length are deliberately NOT the same quantity. Length is
-        # this partition's own free share; tone is how its free cores compare to
-        # everything else here. `amd-hm` draws a full bar in a cold tone (all of
-        # it free, and it is one node); `amd` draws a short bar in a warm one
-        # (mostly busy, and still the largest pool of free cores on the list).
-        # Collapsing the two would lose whichever one was dropped.
+        # Tone and bar length now measure the SAME quantity, on purpose. They
+        # used to differ (length was the row's own free share, tone was its
+        # free cores against the rest), and a row could then be long and cold
+        # or short and warm, which read as two contradictory answers to one
+        # question. One quantity, drawn twice, agrees with itself -- and how
+        # full a partition is in its own terms is what `idle` and `zoom` say.
         core_heat = heat_steps([q.effective_free_cpus for q in ranked])
         gpu_heat = heat_steps([q.effective_free_gpus for q in ranked])
         # The bar measures the column the table is SORTED by, which it did not.
@@ -952,7 +1087,6 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         for i, q in enumerate(ranked):
             cores = q.cpus_total
             free = q.effective_free_cpus
-            share = (free / cores) if cores else 0.0
             out.append([
                 # A one-character mark column, empty until something selects
                 # this row. The interactive cursor is written into it in place,
@@ -973,7 +1107,6 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                 st.tint(str(free), core_heat[i]) if cores else "",
                 bar(free / peak_free if peak_free else 0.0, 10, st,
                     step=core_heat[i]),
-                st.muted(f"{share * 100:.0f}%"),
                 st.muted(str(q.gpus_total)) if q.gpus_total else "",
                 st.tint(str(q.effective_free_gpus), gpu_heat[i]) if q.gpus_total else "",
                 st.muted(", ".join(list(q.accelerator_models)[:2])),
@@ -984,14 +1117,23 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # legend the way "FREE" did. `maxtime` is gone -- it is a property of the
     # partition, not an answer to "where can I run this", and it lives one
     # command away in `queues -q NAME`.
-    # `free` carries the sort marker and the bar beside it is unlabelled: the
-    # bar IS that column, drawn. `share` labels the percentage, which is a
-    # different question -- how full this partition is, rather than how much of
-    # the cluster's spare capacity is here.
-    heads = ["", term, "nodes", "idle", "cores", f"free {st.g.sort_down}", "",
-             "share", "gpu", "free", "models"]
+    # One quantity per column, and the bar draws the column beside it.
+    #
+    # There used to be a `share` percentage as well -- free as a fraction of the
+    # partition's own capacity -- next to a bar drawn from a different quantity,
+    # and the question that kept coming back was "does the bar show share or
+    # free?" It was unanswerable from the screen: two numbers for two different
+    # notions of free, one of them also drawn. `share` is gone. `free` is the
+    # count, the bar is that count against the largest on the list, and how full
+    # a partition is in its own terms is what `zoom` is for.
+    #
+    # The sort marker went with it. `free ↓` was read as part of the value, not
+    # as an ordering -- "what does free down arrow mean?" -- and the bar already
+    # descends monotonically, which says the same thing without a glyph.
+    heads = ["", term, "nodes", "idle", "cores", "free", "", "gpu", "free",
+             "gpu model"]
     aligns = ["left", "left", "right", "right", "right", "right", "left",
-              "right", "right", "right", "left"]
+              "right", "right", "left"]
 
     # The funnel. Every partition on the cluster is in exactly one of these
     # terms, so the line answers "why five rows" by arithmetic rather than by
@@ -1015,7 +1157,9 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     my_nodes = [n for n in cluster.nodes if n.name in mine]
     my_up = sum(1 for n in my_nodes if n.schedulable)
     my_gpu = sum(n.gpus_total for n in my_nodes)
-    my_gpu_free = sum(n.gpus_free for n in my_nodes if n.schedulable)
+    # The same measure the table's `free` column uses, or the header and the
+    # rows beneath it would disagree on one number.
+    my_gpu_free = sum(n.effective_free_gpus for n in my_nodes if n.schedulable)
     scope = facts[:]
     if len(my_nodes) == nodes:
         scope.append(f"{plural(nodes, 'node')}, {my_up} up")
@@ -1028,11 +1172,13 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     body[header_at] = f"  {st.dim(st.g.sep)}  ".join(scope)
 
     dead_count = len(cluster.unusable_queues())
-    excluded += [(q.name, "dead") for q in cluster.unusable_queues()]
+    # "down", not "dead": it is the word every other status line on a
+    # cluster uses for a partition that can start nothing.
+    excluded += [(q.name, "down") for q in cluster.unusable_queues()]
     excluded += [(q.name, "no nodes") for q in usable if not q.nodes]
     # Stable order, worst-explained last: the reader is looking for their own
     # partition, so the reason groups stay together and names sort inside them.
-    order_of = {"no access": 0, "refused": 1, "no nodes": 2, "dead": 3}
+    order_of = {"no access": 0, "refused": 1, "no nodes": 2, "down": 3}
     excluded.sort(key=lambda e: (order_of.get(e[1], 9), e[0]))
     # The exclusion terms, each one its own selectable target.
     #
@@ -1044,11 +1190,11 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     terms: list[tuple[int, str]] = []
     if not args.all:
         for count, why in ((not_entitled, "no access"), (refused, "refused"),
-                           (no_nodes, "no nodes"), (dead_count, "dead")):
+                           (no_nodes, "no nodes"), (dead_count, "down")):
             if count:
                 terms.append((count, why))
     elif dead_count:
-        terms.append((dead_count, "dead"))
+        terms.append((dead_count, "down"))
 
     # The unsettled ones are *shown*, so they belong to the head term rather
     # than to a term of their own -- an exclusion count for a partition that is
@@ -1058,6 +1204,49 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     head_term = (f"{len(with_room)} open to you" if not args.all
                  else f"{len(with_room)} with nodes")
 
+    if args.json:
+        return status_json(
+            # The header line: what of the cluster is yours.
+            yours={
+                "nodes": len(my_nodes),
+                "nodes_schedulable": my_up,
+                "accelerators_total": my_gpu,
+                "accelerators_free": my_gpu_free,
+                "cpus_total": sum(n.cpus_total for n in my_nodes),
+                "cpus_free_advertised": sum(n.cpus_free for n in my_nodes
+                                            if n.schedulable),
+                "effective_free_cpus": sum(n.effective_free_cpus
+                                           for n in my_nodes if n.schedulable),
+            },
+            # The funnel line: every partition in exactly one term, so these
+            # sum to `queues` above exactly as the printed line does.
+            funnel={
+                "total": len(cluster.queues),
+                "shown": len(with_room),
+                "unconfirmed": unsettled,
+                **{why.replace(" ", "_"): count for count, why in terms},
+            },
+            # The table. A fixed key, not `f"{term}s"`: on PBS and LSF the
+            # queue term is "queue", and `summary` already has a `queues` key
+            # holding the cluster's partition COUNT -- so an interpolated name
+            # would have replaced a number with a list on half the backends.
+            listed=[{
+                "name": q.name,
+                "dedicated": q.is_dedicated,
+                "nodes": len(q.nodes),
+                "nodes_idle": q.effective_free_nodes,
+                "nodes_with_room": sum(1 for n in q.nodes if n.has_room),
+                "cpus_total": q.cpus_total,
+                "cpus_free_advertised": q.cpus_free,
+                "effective_free_cpus": q.effective_free_cpus,
+                "accelerators_total": q.gpus_total,
+                "effective_free_accelerators": q.effective_free_gpus,
+                "accelerator_models": q.accelerator_models,
+            } for q in sorted(with_room, key=order)],
+            # Why every other partition is not in that list, by name.
+            excluded=excluded,
+        )
+
     def render_funnel(selected: str | None = None) -> str:
         """The funnel line, with ``selected`` drawn as the active term.
 
@@ -1065,18 +1254,55 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         two separator spaces, so this line and the rows below it share one left
         edge and the cursor lands in the same place on both.
         """
-        parts = [f"   {plural(len(cluster.queues), term)}",
-                 st.head(head_term) + st.muted(shown_note)]
-        line = f"  {st.dim(st.g.arrow)}  ".join(parts)
+        def mark(active: bool) -> str:
+            """The cursor slot that every term on this line reserves.
+
+            Reserved, not inserted. All of these terms share one row, so the
+            selected one used to be shown by colour alone while the row cursor
+            stayed pinned to the left margin -- pointing at the total, whatever
+            was actually selected: "when pressing the right arrow, it doesn't
+            land at ' 8 open to you'". The glyph moves instead.
+
+            The slot is taken out of the separator's own padding rather than
+            added to it, so the line is exactly as wide as it was before there
+            was a cursor on it and nothing shifts as the selection moves.
+            """
+            return st.accent(st.g.cursor, bold=True) if active else " "
+
+        # The total is a target like the rest, and the separator before the
+        # next term is the same one used between all of them.
+        #
+        # It was `87 partitions  →  8 open to you`, with the total unselectable
+        # and an arrow that carried the funnel's sense of narrowing. Neither
+        # survived contact: "why can't we select the 87 partitions? also, why
+        # there is a right arrow here? it makes no sense at all." Every term on
+        # this line is now a peer -- a count you can open -- so they read as a
+        # list and are punctuated as one.
+        whole = plural(len(cluster.queues), term)
+        head = (st.accent(head_term, bold=True) if selected == "open"
+                else st.head(head_term)) + st.muted(shown_note)
+        line = ("  " + mark(selected == "total")
+                + (st.accent(whole, bold=True) if selected == "total"
+                   else st.head(whole))
+                + f"  {st.dim(st.g.sep)} " + mark(selected == "open") + head)
         for count, why in terms:
             text = f"{count} {why}"
-            line += f"  {st.dim(st.g.sep)}  " + (
+            line += f"  {st.dim(st.g.sep)} " + mark(why == selected) + (
                 st.accent(text, bold=True) if why == selected else st.muted(text))
         return line
 
     body.append("")
     body.append(render_funnel())
     funnel_at = len(body) - 1
+    # The total leads, because it is the leftmost thing on the line: opening it
+    # lists every partition on the cluster with the reason each is or is not in
+    # the table below, which is the one view where the funnel's arithmetic can
+    # be checked rather than trusted.
+    selectable.append((funnel_at, "total", "total"))
+    # The head term is selectable too: pressing Right from the total should land
+    # on "8 open to you", which is a bucket like the others -- its members are
+    # the rows below, so opening it moves the cursor into the table.
+    selectable.append((funnel_at, "open", "open"))
     for _, why in terms:
         selectable.append((funnel_at, "excluded", why))
 
@@ -1107,6 +1333,11 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
 
     shared = [q for q in with_room if not q.is_dedicated]
     owned = [q for q in with_room if q.is_dedicated]
+    # The names the table lists, in display order. Taken from here rather than
+    # from `selectable`, which holds only the rows that fitted under the row cap
+    # -- and the level that lists every queue has to list every queue.
+    shown_names = [q.name for q in sorted(shared, key=order)] + [
+        q.name for q in sorted(owned, key=order)]
     if shared:
         add_table(shared, STATUS_ROWS)
     if owned:
@@ -1160,11 +1391,11 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             + st.dim(f"  {len(ident.accounts)} accounts, one entitlement list")
         )
 
-    title = f"nodetop {st.dim(st.g.sep)} {st.accent(cluster.backend_name)}"
+    title = ""
     if (not getattr(args, "static", False)
             and selectable and interactive.supported()):
         return _browse(cluster, args, st, body, selectable, excluded,
-                       (funnel_at, render_funnel), title)
+                       shown_names, (funnel_at, render_funnel), title)
     print(panel(body, title, st))
     return 0
 
@@ -1172,6 +1403,7 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
 def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
             body: list[str], selectable: list[tuple[int, str, str]],
             excluded: list[tuple[str, str]],
+            shown: Sequence[str],
             funnel: tuple[int, Callable[[str | None], str]],
             title: str) -> int:
     """Move a highlight over the overview's rows and open the chosen one.
@@ -1189,6 +1421,12 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
     # Where each selectable row sits in `body`, so the viewport below can tell a
     # partition row from a heading and keep every heading whatever it hides.
     at_position = {pos: k for k, (pos, _, _) in enumerate(selectable)}
+    # Every queue on the cluster, in the order the funnel accounts for them: the
+    # ones the table lists, then the excluded groups. Opening the total shows
+    # this, which is the one view where the funnel's arithmetic can be checked
+    # instead of trusted -- the rows are the terms, itemised.
+    all_queues: list[tuple[str, str]] = (
+        [(name, "open") for name in shown] + list(excluded))
 
     def visible(rows: list[str], index: int) -> list[str]:
         """``rows``, trimmed to a window around ``index`` that fits the screen.
@@ -1205,25 +1443,43 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         you are looking at; a viewport that discards them to fit two more rows
         has thrown away the reason the rows mean anything.
         """
-        chrome = len(rows) - len(selectable)          # everything not a row
-        room = shutil.get_terminal_size().lines - chrome - 3   # 2 borders + spare
-        total = len(selectable)
-        if room >= total or room < 3:
-            # Fits, or the window is too small for a viewport to help -- in
-            # which case truncating would hide rows without saying so.
+        # Counted over PARTITION rows only.
+        #
+        # `selectable` also holds the funnel's own buckets, which share one line
+        # with each other and are never dropped -- so counting them as rows both
+        # overstated the total ("of 61" for 60 partitions) and stole a line from
+        # the window. The scrollable thing here is the table.
+        scrollable = [k for k, (_, kind, _) in enumerate(selectable)
+                      if kind == "queue"]
+        total = len(scrollable)
+        chrome = len(rows) - total
+        # 2 borders, the title line panel now adds, and one spare.
+        # Clamped to at least one row rather than bailing out below three.
+        # Bailing returned the whole list on exactly the terminals least able
+        # to draw it: 60 partitions on ten lines was a 67-line frame, and the
+        # redraw arithmetic then destroys the screen on every keypress. See
+        # `_window`, which had the same escape hatch.
+        #
+        # Three lines of the frame are not rows: its two borders and the
+        # position line appended below.
+        room = max(1, term_height() - chrome - 3)
+        if room >= total:
             return rows
-        lo = max(0, min(index - room // 2, total - room))
+        # `index` is an entry in `selectable`; the window is over rows, so it is
+        # the row's position in that list that has to stay on screen.
+        here = scrollable.index(index) if index in scrollable else 0
+        lo = max(0, min(here - room // 2, total - room))
         hi = lo + room
-        # A selectable row that is not a partition -- the funnel line -- is kept
+        keep = set(scrollable[lo:hi])
+        # A selectable entry that is not a partition -- the funnel -- is kept
         # whatever scrolls, like the headings around it. It is the summary the
         # rows are a breakdown of, so dropping it to fit one more row would cost
         # the reader their bearings.
         out = [line for i, line in enumerate(rows)
                if at_position.get(i) is None
                or selectable[at_position[i]][1] != "queue"
-               or lo <= at_position[i] < hi]
-        # Same position line as every other level: which slice is on screen,
-        # not how many rows are missing from it.
+               or at_position[i] in keep]
+        # Which slice is on screen, not how many rows are missing from it.
         out.append(st.dim(f"{lo + 1}-{min(hi, total)} of {total}"))
         return out
 
@@ -1251,16 +1507,42 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
 
     funnel_at, render_funnel = funnel
 
+    def framed(content: Sequence[str]) -> list[str]:
+        """Every view in the same box, whatever it happens to hold.
+
+        The frame used to size itself to its content, so stepping from an
+        eighty-column overview into `3 down` shrank it to a third of the width
+        and four rows: the window jumped on every keypress that changed level,
+        and the eye had to find it again each time. "whatever we choose in the
+        ui, the window should stay the same and the text and information getting
+        displayed should dynamically get adjusted."
+
+        So the box comes from :func:`term_width` and :func:`term_height` -- the
+        same two numbers for every level -- and content is padded up to it
+        rather than letting the border close early. Over-long content is
+        truncated here as a backstop: the viewport helpers size themselves from
+        the same two numbers, and a frame taller than its own box is what makes
+        the repaint destructive.
+        """
+        rows = term_height()
+        body = list(content)[: rows - 2]
+        body += [""] * (rows - 2 - len(body))
+        return panel(body, title, st, size=term_width(),
+                     shrink=False).splitlines()
+
     def partition_frame(index: int) -> list[str]:
         rows = list(body)
         position, kind, payload = selectable[index]
         if position == funnel_at:
             # Several selectable terms share this one row, so which is active
-            # cannot be shown by position -- the line is redrawn with that term
-            # in the accent colour.
+            # cannot be shown by position: the line is redrawn with the cursor
+            # sitting against that term. No left-margin cursor as well -- two
+            # cursors on one row, one of them pointing at the wrong thing, is
+            # what made Right look like it had done nothing.
             rows[position] = render_funnel(payload)
-        highlight(rows, position)
-        return panel(visible(rows, index), title, st).splitlines()
+        else:
+            highlight(rows, position)
+        return framed(visible(rows, index))
 
     def node_frame(queue, nodes: list, index: int) -> list[str]:
         rows = _node_rows(nodes, st)
@@ -1270,16 +1552,59 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         head, data = lines[0], lines[1:]
         highlight(data, index)
         shown = _window(data, index, st)
-        with_room = sum(1 for n in nodes if n.schedulable
-                        and (n.cpus_free or n.gpus_free))
+        with_room = sum(1 for n in nodes if n.has_room)
         facts = [st.head(queue.name),
                  st.muted(f"{len(nodes)} nodes"),
                  st.muted(f"{with_room} with room")]
-        return panel(
-            [f"  {st.dim(st.g.sep)}  ".join(facts), "", head, *shown],
-            title, st).splitlines()
+        return framed([f"  {st.dim(st.g.sep)}  ".join(facts), "", head, *shown])
+
+    def node_detail(node, jobs: list) -> list[str]:
+        """What this node is, above whatever is running on it.
+
+        The level below a node listing used to be *only* the job table, so
+        opening a drained node showed a four-line box saying "nothing running
+        here" -- no state, no reason, and the reason is exactly what the reader
+        opened it for. It is truncated in the listing (`maintenance [root@20…`)
+        because the column has to hold forty of them; this is the one view with
+        room to print it whole, so it does.
+        """
+        state = (st.bad(node.state_raw) if not node.schedulable
+                 else st.warn(node.state_raw) if node.degraded
+                 else st.muted(node.state_raw))
+        facts = [st.head(node.name)]
+        if node.state_raw:
+            facts.append(state)
+        facts.append(st.muted(f"{len(jobs)} running"))
+        facts.append(st.muted(f"{node.cpus_free}/{node.cpus_total} cores free"))
+        if node.gpus_total:
+            # "gpu" rather than a bare "?" when the model is unidentifiable:
+            # the question mark reads as a defect in the reader's own knowledge
+            # rather than a gap in the scheduler's inventory.
+            model = node.accelerator.model if node.accelerator else "gpu"
+            facts.append(st.muted(
+                f"{node.gpus_free}/{node.gpus_total} {model} free"))
+        out = [f"  {st.dim(st.g.sep)}  ".join(facts)]
+
+        text, who, when = split_reason(node.reason)
+        if text:
+            # Wrapped to the frame, never truncated: the whole point of being
+            # here. The operator and timestamp follow it rather than sitting
+            # inside it, because they are who to ask, not what is wrong.
+            room = term_width() - 6
+            body_text = wrap_indent(text, indent="", size=room)
+            out.append("")
+            for i, line in enumerate(body_text.splitlines()):
+                out.append(st.warn(line) if i == 0 else st.muted(line))
+            stamp = "  ".join(x for x in (who, when) if x)
+            if stamp:
+                out.append(st.dim(stamp))
+        if node.unreachable:
+            out.append(st.warn("the control plane has lost contact with this node"))
+        return out
 
     def job_frame(node, jobs: list, index: int) -> list[str]:
+        if node is None:                       # pragma: no cover - defensive
+            return framed([st.warn("no such node")])
         if not jobs:
             # Three different reasons for an empty list, and saying the wrong
             # one is the phantom-capacity mistake in a new place: "no jobs here"
@@ -1291,70 +1616,97 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                 note = st.warn("this backend cannot list jobs")
             elif node.cpus_alloc or node.gpus_alloc:
                 note = st.dim("busy, but no job claims these resources")
+            elif not node.schedulable:
+                # Not "nothing running here", which reads as "free".
+                note = st.dim("nothing running here, and nothing can start")
             else:
                 note = st.dim("nothing running here")
-            return panel([st.head(node.name), "", note], title, st).splitlines()
+            return framed([*node_detail(node, jobs), "", note])
         heat = heat_steps([j.cpus for j in jobs])
 
-        def spanned(count: int, job) -> str:
-            """``count`` as reported, marked with the span it is spread over.
+        def here(job) -> Allocation | None:
+            """This job's share of THIS node, or ``None`` if nothing can say.
 
-            ``squeue`` reports a job's cpu and accelerator counts as TOTALS over
-            every node it holds, not as its share of the node being looked at.
-            Printed bare in this table that is actively misleading: a nine-node
-            job appeared as **431 cores on a 48-core node**, which reads as a
-            number the reader knows to be impossible and so discredits the whole
-            column.
-
-            The exact per-node share is not obtainable without a `scontrol show
-            job` per row, and dividing would be a guess dressed as a fact -- a
-            job need not be allocated uniformly. So both exact numbers are
-            shown, `431 x9`, and the reader divides if they care. Single-node
-            jobs -- most of them -- are unmarked and read directly.
+            The column used to hold the job's total across every node it holds,
+            which in a per-node table is a number the reader knows to be
+            impossible: a 42-node job read as **512 cores on a 48-core
+            machine**, with a `x42` marker that explained nothing -- "the cpu
+            column doesn't make any sense. what do the column entries mean?"
+            Its actual share of that node was seven cores and seven gigabytes.
             """
-            if not count:
-                return st.dim(st.g.sep)
-            text = str(count)
-            return (text + st.muted(f" x{len(job.nodes)}")
-                    if len(job.nodes) > 1 else text)
+            return cluster.share_of(job, node.name)
+
+        shares = [here(j) for j in jobs]
+        spans = any(len(j.nodes) > 1 for j in jobs)
+
+        def cell(value: int, i: int, tint: bool = False) -> str:
+            if shares[i] is None:
+                # Unknown, not zero. Only a multi-node job on a backend that
+                # cannot report the split reaches this, and its totals are one
+                # keypress away in the job's own view.
+                return st.dim("?")
+            if not value:
+                # `0`, not the `·` this table used: the node has accelerators
+                # and this job holds none of them, which is a count and not an
+                # absence of one.
+                return st.dim("0")
+            return st.tint(str(value), heat[i]) if tint else str(value)
+
+        # No accelerator column on a node that has none: `table` drops a column
+        # no row fills, and a column of dashes costs width the job name needs.
+        has_gpu = node.gpus_total > 0
 
         rows = [[
             " ",
             st.tint(j.id, heat[i]),
             j.user,
             st.muted(j.account),
-            st.tint(spanned(j.cpus, j), heat[i]) if len(j.nodes) == 1
-            else spanned(j.cpus, j),
-            spanned(j.gpus, j),
+            cell(share.cpus if (share := shares[i]) else 0, i, tint=True),
+            cell((share.memory_mb // 1024) if share else 0, i),
+            cell(share.gpus if share else 0, i) if has_gpu else "",
+            # The span as its own column rather than a marker glued to a
+            # number: "42" under `nodes` needs no decoding. Present only when
+            # something actually spans -- on most nodes every job is a
+            # single-node job, and a column of `·` costs width the name needs.
+            *([st.muted(str(len(j.nodes))) if len(j.nodes) > 1
+               else st.dim(st.g.sep)] if spans else []),
             st.muted(j.elapsed),
             j.remaining,
             j.name,
         ] for i, j in enumerate(jobs)]
-        lines = table(["", "job", "user", "account", "cpu", "gpu", "used",
-                       "left", "name"], rows,
+        lines = table(["", "job", "user", "account", "cpu", "mem", "gpu",
+                       *(["nodes"] if spans else []), "used", "left", "name"],
+                      rows,
                       ["left", "left", "left", "left", "right", "right",
-                       "right", "right", "left"], st, indent="",
-                      limits=[0, 0, 14, 16, 0, 0, 0, 0, 24],
+                       "right", *(["right"] if spans else []), "right",
+                       "right", "left"], st,
+                      indent="",
+                      limits=[0, 0, 14, 16, 0, 0, 0, *([0] if spans else []),
+                              0, 0, 24],
                       header_role="dim", underline=False).splitlines()
         head, data = lines[0], lines[1:]
         highlight(data, index)
-        shown = _window(data, index, st)
-        facts = [st.head(node.name),
-                 st.muted(f"{len(jobs)} running"),
-                 st.muted(f"{node.cpus_free}/{node.cpus_total} cores free")]
-        return panel([f"  {st.dim(st.g.sep)}  ".join(facts), "", head, *shown],
-                     title, st).splitlines()
+        detail = node_detail(node, jobs)
+        shown = _window(data, index, st, reserved=5 + len(detail))
+        return framed([*detail, "", head, *shown])
 
-    def excluded_frame(index: int, only: str = "") -> list[str]:
-        """The partitions the funnel counted out, optionally one reason's worth."""
-        chosen = [e for e in excluded if not only or e[1] == only]
+    def reason_frame(index: int, entries: Sequence[tuple[str, str]],
+                     heading: str) -> list[str]:
+        """A list of queues, each with the word that put it there.
+
+        One renderer for three levels -- every partition, everything the funnel
+        counted out, and one reason's worth -- because they differ only in which
+        entries they are handed. Three tables of the same shape is three places
+        for the columns to drift.
+        """
         by_reason: dict[str, int] = {}
-        for _, why in chosen:
+        for _, why in entries:
             by_reason[why] = by_reason.get(why, 0) + 1
         rows = []
-        for name, why in chosen:
+        for name, why in entries:
             q = cluster.queues.get(name)
-            tone = {"dead": st.bad, "refused": st.warn}.get(why, st.muted)
+            tone = {"down": st.bad, "refused": st.warn,
+                    "open": st.ok}.get(why, st.muted)
             rows.append([
                 " ", name, tone(why),
                 st.muted(str(len(q.nodes))) if q else "",
@@ -1369,12 +1721,74 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         head, data = lines[0], lines[1:]
         highlight(data, index)
         shown = _window(data, index, st)
-        facts = ([st.head(f"{len(chosen)} {only}")] if only
-                 else [st.head(f"{len(chosen)} not in the list")]
-                 + [st.muted(f"{n} {w}") for w, n in by_reason.items()])
-        return panel(
-            [f"  {st.dim(st.g.sep)}  ".join(facts), "", head, *shown],
-            title, st).splitlines()
+        facts = [st.head(heading)]
+        if len(by_reason) > 1:
+            facts += [st.muted(f"{n} {w}") for w, n in by_reason.items()]
+        return framed([f"  {st.dim(st.g.sep)}  ".join(facts), "", head, *shown])
+
+    def excluded_frame(index: int, only: str = "") -> list[str]:
+        """The partitions the funnel counted out, optionally one reason's worth."""
+        chosen = [e for e in excluded if not only or e[1] == only]
+        heading = (f"{len(chosen)} {only}" if only
+                   else f"{len(chosen)} not in the list")
+        return reason_frame(index, chosen, heading)
+
+    def every_frame(index: int) -> list[str]:
+        """Every queue on the cluster, whether or not the table lists it."""
+        return reason_frame(index, all_queues,
+                            plural(len(all_queues), cluster.queue_term))
+
+    def job_detail_frame(node, job, index: int) -> list[str]:
+        """One job, in full.
+
+        Enter on a job row used to pop straight back to the node listing --
+        "when choosing any of the job here, it doesn't go into the job details
+        but going back to the original node" -- so the row was the deepest the
+        tool went, with its name truncated and its node list unseen. Nothing
+        here is selectable: this is the leaf, and any key leaves it.
+        """
+        facts = [st.head(job.id)]
+        if job.state:
+            facts.append(st.muted(job.state))
+        # Empty fields are dropped rather than joined: a backend that does not
+        # report an account left a dangling separator at the end of the line.
+        facts += [x for x in (job.user, st.muted(job.account) if job.account
+                              else "") if x]
+        out = [f"  {st.dim(st.g.sep)}  ".join(facts)]
+        if job.name:
+            # Untruncated, which the listing cannot afford.
+            out += ["", st.accent(job.name)]
+        share = cluster.share_of(job, node.name) if node is not None else None
+        pairs: list[tuple[str, str]] = []
+        if share is not None:
+            bits = [f"{share.cpus} cores"]
+            if share.memory_mb:
+                bits.append(f"{share.memory_mb // 1024} GB")
+            if share.gpus:
+                bits.append(f"{share.gpus} gpu")
+            pairs.append((f"on {node.name}",
+                          st.head(f"  {st.dim(st.g.sep)}  ".join(bits))))
+        elif node is not None:
+            pairs.append((f"on {node.name}",
+                          st.dim("this backend cannot report the per-node split")))
+        total = [f"{job.cpus} cores"]
+        if job.gpus:
+            total.append(f"{job.gpus} gpu")
+        total.append(plural(len(job.nodes), "node"))
+        pairs.append(("job total", st.muted(f"  {st.dim(st.g.sep)}  ".join(total))))
+        if job.queue:
+            pairs.append((cluster.queue_term, st.muted(job.queue)))
+        if job.elapsed or job.remaining:
+            used = f"{job.elapsed} used" if job.elapsed else ""
+            left = f"{job.remaining} left" if job.remaining else ""
+            pairs.append(("time", st.muted(
+                f"  {st.dim(st.g.sep)}  ".join(x for x in (used, left) if x))))
+        if job.nodes:
+            pairs.append(("nodes", st.muted(
+                cluster.format_nodelist(job.nodes)
+                if len(job.nodes) > 1 else job.nodes[0])))
+        out += ["", *kv(pairs, st, indent="", size=term_width() - 6).splitlines()]
+        return framed(out)
 
     # One raw-mode block, one screen, and an explicit stack.
     #
@@ -1401,17 +1815,44 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
             where = stack[-1]
             kind, payload = where
             if kind == "partitions":
-                got = interactive.select(partition_frame, len(selectable),
-                                         raw=False,
-                                         initial=cursors.get(where, 0))
+                # `rows` is what makes the arrows mean what they look like: the
+                # funnel's counts share one display row, so Left and Right move
+                # along them while Up and Down step between rows.
+                #
+                # `escapable=False` because this is the root. Left and Escape
+                # here used to return, and returning at the root exits -- so a
+                # stray Left took the whole program down.
+                got = interactive.select(
+                    partition_frame, len(selectable), raw=False,
+                    initial=cursors.get(where, 0),
+                    rows=[pos for pos, _, _ in selectable], escapable=False)
                 if not isinstance(got, int):
-                    return 0            # back or quit, at the root
+                    return 0            # only `q` reaches here
                 cursors[where] = got
                 _, what, name = selectable[got]
-                if what == "excluded":
+                if what == "total":
+                    stack.append(("all", ""))
+                elif what == "excluded":
                     stack.append(("excluded", name))
+                elif what == "open":
+                    # Its members are the rows below, so opening the bucket
+                    # means putting the cursor on the first of them.
+                    first = next((i for i, (_, k, _) in enumerate(selectable)
+                                  if k == "queue"), None)
+                    if first is not None:
+                        cursors[where] = first
                 else:
                     stack.append(("nodes", name))
+            elif kind == "all":
+                got = interactive.select(every_frame, len(all_queues), raw=False,
+                                         initial=cursors.get(where, 0))
+                if got == keyed.QUIT:
+                    return 0
+                if not isinstance(got, int):
+                    stack.pop()
+                    continue
+                cursors[where] = got
+                stack.append(("nodes", all_queues[got][0]))
             elif kind == "excluded":
                 subset = [e for e in excluded if not payload or e[1] == payload]
 
@@ -1431,8 +1872,8 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                 queue = cluster.queues.get(payload)
                 nodes = sorted(
                     queue.nodes if queue else [],
-                    key=lambda n: (not n.schedulable, -n.gpus_free,
-                                   -n.cpus_free, n.name))
+                    key=lambda n: (not n.schedulable, -n.effective_free_gpus,
+                                   -n.effective_free_cpus, n.name))
 
                 def draw_nodes(i: int, q: object = queue,
                                ns: list = nodes) -> list[str]:
@@ -1447,7 +1888,7 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                     continue
                 cursors[where] = got
                 stack.append(("jobs", nodes[got].name))
-            else:
+            elif kind == "jobs":
                 node = by_name.get(payload)
                 jobs = cluster.jobs_on(payload)
 
@@ -1460,8 +1901,30 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                                         initial=cursors.get(where, 0))
                 if got == keyed.QUIT:
                     return 0
-                if isinstance(got, int):
+                if isinstance(got, int) and got < len(jobs):
                     cursors[where] = got
+                    stack.append(("job", f"{payload}|{jobs[got].id}"))
+                    continue
+                stack.pop()
+            elif kind == "job":
+                node_name, _, job_id = payload.partition("|")
+                nd = by_name.get(node_name)
+                job = next((j for j in cluster.jobs_on(node_name)
+                            if j.id == job_id), None)
+                if job is None:                # pragma: no cover - it vanished
+                    stack.pop()
+                    continue
+
+                def draw_job(_i: int, n: object = nd, j: object = job) -> list[str]:
+                    return job_detail_frame(n, j, 0)
+
+                # One entry: there is nothing here to choose between, so any
+                # key that is not `q` steps back out.
+                got = interactive.select(draw_job, 1, raw=False)
+                if got == keyed.QUIT:
+                    return 0
+                stack.pop()
+            else:                          # pragma: no cover - unreachable
                 stack.pop()
     return 0
 
@@ -1506,7 +1969,15 @@ def cmd_queues(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             "nodes_declared": q.declared_nodes,
             "idle_nodes_advertised": len(q.idle_nodes),
             "effective_free_nodes": q.effective_free_nodes,
+            # The text form prints "0 wholly free, 45 of 190 with something
+            # spare" and a free-core count; `--json` carried neither, so the
+            # two forms of the same command answered different questions.
+            "nodes_with_room": sum(1 for n in q.nodes if n.has_room),
+            "cpus_total": q.cpus_total,
+            "cpus_free_advertised": q.cpus_free,
+            "effective_free_cpus": q.effective_free_cpus,
             "accelerators_total": q.gpus_total,
+            "accelerators_free_advertised": q.gpus_free,
             "effective_free_accelerators": q.effective_free_gpus,
             "accelerator_models": q.accelerator_models,
             "max_walltime_queue": format_duration(q.max_walltime_seconds),
@@ -1633,8 +2104,7 @@ def _queues_detail(cluster: Cluster, queues: list, st: Style) -> None:
         # shows `idle 0` while carrying a couple of hundred free cores spread
         # over nodes that are each running something. "0" then reads as "nothing
         # here for me", which is wrong and costs the reader the partition.
-        with_room = sum(1 for n in q.nodes
-                        if n.schedulable and (n.cpus_free or n.gpus_free))
+        with_room = sum(1 for n in q.nodes if n.has_room)
         idle = str(q.effective_free_nodes)
         if not q.usable and q.idle_nodes:
             idle = st.bad(idle) + st.dim(f"  ({len(q.idle_nodes)} advertised)")
@@ -1720,9 +2190,9 @@ def cmd_zoom(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     if args.cpu:
         nodes = [n for n in nodes if not n.is_gpu_node]
     if args.free:
-        nodes = [n for n in nodes if n.schedulable and (n.cpus_free or n.gpus_free)]
+        nodes = [n for n in nodes if n.has_room]
 
-    with_room = [n for n in nodes if n.schedulable and (n.cpus_free or n.gpus_free)]
+    with_room = [n for n in nodes if n.has_room]
     wholly_idle = [n for n in nodes if n.idle]
     out_of_service = [n for n in nodes if not n.schedulable]
 
@@ -1735,6 +2205,16 @@ def cmd_zoom(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             "unschedulable": len(out_of_service),
             "cpus": [sum(n.cpus_free for n in nodes if n.schedulable),
                      sum(n.cpus_total for n in nodes)],
+            # What the scheduler claims is free, and what could actually be
+            # allocated: they differ by every core sitting on a node whose
+            # memory is spoken for. `with_room` above counts those nodes out,
+            # so these figures have to as well or the two disagree. Named as
+            # `queues --json` names them -- one quantity, one key, whichever
+            # command you ask.
+            "effective_free_cpus": sum(n.effective_free_cpus for n in nodes
+                                       if n.schedulable),
+            "effective_free_accelerators": sum(
+                n.effective_free_gpus for n in nodes if n.schedulable),
             "accelerators": [sum(n.gpus_free for n in nodes if n.schedulable),
                              sum(n.gpus_total for n in nodes)],
             "members": [{
@@ -1781,8 +2261,9 @@ def cmd_zoom(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     print(section("inside", st, f"  {st.g.sep}  ".join(facts)))
     # Same rule as `nodes`: a drained node reports everything free and none of
     # it is reachable, so it cannot lead a list of where the room is.
-    nodes = sorted(nodes, key=lambda n: (not n.schedulable, -n.gpus_free,
-                                         -n.cpus_free, n.name))
+    nodes = sorted(nodes, key=lambda n: (not n.schedulable,
+                                         -n.effective_free_gpus,
+                                         -n.effective_free_cpus, n.name))
     rows = _node_rows(nodes, st)
     limit = None if args.all else max(1, args.top)
     visible = rows if limit is None else rows[:limit]
@@ -1816,7 +2297,7 @@ def cmd_nodes(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     if args.cpu:
         nodes = [n for n in nodes if not n.is_gpu_node]
     if args.free:
-        nodes = [n for n in nodes if n.schedulable and (n.cpus_free or n.gpus_free)]
+        nodes = [n for n in nodes if n.has_room]
 
     # Most room first, because the listing is capped.
     #
@@ -1837,8 +2318,9 @@ def cmd_nodes(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # put a DOWN+DRAIN node with "32/32 cores, 4/4 GPUs" at the top of the list
     # -- phantom capacity, at the head of the answer to "where is there room".
     # `Queue.effective_free_*` has always excluded these; the ordering had not.
-    nodes = sorted(nodes, key=lambda n: (not n.schedulable, -n.gpus_free,
-                                         -n.cpus_free, n.name))
+    nodes = sorted(nodes, key=lambda n: (not n.schedulable,
+                                         -n.effective_free_gpus,
+                                         -n.effective_free_cpus, n.name))
 
     if args.json:
         print(json.dumps([{
@@ -2039,7 +2521,11 @@ def _verdict_label(p: Placement) -> str:
     Order is by what the reader cannot work around: no access at all, then
     hardware that cannot host this shape, then a ceiling, then mere queueing.
     """
-    if p.runnable_now:
+    # `starts_now`, not `runnable_now`: free nodes are not a start time. Where
+    # the scheduler offers its own estimate it outranks our arithmetic, and a
+    # placement with room but a queue ahead of it falls through to QUEUE --
+    # "submit and wait", which is the truth and a different next move.
+    if p.starts_now:
         return "RUN NOW"
     if p.fatal_blockers:
         return "BLOCKED"
@@ -2069,7 +2555,7 @@ def _render_placements(
     show_all: bool, turned_away: int = 0,
 ) -> None:
     term = cluster.queue_term
-    best = next((p for p in places if p.runnable_now), None)
+    best = next((p for p in places if p.starts_now), None)
     verdict = (
         badge("RUN NOW", "ok", st) + "  " + st.head(best.queue)
         if best is not None
@@ -2102,7 +2588,7 @@ def _render_placements(
     for p in places:
         glyph, label = _verdict_marks(p, st)
         when = st.dim(st.g.sep)
-        if p.runnable_now:
+        if p.starts_now:
             when = st.ok("now")
         elif p.earliest_start:
             # Measured from when the data was taken, not when it is read: on a
@@ -2239,7 +2725,7 @@ def _render_placements(
         bad_verdict = p.verdict is not None and not p.verdict.allowed
         if not (p.blockers or own or hw_note or bad_verdict):
             continue
-        if not show_all and p.runnable_now and not own:
+        if not show_all and p.starts_now and not own:
             continue
         items: list[tuple[str, str]] = []
         for b in p.blockers:
@@ -2325,13 +2811,19 @@ def cmd_where(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             return False
         return bool(q is not None and q.is_dedicated)
 
-    places.sort(key=lambda pl: (not pl.runnable_now, _second_class(pl)))
+    places.sort(key=lambda pl: (not pl.starts_now, _second_class(pl)))
     exit_ok = any(p.reachable and not p.hardware_incompatible for p in places)
 
     if args.json:
         print(json.dumps([{
             "queue": p.queue,
+            # Two different facts, and they disagree often enough to be worth
+            # both: `runnable_now` is "nodes of this shape are free", while
+            # `starts_now` also asks the scheduler whether anything is ahead of
+            # you. On this cluster `amd` was runnable_now with 1687 free cores
+            # and four and a half hours from starting a four-core job.
             "runnable_now": p.runnable_now,
+            "starts_now": p.starts_now,
             "reachable": p.reachable,
             "confirmed": p.confirmed,
             "entitlement_unconfirmed": p.entitlement_unconfirmed,
@@ -2368,7 +2860,7 @@ def cmd_where(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # "it would queue on beagle3" is still the answer you act on, and having to
     # reconstruct the flags by hand is where a mismatch with what was actually
     # checked creeps in.
-    best = next((p for p in places if p.runnable_now), None)
+    best = next((p for p in places if p.starts_now), None)
     note = "starts now"
     if best is None:
         best = next((p for p in places if p.reachable), None)
@@ -2638,7 +3130,7 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
     def totals(group: list) -> tuple[int, int, int]:
         return (
             sum(x.gpus_total for x in group),
-            sum(x.gpus_free for x in group
+            sum(x.effective_free_gpus for x in group
                 if x.schedulable and x.name in live),
             len(group),
         )
@@ -2652,7 +3144,7 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
         ]
         reach[cap] = (
             sum(n.gpus_total for n in able),
-            sum(n.gpus_free for n in able
+            sum(n.effective_free_gpus for n in able
                 if n.schedulable and n.name in live),
         )
     unknown = sum(n.gpus_total for n in nodes if n.accelerator is None)

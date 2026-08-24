@@ -28,7 +28,7 @@ from nodetop.core.model import (
 from nodetop.render import Glyphs, Style
 
 PLAIN = Style(depth=0, glyphs=Glyphs())
-TERMS = ("open to you", "with nodes", "no access", "refused", "no nodes", "dead")
+TERMS = ("open to you", "with nodes", "no access", "refused", "no nodes", "down")
 
 
 def _args(argv):
@@ -81,7 +81,8 @@ def _build(specs, *, accepts=(), probe=False):
 def _funnel(cluster, capsys, argv=("status",)):
     cmd_status(cluster, _args(list(argv)), PLAIN)
     out = capsys.readouterr().out
-    line = next((ln for ln in out.splitlines() if "→" in ln or "->" in ln), None)
+    line = next((ln for ln in out.splitlines()
+                 if re.search(r"\d+ partitions?\b", ln)), None)
     assert line is not None, f"no funnel line in:\n{out}"
     total = int(re.search(r"(\d+) partition", line).group(1))
     parts = {}

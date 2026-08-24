@@ -134,7 +134,16 @@ def node_fits(node: Node, shape: JobShape) -> NodeFit:
         reasons.append(f"{node.gpus_free}/{shape.gpus_per_node} accelerators free")
     if node.cpus_free < shape.cpus_per_node:
         reasons.append(f"{node.cpus_free}/{shape.cpus_per_node} CPUs free")
-    if shape.memory_mb_per_node and node.memory_free_mb < shape.memory_mb_per_node:
+    # Checked whether or not the shape names a memory figure.
+    #
+    # It used to be conditional on `shape.memory_mb_per_node`, so a job that
+    # asked only for cores was told a node with 44 of 48 cores idle and every
+    # byte of its memory allocated would take it.  It would not: the scheduler
+    # gives every job memory, so a job that names no figure gets the default
+    # -- and there is none left to give.  See `Node.memory_exhausted`.
+    if node.memory_exhausted:
+        reasons.append("no memory free")
+    elif shape.memory_mb_per_node and node.memory_free_mb < shape.memory_mb_per_node:
         reasons.append(
             f"{node.memory_free_mb // 1024}/{shape.memory_mb_per_node // 1024} GB RAM free"
         )

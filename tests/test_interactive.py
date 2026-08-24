@@ -42,7 +42,9 @@ class TestKeyDecoding:
         (["q"], Key.QUIT),
         (["\x03"], Key.QUIT),      # ctrl-c
         (["\x04"], Key.QUIT),      # ctrl-d
-        (["\x1b"], Key.BACK),      # a lone Escape steps out, it does not quit
+        # A lone Escape is its own key: it steps out of a nested view like
+        # Left, and leaves the program at the root where Left cannot.
+        (["\x1b"], Key.ESCAPE),
         (["z"], Key.OTHER),
         ([], Key.QUIT),            # EOF: the terminal went away
     ])
@@ -56,7 +58,7 @@ class TestKeyDecoding:
     def test_an_escape_followed_by_a_letter_steps_out(self):
         # Alt-x arrives as ESC then 'x'. There is no binding for it, and
         # treating it as the start of a CSI sequence would eat the next key.
-        assert read_key(_reader(["\x1b", "x"])) == Key.BACK
+        assert read_key(_reader(["\x1b", "x"])) == Key.ESCAPE
 
 
 class TestTheMoveLoop:
@@ -99,10 +101,63 @@ class TestTheMoveLoop:
         # One initial paint plus one per move; the Enter does not repaint.
         assert len([f for f in frames if "row0" in f]) == 3
 
-    def test_a_repaint_clears_the_previous_block(self):
-        # Without the clear, a block that shrinks leaves its old tail on screen.
-        _, frames = self._run([Key.DOWN, Key.ENTER])
-        assert any("\x1b[" in f and "F" in f and "J" in f for f in frames)
+    def test_a_repaint_never_blanks_the_screen_first(self):
+        """Overwrite, not erase-then-write.
+
+        Moving to the top of the block and clearing everything downward before
+        writing the new lines leaves the screen empty for one render, and
+        holding an arrow key turns that into a strobe: "when pressing down
+        arrow constantly, the app is flickering". Each line is written over the
+        old one and cleared only to end-of-line as it goes.
+        """
+        _, frames = self._run([Key.DOWN, Key.DOWN, Key.ENTER])
+        repaints = [f for f in frames if "row0" in f]
+        assert len(repaints) == 3          # one write per frame, no gap
+        for f in repaints:
+            assert "\x1b[J" not in f       # no clear-to-end-of-screen
+            assert "\x1b[K" in f           # cleared per line instead
+
+    def test_a_block_that_shrinks_wipes_its_own_tail(self):
+        # Row 0 draws five lines and row 1 draws two: without the wipe, three
+        # lines of the old block stay on screen below the new one.
+        seq = iter([Key.DOWN, Key.ENTER])
+        frames: list[str] = []
+        select(lambda i: ["x"] * (5 if i == 0 else 2), 2,
+               keys=lambda: next(seq, Key.QUIT), write=frames.append,
+               raw=False)
+        shrunk = frames[1]
+        assert shrunk.count("\x1b[K") == 5     # 2 content lines + 3 stale
+        # And the cursor put back where the next repaint expects it.
+        assert "\x1b[3F" in shrunk
+
+    def test_a_burst_of_keypresses_repaints_once(self):
+        """A held arrow key arrives as a stream; only the last position matters.
+
+        Painting per repeat is work whose only visible effect is flicker.
+        """
+        seq = iter([Key.DOWN, Key.DOWN, Key.DOWN, Key.ENTER])
+        queued = iter([True, True, False])
+        frames: list[str] = []
+        chosen = select(lambda i: [f"row{i}"], 4,
+                        keys=lambda: next(seq, Key.QUIT),
+                        write=frames.append, raw=False,
+                        pending=lambda: next(queued, False))
+        assert chosen == 3                          # every key still counted
+        painted = [f for f in frames if "row" in f]
+        assert len(painted) == 2                    # initial, then one for the burst
+        assert "row3" in painted[-1]                # and it shows where we ended
+
+    def test_an_endless_burst_still_gets_repainted(self):
+        # A screen that never updates would be worse than one that updates too
+        # often, so the coalescing is capped.
+        from nodetop.interactive import _MAX_SKIPPED_FRAMES
+
+        keys = [Key.DOWN] * (_MAX_SKIPPED_FRAMES + 2) + [Key.ENTER]
+        seq = iter(keys)
+        frames: list[str] = []
+        select(lambda i: [f"row{i}"], 40, keys=lambda: next(seq, Key.QUIT),
+               write=frames.append, raw=False, pending=lambda: True)
+        assert len([f for f in frames if "row" in f]) >= 2
 
     def test_an_empty_list_steps_out(self):
         assert select(lambda _i: [], 0, keys=lambda: Key.ENTER,
@@ -154,6 +209,37 @@ class TestItDegradesToThePrintout:
 
         monkeypatch.setattr("sys.stdin", NotATty())
         assert not supported(Tty())
+
+    def test_a_terminal_too_short_for_one_frame_is_unsupported(self, monkeypatch):
+        """Below the chrome's own height the repaint is destructive.
+
+        A frame is repainted by moving the cursor up by its own height, and the
+        chrome that nothing is allowed to drop is nine rows. On a shorter
+        screen the cursor clamps at the top, the clear lands in the wrong place
+        and every keypress leaves another copy behind -- a stack of `╭────╮`
+        lines. The static print merely scrolls.
+        """
+        import os
+        import shutil
+
+        from nodetop.interactive import MIN_LINES
+
+        monkeypatch.setenv("TERM", "xterm")
+
+        class Tty:
+            @staticmethod
+            def isatty():
+                return True
+
+        monkeypatch.setattr("sys.stdin", Tty())
+        monkeypatch.setattr(
+            shutil, "get_terminal_size",
+            lambda *_a, **_k: os.terminal_size((100, MIN_LINES - 1)))
+        assert not supported(Tty())
+        monkeypatch.setattr(
+            shutil, "get_terminal_size",
+            lambda *_a, **_k: os.terminal_size((100, MIN_LINES)))
+        assert supported(Tty())
 
 
 class TestRawModeSpansTheWholeInteraction:
@@ -306,11 +392,13 @@ class TestNavigationHasThreeOutcomes:
     """
 
     @pytest.mark.parametrize("chars,expected", [
-        (["\x1b"], Key.BACK),              # a lone Escape steps out
+        (["\x1b"], Key.ESCAPE),            # a lone Escape
         (["\x7f"], Key.BACK),              # Backspace
         (["h"], Key.BACK),
         (["\x1b", "[", "D"], Key.BACK),    # Left
-        (["\x1b", "[", "C"], Key.ENTER),   # Right opens, like Enter
+        # Right is its own key now: inside a row it moves right, and only at
+        # the row's edge does it open. `select` turns it into a selection there.
+        (["\x1b", "[", "C"], Key.RIGHT),
         (["q"], Key.QUIT),
         (["\x03"], Key.QUIT),
     ])
@@ -328,6 +416,29 @@ class TestNavigationHasThreeOutcomes:
         # A node with no jobs must not close the whole browser.
         assert select(lambda _i: [], 0, keys=lambda: Key.ENTER,
                       write=lambda _s: None, raw=False) == Key.BACK
+
+    def test_escape_steps_out_of_a_nested_view(self):
+        got = select(lambda _i: ["a", "b"], 2, keys=lambda: Key.ESCAPE,
+                     write=lambda _s: None, raw=False)
+        assert got == Key.BACK
+
+    def test_escape_leaves_the_program_at_the_root(self):
+        """Where there is nothing to step out of, Escape means out.
+
+        Left has to do nothing at the root -- it used to return, and returning
+        there exits, so a stray press took the whole program down. Escape got
+        the same treatment and should not have: it is the key a reader reaches
+        for to get out, and doing nothing is indistinguishable from a hang.
+        """
+        got = select(lambda _i: ["a", "b"], 2, keys=lambda: Key.ESCAPE,
+                     write=lambda _s: None, raw=False, escapable=False)
+        assert got == Key.QUIT
+
+    def test_left_at_the_root_still_does_nothing(self):
+        seq = iter([Key.BACK, Key.BACK, Key.ENTER])
+        got = select(lambda _i: ["a", "b"], 2, keys=lambda: next(seq, Key.QUIT),
+                     write=lambda _s: None, raw=False, escapable=False)
+        assert got == 0
 
     def test_the_cursor_starts_where_the_caller_left_it(self):
         # Stepping out of a nested view lands on the row you came from, not the

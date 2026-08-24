@@ -591,6 +591,33 @@ def term_width(cap: int = MAX_WIDTH) -> int:
     return max(MIN_WIDTH, min(shutil.get_terminal_size((cap, 24)).columns, cap))
 
 
+#: Rows a full-screen frame may occupy, before the window is consulted.
+#:
+#: The counterpart of :data:`MAX_WIDTH` and for the same reason: a box ruled out
+#: to sixty rows around eight rows of content reads as an empty room.
+MAX_HEIGHT = 30
+
+#: Below this a full-screen frame cannot hold its own chrome, and the repaint
+#: starts overwriting the screen instead of itself.
+MIN_HEIGHT = 8
+
+
+def term_height(cap: int = MAX_HEIGHT) -> int:
+    """Rows one full-screen frame may occupy, borders included.
+
+    **One less than the window, and that spare line is load-bearing.** A frame
+    exactly as tall as the terminal scrolls it by one on its final newline, so
+    the repaint's cursor-up lands a line low and every keypress orphans the top
+    border -- a growing stack of ``╭────╮``.
+
+    Every view in an interactive session sizes itself from this one number, so
+    the box stays put as the reader moves between levels instead of shrinking
+    to fit whatever is inside it.
+    """
+    lines = shutil.get_terminal_size((MAX_WIDTH, 24)).lines
+    return max(MIN_HEIGHT, min(lines - 1, cap))
+
+
 # ---------------------------------------------------------------------------
 # meters
 # ---------------------------------------------------------------------------
@@ -803,7 +830,8 @@ def panel(
             needed = max(needed, width(title) + 6)
         size = min(size, max(needed, MIN_WIDTH // 2))
     inner = size - 4
-    height = len(lines) + 2
+    # +1 for the title, which is now a content line rather than part of the edge.
+    height = len(lines) + 2 + (1 if title else 0)
     ramp = [] if role is not None else _frame_ramp(style)
 
     def tone_at(x: int, y: int) -> str | None:
@@ -840,20 +868,38 @@ def panel(
             out.append(f"{current}{''.join(buffered)}\033[0m")
         return "".join(out)
 
-    if title:
-        # Recessive chrome, highlighted title: the eye should land on the words.
-        lead = sweep(f"{g.tl}{g.h} ", 0)
-        tail_len = max(0, size - 5 - width(title))
-        top = (lead + style.head(title)
-               + sweep(" " + g.h * tail_len + g.tr, 0, x0=3 + width(title)))
-    else:
-        top = sweep(g.tl + g.h * (size - 2) + g.tr, 0)
+    # The frame is unbroken, and the title lives inside it.
+    #
+    # A title used to be inlaid into the top edge -- `╭─ nodetop · slurm ────╮`
+    # -- which cuts the border where the eye expects it to continue: "i hope the
+    # ui is completely sealed, not broke by ' nodetop · slurm ───'". A box that
+    # is a box everywhere is worth more than a label saving one line, and the
+    # title reads better as content than as a gap in the chrome.
+    def stretched(line: str) -> str:
+        """A divider inside a frame spans the frame.
 
-    out = [top]
+        :func:`_grid` rules to its own widest column, which is narrower than
+        the frame whenever some other line -- the facts header -- is longer.
+        A separator that stops four columns short of the border reads as a
+        rendering fault rather than as a separator, and the frame only knows
+        its final inner width here.
+        """
+        bare = _strip_ansi(line)
+        body = bare.lstrip()
+        if len(body) < 3 or set(body) != {g.h}:
+            return line
+        lead = len(bare) - len(body)
+        prefix = line[: line.index(g.h)]
+        tail = "\033[0m" if "\033" in prefix else ""
+        return prefix + g.h * max(1, inner - lead) + tail
+
+    out = [sweep(g.tl + g.h * (size - 2) + g.tr, 0)]
+    if title:
+        lines = [title, *lines]
     for i, line in enumerate(lines):
         # Truncate to the inner width: a content line longer than the frame
         # pushes the right border off the screen and breaks the box.
-        fitted = pad(truncate(line, inner, g.ellipsis), inner)
+        fitted = pad(truncate(stretched(line), inner, g.ellipsis), inner)
         y = i + 1
         out.append(cell(g.v, 0, y) + " " + fitted + " " + cell(g.v, size - 1, y))
     out.append(sweep(g.bl + g.h * (size - 2) + g.br, height - 1))

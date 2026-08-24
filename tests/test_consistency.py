@@ -86,6 +86,59 @@ class TestEveryCommandAgreesWithEveryOther:
             assert js["accelerators_total"] == sum(
                 n.gpus_total for n in queue.nodes), name
             assert js["effective_free_nodes"] == queue.effective_free_nodes, name
+            # `queues --json` used to carry no core figures at all while the
+            # text form printed two, so the same command answered different
+            # questions depending on the flag.
+            assert js["cpus_total"] == sum(n.cpus_total for n in queue.nodes), name
+            assert js["effective_free_cpus"] == queue.effective_free_cpus, name
+            assert js["nodes_with_room"] == sum(
+                1 for n in queue.nodes if n.has_room), name
+
+    def test_the_room_count_is_the_same_in_both_forms_of_queues(self, cluster):
+        # The detail view says "N of M with something spare"; the JSON of the
+        # same query has to agree, and used to carry no such figure at all.
+        for js in _json(cluster, cmd_queues, ["queues", "--all", "--json"]):
+            if js["routes"] or not js["nodes"]:
+                continue
+            argv = ["queues", "-q", js["name"]]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cmd_queues(cluster, build_parser().parse_args(argv), PLAIN)
+            spare = f"{js['nodes_with_room']} of {js['nodes']} with something spare"
+            assert spare in buf.getvalue(), (js["name"], spare)
+
+    def test_the_shares_of_one_node_sum_to_what_it_holds(self):
+        """Per-job shares must add up to the node's own allocated counts.
+
+        The invariant that would have caught the GRES misparse at once: a node
+        reporting all four of its accelerators allocated had per-job shares of
+        0, 2 and 1. Cheap to state, and it constrains every field the two
+        sources have in common.
+        """
+        import dataclasses
+
+        from nodetop.core.model import Allocation, Job, Node, Queue
+
+        node = Node(name="n1", state_raw="MIXED", cpus_total=48, cpus_alloc=25,
+                    memory_mb=184320, memory_alloc_mb=101920, gpus_total=4,
+                    gpus_alloc=4, queues=("q",))
+        jobs = [Job(id="1", cpus=16, gpus=2, nodes=("n1",)),
+                Job(id="2", cpus=8, gpus=1, nodes=("n1",)),
+                Job(id="3", cpus=1, gpus=1, nodes=("n1",))]
+        shares = [Allocation(job="1", node="n1", cpus=16, memory_mb=60960, gpus=2),
+                  Allocation(job="2", node="n1", cpus=8, memory_mb=16384, gpus=1),
+                  Allocation(job="3", node="n1", cpus=1, memory_mb=24576, gpus=1)]
+        cluster = dataclasses.replace(
+            Cluster(backend_name="synthetic", queue_term="partition",
+                    nodes=[node],
+                    queues={"q": Queue(name="q", node_names=("n1",),
+                                       declared_nodes=1, nodes=[node])}),
+            _jobs=jobs,
+            _allocations={(a.job, a.node): a for a in shares})
+        got = [cluster.share_of(j, "n1") for j in cluster.jobs_on("n1")]
+        assert sum(s.cpus for s in got) == node.cpus_alloc
+        assert sum(s.gpus for s in got) == node.gpus_alloc
+        assert sum(s.memory_mb for s in got) == node.memory_alloc_mb
 
     def test_the_exclusion_list_expands_back_to_exactly_that_set(self, cluster):
         # The output is fed to `sbatch --exclude`, so a nodelist that expands to

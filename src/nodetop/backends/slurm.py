@@ -22,6 +22,7 @@ Two Slurm-specific hazards are handled here rather than in the core:
 
 from __future__ import annotations
 
+import dataclasses
 import getpass
 import grp
 import os
@@ -33,6 +34,7 @@ from typing import TypedDict
 from ..core.duration import parse_timestamp
 from ..core.hardware import identify_accelerator
 from ..core.model import (
+    Allocation,
     Identity,
     Job,
     JobShape,
@@ -44,7 +46,7 @@ from ..core.model import (
 )
 from ..hostlist import collapse, expand
 from ..runner import Runner, SubprocessRunner, which
-from .base import BackendCapabilities
+from .base import BackendCapabilities, count
 
 __all__ = ["SlurmBackend", "parse_slurm_duration"]
 
@@ -168,19 +170,13 @@ def _looks_present(value: str | None) -> bool:
     }
 
 
-def _int(value: str | None, default: int = 0) -> int:
-    """Leading integer from a field, never negative.
-
-    A resource count below zero is meaningless, and letting one through is
-    actively harmful: ``cpus_free`` is ``total - alloc``, so an allocation of
-    -5 against a total of 0 reports five free CPUs that do not exist.
-    """
-    if not value:
-        return default
-    m = re.match(r"-?\d+", value.strip())
-    if not m:
-        return default
-    return max(0, int(m.group()))
+#: Leading integer from a field, never negative.
+#:
+#: The shared implementation lives in :func:`nodetop.backends.base.count`, since
+#: every adapter needs one and each having its own is how they drifted -- PBS's
+#: raised on a non-numeric value and let a negative one through. Kept under this
+#: name because fifteen call sites and a test reference it.
+_int = count
 
 
 def _opt_int(value: str | None) -> int | None:
@@ -190,16 +186,45 @@ def _opt_int(value: str | None) -> int | None:
     return int(m.group()) if m else None
 
 
+#: A parenthesised suffix on a GRES value.  Slurm appends the specific devices
+#: -- ``gpu:2(IDX:0,3)`` from a job's allocation, ``gpu:v100:4(S:0-1)`` from a
+#: node's socket affinity -- and the contents carry both colons and commas, the
+#: two characters the field is otherwise split on.
+_GRES_SUFFIX = re.compile(r"\([^)]*\)")
+
+
 def _gres_gpus(gres: str | None) -> int:
-    """Total accelerators from a ``Gres=`` field: ``gpu:4`` or ``gpu:a30:4``."""
+    """Total accelerators from a ``Gres=`` field: ``gpu:4`` or ``gpu:a30:4``.
+
+    **The parenthesised suffix is removed first, and that is the whole
+    subtlety.** ``gpu:2(IDX:0,3)`` split on commas gives ``gpu:2(IDX:0`` and
+    ``3)``; the first then split on colons ends in ``0``, which is the *device
+    index* being read as the count. Measured on a real node, for the three jobs
+    holding its four accelerators:
+
+    ==============  ======================  =========  ========
+    job             GRES                    reported   actual
+    ==============  ======================  =========  ========
+    53741225        ``gpu:2(IDX:0,3)``      0          2
+    54466230_1      ``gpu:1(IDX:2)``        2          1
+    54072325        ``gpu:1(IDX:1)``        1          1
+    ==============  ======================  =========  ========
+
+    Two of three wrong, and wrong in the direction that reads as another job's
+    number -- the reason it looked like the rows had been shuffled rather than
+    misparsed. The same field on a node, ``gpu:v100:4(S:0-1)``, read as **zero
+    accelerators**: this cluster does not print the socket suffix, so that one
+    was latent, and it would have made every GPU node on a cluster that does
+    print it look like a CPU node.
+    """
     if not gres or gres.strip().lower() in {"(null)", "none", ""}:
         return 0
     total = 0
-    for entry in gres.split(","):
-        parts = entry.strip().split(":")
+    for entry in _GRES_SUFFIX.sub("", gres).split(","):
+        parts = [x for x in entry.strip().split(":") if x]
         if not parts or parts[0].lower() != "gpu":
             continue
-        total += _int(parts[-1].split("(")[0], 0)
+        total += _int(parts[-1], 0)
     return total
 
 
@@ -244,6 +269,26 @@ def _parse_tres_map(text: str | None) -> dict[str, int]:
                      "G": 1024.0, "T": 1024.0 ** 2, "P": 1024.0 ** 3}
             out["mem_mb"] = int(val * scale.get(unit, 1.0))
     return out
+
+
+def _count_cpu_ids(text: str | None) -> int:
+    """How many CPUs ``CPU_IDs=0-17,19-24`` names.
+
+    Slurm reports the allocation as core *identifiers*, not a count, so the
+    ranges have to be counted rather than read.
+    """
+    total = 0
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, dash, hi = part.partition("-")
+        if dash:
+            if lo.isdigit() and hi.isdigit() and int(hi) >= int(lo):
+                total += int(hi) - int(lo) + 1
+        elif lo.isdigit():
+            total += 1
+    return total
 
 
 def _literal_csv(value: str | None) -> tuple[str, ...]:
@@ -343,7 +388,41 @@ class SlurmBackend:
         return nodes
 
     def load_nodes(self) -> list[Node]:
-        return self.parse_nodes(self.runner.run(["scontrol", "show", "node", "--oneliner"]))
+        nodes = self.parse_nodes(
+            self.runner.run(["scontrol", "show", "node", "--oneliner"]))
+        if self.memory_is_consumable():
+            return nodes
+        return [dataclasses.replace(n, memory_consumable=False) for n in nodes]
+
+    def memory_is_consumable(self) -> bool:
+        """Whether this cluster accounts for memory when it places work.
+
+        `SelectTypeParameters=CR_CORE_MEMORY` (or `CR_CPU_MEMORY`) makes memory
+        a consumable resource: a node whose `AllocMem` has reached its
+        `RealMemory` can host nothing more, whatever its idle core count says.
+        On the cluster this was written against that is the difference between
+        `caslake` advertising **2322 free cores** and the 287 it could actually
+        hand out -- 2035 of them sat on 47 nodes whose memory was entirely
+        allocated to a handful of four-core jobs, and `DefMemPerNode=UNLIMITED`
+        there means a job that names no `--mem` asks for the whole node.
+
+        Without the `_MEMORY` suffix Slurm does not decrement memory at all, so
+        `AllocMem` is a record of what jobs requested rather than a ceiling the
+        scheduler enforces, and reading it as one would report a whole cluster
+        as full. Hence the question, rather than the assumption.
+
+        Unreadable config answers yes, which claims less capacity -- the bias
+        everywhere else here, and the alternative is recommending a node the
+        scheduler will refuse.
+        """
+        try:
+            out = self.runner.run(["scontrol", "show", "config"])
+        except Exception:
+            return True
+        for line in out.splitlines():
+            if "SelectTypeParameters" in line:
+                return "MEMORY" in line.upper()
+        return True
 
     # -- partitions ---------------------------------------------------------
     def parse_queues(self, output: str) -> list[Queue]:
@@ -487,6 +566,73 @@ class SlurmBackend:
     #: separated because a job NAME may contain spaces and nothing else here is
     #: safe to split on.
     JOB_FORMAT = "%i|%u|%a|%P|%N|%C|%b|%M|%L|%T|%j"
+
+    #: One allocation block from ``scontrol show job -d``::
+    #:
+    #:     Nodes=midway3-[0521-0522] CPU_IDs=78-94 Mem=29750 GRES=gpu:1(IDX:1)
+    #:
+    #: ``Nodes`` is a nodelist, not a name: Slurm collapses consecutive nodes
+    #: that got the same shape of allocation, and the CPU/memory figures then
+    #: apply to *each* of them.
+    _ALLOC = re.compile(
+        r"Nodes=(?P<nodes>\S+)\s+CPU_IDs=(?P<cpus>\S+)\s+Mem=(?P<mem>\d+)"
+        r"(?:\s+GRES=(?P<gres>\S*))?"
+    )
+
+    def parse_allocations(self, output: str) -> list[Allocation]:
+        """Per-node shares, from ``scontrol show job -d``.
+
+        **The two commands do not agree on what a job is called.** ``squeue``
+        names a running array task ``54462542_132``; ``scontrol`` gives it a
+        JobId of its own and records the array it came from separately::
+
+            JobId=54465084 ArrayJobId=54462542 ArrayTaskId=65 JobName=...
+
+        1864 of this cluster's 2928 jobs are array tasks, so keying on
+        ``JobId`` alone would have found a share for none of them. Each
+        allocation is therefore registered under both spellings, and the caller
+        can look up whichever it holds.
+        """
+        out: list[Allocation] = []
+        ids: list[str] = []
+        for raw in output.splitlines():
+            line = raw.strip()
+            if line.startswith("JobId="):
+                f = _fields(_NODE_FIELD, line)
+                ids = [f.get("JobId", "")]
+                array, task = f.get("ArrayJobId", ""), f.get("ArrayTaskId", "")
+                # A single task, not a pending range like `1-20%10`.
+                if array and task.isdigit():
+                    ids.append(f"{array}_{task}")
+                ids = [x for x in ids if x]
+                continue
+            if not ids or not line.startswith("Nodes="):
+                continue
+            m = self._ALLOC.match(line)
+            if not m:
+                continue
+            cpus = _count_cpu_ids(m.group("cpus"))
+            mem = _int(m.group("mem"))
+            gpus = _gres_gpus(m.group("gres"))
+            for node in expand(m.group("nodes")):
+                out.extend(
+                    Allocation(job=jid, node=node, cpus=cpus, memory_mb=mem,
+                               gpus=gpus)
+                    for jid in ids
+                )
+        return out
+
+    def load_allocations(self) -> list[Allocation]:
+        """Every job's per-node share, in one call.
+
+        One whole-cluster query rather than one per job: measured on 2928 jobs
+        it costs 0.6s and 4.7 MB, against 0.13s for a single job -- so asking
+        about five jobs already pays for asking about all of them, and a node
+        with 49 tasks on it would otherwise stall an interactive repaint for
+        six seconds.
+        """
+        return self.parse_allocations(
+            self.runner.run(["scontrol", "show", "job", "-d"]))
 
     def parse_jobs(self, output: str) -> list[Job]:
         """One :class:`Job` per line of ``squeue`` output.

@@ -240,15 +240,39 @@ class TestNavigationGoesInAndOut:
         return Cluster(backend_name="synthetic", queue_term="partition",
                        nodes=nodes, queues=queues)
 
+    @staticmethod
+    def _funnel_entries(render, count: int) -> int:
+        """How many selectable entries live on the funnel line.
+
+        Derived, not hardcoded. Every one of them shares that single display
+        row -- the partition total, the "open to you" bucket, one per exclusion
+        reason -- so an entry belongs to it exactly when the cursor renders
+        inside it. The count has changed twice; a constant here rotted twice.
+        """
+        return sum(
+            1 for i in range(count)
+            if any(PLAIN.g.cursor in line and "partition" in line
+                   for line in render(i))
+        )
+
     def _walk(self, monkeypatch, capsys, replies):
-        """Drive the stack with a scripted list of `select` results."""
+        """Drive the stack with a scripted list of `select` results.
+
+        Integer replies are *partition* positions at the top level; the funnel
+        entries in front of them are skipped, so a test can say "the second
+        row" without tracking how many buckets the funnel happens to have.
+        """
         import nodetop.interactive as inter
 
         frames: list[list[str]] = []
         answers = iter(replies)
+        depth = {"n": 0}
 
         def scripted(render, count, **_kw):
             got = next(answers, inter.Key.QUIT)
+            if isinstance(got, int) and depth["n"] == 0:
+                got += self._funnel_entries(render, count)
+            depth["n"] += 1
             index = got if isinstance(got, int) else 0
             frames.append(list(render(min(index, max(0, count - 1)))))
             return got
@@ -263,14 +287,22 @@ class TestNavigationGoesInAndOut:
     def test_it_offers_one_row_per_partition(self, monkeypatch, capsys):
         import nodetop.interactive as inter
 
-        counts = []
+        seen = {}
         monkeypatch.setattr(inter, "supported", lambda *_a, **_k: True)
         monkeypatch.setattr(inter, "read_key", lambda *_a, **_k: inter.Key.QUIT)
-        monkeypatch.setattr(inter, "select",
-                            lambda _r, n, **_k: counts.append(n) or inter.Key.QUIT)
+
+        def capture(render, n, **_kw):
+            seen["count"] = n
+            seen["funnel"] = self._funnel_entries(render, n)
+            return inter.Key.QUIT
+
+        monkeypatch.setattr(inter, "select", capture)
         cmd_status(self._cluster(), _args(["status"]), PLAIN)
         capsys.readouterr()
-        assert counts == [3]
+        # One row per partition, and every funnel term is a target too -- the
+        # total and "open to you" at least, plus one per exclusion reason.
+        assert seen["count"] - seen["funnel"] == 3
+        assert seen["funnel"] >= 2
 
     @pytest.mark.parametrize("pick,expected", [(0, "most"), (1, "mid"), (2, "least")])
     def test_choosing_a_row_opens_that_partition(self, monkeypatch, capsys,
@@ -336,20 +368,104 @@ class TestNavigationGoesInAndOut:
         assert "partition" in capsys.readouterr().out
 
 
-class TestJobTotalsAreNotPerNodeShares:
-    """`squeue` reports a job's counts as totals over every node it holds.
+class TestAJobHasItsOwnView:
+    """Enter on a job row used to pop straight back to the node listing.
 
-    Printed bare in a per-node table that is actively misleading: a nine-node
-    job appeared as **431 cores on a 48-core node**, a number the reader knows
-    to be impossible, which discredits the whole column.
-
-    The exact per-node share needs a `scontrol show job` per row, and dividing
-    would be a guess dressed as a fact -- a job need not be allocated uniformly.
-    So both exact numbers are shown and the reader divides if they care.
+    "when choosing any of the job here, it doesn't go into the job details but
+    going back to the original node" -- so the row was the deepest the tool
+    went, with its name truncated and its node list unseen.
     """
 
     @staticmethod
-    def _cluster(jobs):
+    def _cluster(job):
+        import dataclasses
+
+        from nodetop.core.cluster import Cluster
+        from nodetop.core.model import Node, Queue
+
+        node = Node(name="n1", state_raw="MIXED", cpus_total=48, cpus_alloc=40,
+                    memory_mb=1000, queues=("q",))
+        queue = Queue(name="q", node_names=("n1",), declared_nodes=1,
+                      nodes=[node])
+        cluster = Cluster(backend_name="synthetic", queue_term="partition",
+                          nodes=[node], queues={"q": queue})
+        return dataclasses.replace(cluster, _jobs=[job])
+
+    def _frames(self, monkeypatch, capsys, job, replies):
+        import nodetop.interactive as inter
+
+        frames: list[list[str]] = []
+        answers = iter(replies)
+
+        def scripted(render, _count, **_kw):
+            got = next(answers, inter.Key.QUIT)
+            frames.append(list(render(got if isinstance(got, int) else 0)))
+            return got
+
+        monkeypatch.setattr(inter, "supported", lambda *_a, **_k: True)
+        monkeypatch.setattr(inter, "select", scripted)
+        monkeypatch.setattr(inter, "read_key", lambda *_a, **_k: inter.Key.QUIT)
+        assert cmd_status(self._cluster(job), _args(["status"]), PLAIN) == 0
+        capsys.readouterr()
+        return frames
+
+    #: total, "open to you", then the partition row.
+    ROW = 2
+
+    def test_entering_a_job_opens_it(self, monkeypatch, capsys):
+        from nodetop.core.model import Job
+
+        job = Job(id="42", user="alice", account="pi-x", queue="q", cpus=8,
+                  nodes=("n1",), name="a-name-far-too-long-for-any-table-cell",
+                  state="RUNNING", elapsed="1:00:00", remaining="2:00:00")
+        frames = self._frames(monkeypatch, capsys, job, [self.ROW, 0, 0])
+        # partitions, nodes, jobs, then the job itself.
+        assert len(frames) == 4
+        deepest = "\n".join(frames[3])
+        assert "42" in deepest
+        # The name in full, which the listing cannot afford.
+        assert job.name in deepest
+        assert "RUNNING" in deepest
+
+    def test_it_names_the_node_and_the_share(self, monkeypatch, capsys):
+        from nodetop.core.model import Job
+
+        job = Job(id="42", user="alice", cpus=8, nodes=("n1",))
+        deepest = "\n".join(
+            self._frames(monkeypatch, capsys, job, [self.ROW, 0, 0])[3])
+        assert "on n1" in deepest
+        assert "job total" in deepest
+
+    def test_stepping_out_of_a_job_returns_to_the_job_list(self, monkeypatch,
+                                                          capsys):
+        import nodetop.interactive as inter
+        from nodetop.core.model import Job
+
+        job = Job(id="42", user="alice", cpus=8, nodes=("n1",))
+        frames = self._frames(monkeypatch, capsys, job,
+                              [self.ROW, 0, 0, inter.Key.BACK, inter.Key.QUIT])
+        assert len(frames) >= 5
+        # Back at the job table: its facts line names the node, and the job's
+        # own view does not.
+        assert any("cores free" in ln for ln in frames[4])
+        assert any("n1" in ln for ln in frames[4])
+
+
+class TestJobTotalsAreNotPerNodeShares:
+    """A per-node table has to show the share, not the job's total.
+
+    `squeue` reports a job's counts over every node it holds, so a 42-node job
+    read as **512 cores on a 48-core machine** -- a number the reader knows to
+    be impossible, which discredits the whole column. It used to be marked
+    `512 x42`, which explained nothing: "the cpu column doesn't make any sense.
+    what do the column entries mean?"
+
+    The share is now fetched (`Cluster.share_of`), and a job whose share cannot
+    be established says so rather than substituting a total.
+    """
+
+    @staticmethod
+    def _cluster(jobs, allocations=None):
         import dataclasses
 
         from nodetop.core.cluster import Cluster
@@ -361,13 +477,17 @@ class TestJobTotalsAreNotPerNodeShares:
                       nodes=[node])
         cluster = Cluster(backend_name="synthetic", queue_term="partition",
                           nodes=[node], queues={"q": queue})
-        return dataclasses.replace(cluster, _jobs=list(jobs))
+        return dataclasses.replace(
+            cluster, _jobs=list(jobs),
+            _allocations={(a.job, a.node): a for a in (allocations or ())})
 
-    def _job_frame(self, monkeypatch, capsys, jobs):
+    def _job_frame(self, monkeypatch, capsys, jobs, allocations=None):
         import nodetop.interactive as inter
 
         seen = {}
-        replies = iter([0, 0])
+        # The funnel's own buckets sit in front of the partition rows: the
+        # total, then "open to you". The partition is the entry after them.
+        replies = iter([2, 0])
 
         def scripted(render, _count, **_kw):
             got = next(replies, inter.Key.QUIT)
@@ -377,26 +497,76 @@ class TestJobTotalsAreNotPerNodeShares:
         monkeypatch.setattr(inter, "supported", lambda *_a, **_k: True)
         monkeypatch.setattr(inter, "select", scripted)
         monkeypatch.setattr(inter, "read_key", lambda *_a, **_k: inter.Key.QUIT)
-        cmd_status(self._cluster(jobs), _args(["status"]), PLAIN)
+        cmd_status(self._cluster(jobs, allocations), _args(["status"]), PLAIN)
         capsys.readouterr()
         return "\n".join(seen[max(seen)])
 
-    def test_a_single_node_job_shows_a_bare_count(self, monkeypatch, capsys):
+    def test_a_single_node_job_needs_no_lookup(self, monkeypatch, capsys):
+        # Its totals ARE its share, which is most jobs and the whole answer on
+        # a backend that models a job as living on one machine.
         from nodetop.core.model import Job
 
         out = self._job_frame(monkeypatch, capsys, [
             Job(id="1", user="u", cpus=40, gpus=2, nodes=("n1",))])
-        assert " 40 " in out or out.rstrip().endswith("40")
+        assert " 40 " in out
         assert "x1" not in out
 
-    def test_a_multi_node_job_is_marked_with_its_span(self, monkeypatch, capsys):
+    def test_a_multi_node_job_shows_its_share_of_this_node(self, monkeypatch,
+                                                           capsys):
+        from nodetop.core.model import Allocation, Job
+
+        out = self._job_frame(
+            monkeypatch, capsys,
+            [Job(id="1", user="u", cpus=512, gpus=8,
+                 nodes=tuple(f"n{i}" for i in range(41)) + ("n1",))],
+            [Allocation(job="1", node="n1", cpus=7, memory_mb=7168, gpus=1)])
+        assert " 7 " in out          # cores here
+        assert " 1 " in out          # accelerators here
+        assert "512" not in out      # not the total
+        assert "x42" not in out      # and not the marker nobody could read
+        assert " 42 " in out         # the span, in its own column
+
+    def test_a_share_that_cannot_be_established_says_so(self, monkeypatch,
+                                                        capsys):
+        # No allocation and more than one node: a total in a column that means
+        # a share is the defect this class exists for.
         from nodetop.core.model import Job
 
         out = self._job_frame(monkeypatch, capsys, [
-            Job(id="1", user="u", cpus=431, gpus=8,
-                nodes=tuple(f"n{i}" for i in range(9)) + ("n1",))])
-        assert "431 x10" in out
-        assert "8 x10" in out
+            Job(id="1", user="u", cpus=512, gpus=8, nodes=("n0", "n1"))])
+        assert "512" not in out
+        assert "?" in out
+
+    def test_the_memory_column_is_the_share_in_gb(self, monkeypatch, capsys):
+        from nodetop.core.model import Allocation, Job
+
+        out = self._job_frame(
+            monkeypatch, capsys,
+            [Job(id="1", user="u", cpus=8, nodes=("n0", "n1"))],
+            [Allocation(job="1", node="n1", cpus=8, memory_mb=57600)])
+        assert " 56 " in out         # 57600 MB
+        assert "57600" not in out
+
+    def test_a_job_holding_no_accelerator_shows_a_zero(self, monkeypatch,
+                                                       capsys):
+        # The node has accelerators and this job holds none of them, which is a
+        # count. `·` was doing double duty for "none installed" and "none held".
+        from nodetop.core.model import Allocation, Job
+
+        out = self._job_frame(
+            monkeypatch, capsys,
+            [Job(id="1", user="u", cpus=8, gpus=0, nodes=("n1",))],
+            [Allocation(job="1", node="n1", cpus=8, memory_mb=1024, gpus=0)])
+        assert " 0 " in out
+
+    def test_the_span_column_is_absent_when_nothing_spans(self, monkeypatch,
+                                                          capsys):
+        # A column of `·` costs width the job name needs.
+        from nodetop.core.model import Job
+
+        out = self._job_frame(monkeypatch, capsys, [
+            Job(id="1", user="u", cpus=8, nodes=("n1",))])
+        assert "nodes" not in out
 
     def test_a_job_with_no_accelerators_shows_a_dash(self, monkeypatch, capsys):
         from nodetop.core.model import Job
@@ -490,10 +660,38 @@ class TestTheInteractiveFrameFitsTheScreen:
     def test_the_selection_stays_on_screen(self, monkeypatch, capsys):
         # The point of scrolling: the highlighted row must be in the window,
         # otherwise the cursor vanishes and the arrows appear to do nothing.
-        frames = self._frames(monkeypatch, capsys, 60, rows=24)
-        for i, frame in enumerate(frames):
+        #
+        # The leading frames belong to the funnel's own buckets, which are not
+        # partition rows; the partition frames follow them. Counted rather than
+        # assumed -- the funnel has gained a term twice.
+        every = self._frames(monkeypatch, capsys, 60, rows=24)
+        funnel = sum(1 for f in every
+                     if any(PLAIN.g.cursor in ln and "partition" in ln
+                            for ln in f))
+        for i, frame in enumerate(every[funnel:]):
             body = "\n".join(frame)
             assert f"p{i:03d} " in body, i
+
+    def test_every_frame_is_the_same_size(self, monkeypatch, capsys):
+        """The window does not move as the reader changes level.
+
+        It used to size itself to its content, so stepping from an
+        eighty-column overview into `3 down` shrank it to a third of the width
+        and four rows -- "whatever we choose in the ui, the window should stay
+        the same and the text and information getting displayed should
+        dynamically get adjusted".
+        """
+        frames = self._frames(monkeypatch, capsys, 60, rows=24)
+        sizes = {(len(f), width(f[0])) for f in frames}
+        assert len(sizes) == 1, sizes
+
+    def test_a_short_view_is_padded_not_shrunk(self, monkeypatch, capsys):
+        # Four partitions do not fill a 24-row frame, and the border must not
+        # close early to meet them.
+        frames = self._frames(monkeypatch, capsys, 4, rows=24)
+        for frame in frames:
+            assert len(frame) == 23
+            assert frame[-2].strip("│ ") == ""    # padding, then the border
 
     def test_headings_are_never_dropped_to_fit(self, monkeypatch, capsys):
         # They are the frame of reference for the row you are looking at.
@@ -548,6 +746,129 @@ class TestZoomEdgeCases:
         row = [x for x in self._out(cluster, capsys).splitlines() if "d1" in x][0]
         assert PLAIN.g.blocks[-1] not in row      # no filled cell
         assert "8/8" in row                       # but the claim is still shown
+
+    def test_a_node_with_no_memory_left_reads_empty_too(self, capsys):
+        # 44 of 48 cores idle and every byte of memory allocated: the same
+        # phantom capacity as a drained node, and the biggest number on the
+        # screen. Real -- `caslake` had 47 of these behind a headline of 2322
+        # free cores.
+        # `_node` gives the node 100 MB; this allocates all of it.
+        cluster = self._cluster([self._node(
+            "starved", state_raw="MIXED", cpus_total=48, cpus_alloc=4,
+            memory_alloc_mb=100)])
+        row = [x for x in self._out(cluster, capsys).splitlines()
+               if "starved" in x][0]
+        assert PLAIN.g.blocks[-1] not in row      # no filled cell
+        assert "44/48" in row                     # the claim is still shown
+        assert "0/0G" in row                      # and so is the reason
+
+    def test_a_node_with_memory_to_spare_still_draws_its_meter(self, capsys):
+        cluster = self._cluster([self._node(
+            "roomy", state_raw="MIXED", cpus_total=48, cpus_alloc=4)])
+        row = [x for x in self._out(cluster, capsys).splitlines()
+               if "roomy" in x][0]
+        assert PLAIN.g.blocks[-1] in row
+
+    def test_a_node_with_no_accelerator_says_so_with_a_dash(self, capsys):
+        # `·` is this tool's empty cell, and in a column headed "gpu free" it
+        # answers a question the node is not being asked: "the . in the gpu
+        # column is a very confusing thing ... putting a dot there means
+        # nothing". A dash reads as not-applicable with colour off and in ASCII.
+        cluster = self._cluster([
+            self._node("cpu1", state_raw="IDLE", cpus_total=8),
+            self._node("gpu1", state_raw="IDLE", cpus_total=8, gpus_total=4),
+        ])
+        rows = {ln.split()[1] if len(ln.split()) > 1 else "": ln
+                for ln in self._out(cluster, capsys).splitlines()}
+        line = next(ln for ln in rows.values() if "cpu1" in ln)
+        assert PLAIN.g.dash in line
+        assert next(ln for ln in rows.values() if "gpu1" in ln).count("4/4") == 1
+
+    def test_the_accelerator_column_is_absent_when_nothing_has_one(self, capsys):
+        # A column of dashes costs width the node name and reason need.
+        cluster = self._cluster([self._node("cpu1", state_raw="IDLE",
+                                            cpus_total=8)])
+        out = self._out(cluster, capsys)
+        assert "gpu" not in out
+        assert PLAIN.g.dash not in out
+
+    def test_each_free_column_says_which_resource_it_counts(self, capsys):
+        # It was `cpu | free | mem free | gpu`, with one bare `free` doing the
+        # work of three labels: "why so many frees? it looks weird and the
+        # words are very unclear".
+        cluster = self._cluster([self._node("gpu1", state_raw="IDLE",
+                                            cpus_total=8, gpus_total=4)])
+        out = self._out(cluster, capsys)
+        for head in ("cpu free", "mem free", "gpu free"):
+            assert head in out, head
+        # And the meter follows the number it draws, as in the overview.
+        row = next(ln for ln in out.splitlines() if "gpu1" in ln)
+        assert row.index("8/8") < row.index(PLAIN.g.blocks[-1])
+
+    def test_a_down_node_shows_why_it_is_down(self, capsys):
+        """The reason, in full, and the state beside it.
+
+        Opening a drained node used to give a four-line box saying "nothing
+        running here" -- no state, no reason -- and the reason is exactly what
+        the reader opened it for: "after hitting this one, nothing shows up,
+        even people wanting to see the reason why this node is down". It is
+        truncated in the listing, so this is the view that prints it whole.
+        """
+        import nodetop.interactive as inter
+
+        reason = ("maintenance: replacing a failed accelerator and the fabric "
+                  "card that came with it [root@2026-08-19T09:14:02]")
+        # A healthy node beside it, so the partition itself stays usable and
+        # the funnel keeps to its two terms -- otherwise entry 2 is the "down"
+        # label rather than the partition row.
+        cluster = self._cluster([
+            self._node("ok1", state_raw="IDLE", cpus_total=8),
+            self._node("d1", state_raw="DOWN*+DRAIN", cpus_total=8,
+                       conditions=frozenset({"DOWN"}), unreachable=True,
+                       reason=reason),
+        ])
+        frames: list[list[str]] = []
+        # partition row, then the drained node -- unschedulable ones sort last.
+        answers = iter([2, 1, 0])
+
+        def scripted(render, _count, **_kw):
+            got = next(answers, inter.Key.QUIT)
+            frames.append(list(render(got if isinstance(got, int) else 0)))
+            return got
+
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            monkeypatch.setattr(inter, "supported", lambda *_a, **_k: True)
+            monkeypatch.setattr(inter, "select", scripted)
+            monkeypatch.setattr(inter, "read_key",
+                                lambda *_a, **_k: inter.Key.QUIT)
+            cmd_status(cluster, _args(["status"]), PLAIN)
+        finally:
+            monkeypatch.undo()
+        capsys.readouterr()
+        # The node's own view, found by its facts line rather than by index:
+        # stepping back out of it renders the listing again afterwards.
+        opened = next("\n".join(f) for f in frames
+                      if any(ln.lstrip("│ ").startswith("d1  ") for ln in f))
+        assert "DOWN*+DRAIN" in opened
+        # Whole, not truncated, and the stamp separated from the cause.
+        assert "replacing a failed accelerator" in opened
+        assert "fabric" in opened
+        assert PLAIN.g.ellipsis not in opened
+        assert "root" in opened
+        assert "lost contact" in opened
+        # And not the note that reads as "free".
+        assert "nothing can start" in opened
+
+    def test_a_node_with_no_room_is_not_marked_free(self, capsys):
+        # Nothing running, no allocatable memory: the green mark is the one
+        # thing on a row a reader trusts without reading the numbers.
+        cluster = self._cluster([self._node(
+            "hollow", state_raw="IDLE", cpus_total=48, memory_alloc_mb=100)])
+        row = [x for x in self._out(cluster, capsys).splitlines()
+               if "hollow" in x][0]
+        assert PLAIN.g.ok not in row
+        assert PLAIN.g.partial in row
 
     def test_a_routing_queue_gets_no_empty_node_listing(self, capsys):
         # The detail block above it already says "owns no nodes of its own".
@@ -696,7 +1017,7 @@ class TestStatus:
         # asking why 87 partitions became 5 still needs every term of it.
         cmd_status(cluster, _args(["status"]), PLAIN)
         out = " ".join(capsys.readouterr().out.split())
-        assert "dead" in out
+        assert "down" in out
 
     def test_the_detail_is_one_command_away(self, cluster, capsys):
         # The condition for taking it off the overview: `queues` still names
@@ -1141,6 +1462,56 @@ class TestStatusIdentity:
         assert json.loads(capsys.readouterr().out)["identity"] is None
 
 
+class TestStatusJsonSaysWhatThePanelSays:
+    """`--json` used to answer a different question than the panel.
+
+    It returned `cluster.summary()` and nothing else: the panel said "222 of
+    358 GPUs, 53 free" -- your partitions -- while the JSON reported 358 and
+    126, counting accelerators in partitions the account cannot submit to, and
+    carried neither the funnel nor a single partition row.
+    """
+
+    def _json(self, cluster, capsys, argv=("status", "--json")):
+        assert cmd_status(cluster, _args(list(argv)), PLAIN) == 0
+        return json.loads(capsys.readouterr().out)
+
+    def test_the_funnel_terms_sum_to_the_partition_count(self, cluster, capsys):
+        d = self._json(cluster, capsys)
+        f = d["funnel"]
+        assert f["total"] == d["queues"]
+        assert sum(v for k, v in f.items()
+                   if k not in {"total", "unconfirmed"}) == f["total"]
+
+    def test_the_listed_rows_are_the_ones_the_funnel_shows(self, cluster, capsys):
+        d = self._json(cluster, capsys)
+        assert len(d["listed"]) == d["funnel"]["shown"]
+
+    def test_every_other_partition_is_named_with_its_reason(self, cluster, capsys):
+        d = self._json(cluster, capsys)
+        assert len(d["listed"]) + len(d["excluded"]) == d["funnel"]["total"]
+        assert all(e["reason"] for e in d["excluded"])
+
+    def test_the_scope_is_yours_not_the_whole_cluster(self, cluster, capsys):
+        # Both are carried, and they are labelled: `accelerators_total` at the
+        # top level is the cluster, `yours` is the population the panel counts.
+        d = self._json(cluster, capsys)
+        assert d["yours"]["accelerators_total"] <= d["accelerators_total"]
+        assert d["yours"]["nodes"] <= d["nodes"]
+
+    def test_the_allocatable_core_count_is_carried_too(self, cluster, capsys):
+        # The number the panel meters, which no JSON field used to hold.
+        y = self._json(cluster, capsys)["yours"]
+        assert y["effective_free_cpus"] <= y["cpus_free_advertised"]
+
+    def test_an_empty_cluster_still_emits_the_whole_schema(self, capsys):
+        from nodetop.core.cluster import Cluster
+
+        d = self._json(Cluster(), capsys)
+        for key in ("yours", "funnel", "listed", "excluded"):
+            assert key in d, key
+        assert d["funnel"]["shown"] == 0
+
+
 class TestStatusIsSelfLimiting:
     """The dashboard's length must not track the size of the cluster.
 
@@ -1480,7 +1851,7 @@ class TestStatusLeadsWithWhatYouCanUse:
 
     def test_it_is_counted_rather_than_listed(self, capsys):
         out = " ".join(self._out(capsys).split())
-        assert "1 dead" in out
+        assert "1 down" in out
 
     def test_the_partitions_you_can_use_are_what_is_listed(self, capsys):
         out = self._out(capsys)
@@ -1586,8 +1957,12 @@ class TestStatusIsNotFramedAroundGpus:
 
     def test_no_column_packs_free_and_total_into_one_fraction(self, capsys):
         out = self._out(capsys)
-        header = next(ln for ln in out.splitlines() if "share" in ln)
+        # `share` used to label a percentage column. It is gone: a bar drawn
+        # from one notion of free beside a number expressing another was
+        # unreadable, so there is one quantity per column now.
+        header = next(ln for ln in out.splitlines() if "cores" in ln)
         assert "free" in header and "nodes" in header
+        assert "share" not in header
         # No cell is a bare "free/total" fraction. The first version split the
         # row on a double space and looked at element zero, which is the leading
         # indent -- so it checked nothing and a mutation recombining the columns
@@ -2069,7 +2444,7 @@ class TestFreeMeansReachableAndFree:
 class TestEachFunnelLabelIsItsOwnTarget:
     """"i want to hit enter myself to each of the labels."
 
-    The counts on the funnel line -- `65 no access`, `11 refused`, `3 dead` --
+    The counts on the funnel line -- `65 no access`, `11 refused`, `3 down` --
     are each a set of partitions the reader can be shown. They share one body
     row, so the cursor cannot tell them apart by position: the selected term is
     the one drawn in the accent colour, and entering it opens that reason's
@@ -2131,10 +2506,12 @@ class TestEachFunnelLabelIsItsOwnTarget:
         assert counts and counts[0] > 1
 
     def test_entering_a_label_shows_only_that_reason(self, monkeypatch, capsys):
-        frames = self._walk(monkeypatch, capsys, [0])
+        # Entry 0 is the partition total, 1 is "open to you", so the first
+        # exclusion reason is 2.
+        frames = self._walk(monkeypatch, capsys, [2])
         opened = "\n".join(frames[1])
         # The header names the reason, and every row shares it.
-        reasons = {"no access", "dead", "no nodes", "refused"}
+        reasons = {"no access", "down", "no nodes", "refused"}
         named = [r for r in reasons if r in opened]
         assert named, opened
         assert opened.count(named[0]) >= 2
@@ -2149,6 +2526,38 @@ class TestEachFunnelLabelIsItsOwnTarget:
         second = self._walk(monkeypatch, capsys, [1])[0]
         line_b = [ln for ln in second if "open to you" in ln][0]
         assert width(line_a) == width(line_b)
+
+    def test_the_cursor_moves_to_the_selected_label(self, monkeypatch, capsys):
+        """The glyph points at the term, not at the left margin.
+
+        The row cursor was pinned to column 0 of this line while the selection
+        moved between terms by colour alone, so it pointed at the partition
+        total whatever was chosen and Right read as having done nothing:
+        "when pressing the right arrow, it doesn't land at ' 8 open to you'".
+        """
+        def pointed_at(entry: int) -> str:
+            line = [ln for ln in self._walk(monkeypatch, capsys, [entry])[0]
+                    if "open to you" in ln][0]
+            # One cursor on the row, not one per candidate and not two.
+            assert line.count(PLAIN.g.cursor) == 1, line
+            return line.split(PLAIN.g.cursor)[1].strip()
+
+        # The total leads the line and is a target like the rest of them:
+        # "why can't we select the 87 partitions?"
+        assert pointed_at(0).startswith("3 partitions")
+        assert pointed_at(1).startswith("1 open to you")
+        assert not pointed_at(2).startswith("1 open to you")
+
+    def test_the_total_opens_every_partition_with_its_reason(self, monkeypatch,
+                                                            capsys):
+        # The one view where the funnel's arithmetic can be checked rather than
+        # trusted: its terms, itemised.
+        opened = "\n".join(self._walk(monkeypatch, capsys, [0])[1])
+        assert "3 partitions" in opened
+        for name in ("open", "private", "broken"):
+            assert name in opened, name
+        # And each carries the word that put it there.
+        assert "open" in opened and "no access" in opened and "down" in opened
 
     def test_a_cluster_with_nothing_excluded_has_no_labels(self, monkeypatch,
                                                            capsys):
@@ -2169,4 +2578,8 @@ class TestEachFunnelLabelIsItsOwnTarget:
                             lambda _r, n, **_k: counts.append(n) or inter.Key.QUIT)
         cmd_status(cluster, _args(["status"]), PLAIN)
         capsys.readouterr()
-        assert counts == [1]        # the single partition, and nothing else
+        # The partition, plus the funnel's own "open to you" bucket. No
+        # exclusion buckets, because nothing is excluded -- which is the point.
+        # The total, "open to you", and the single partition row. No exclusion
+        # terms, because nothing is excluded.
+        assert counts == [3]

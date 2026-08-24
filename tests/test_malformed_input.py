@@ -109,6 +109,7 @@ class TestNoNegativeResources:
         "nodetop.backends.pbs._mem_to_mb",
         "nodetop.backends.sge._mem_to_mb",
         "nodetop.backends.slurm._int",
+        "nodetop.backends.base.count",
     ])
     def test_every_numeric_parser_clamps(self, parser):
         import importlib
@@ -118,6 +119,53 @@ class TestNoNegativeResources:
         for probe in ["-8", "-8G", "-99999"]:
             got = fn(probe)
             assert got is None or got >= 0, f"{parser}({probe!r}) = {got}"
+
+
+class TestACountIsNotACrash:
+    """A field that is not a number must not empty the node list.
+
+    PBS reports ``resources_available.ngpus = unlimited`` for an uncapped
+    resource, and site scripts emit ``4x`` and ``8gb``. `int()` on any of those
+    raised through the node parser, so one odd field on one node took down the
+    whole listing -- and an empty listing is reported as "wrong backend, or the
+    control plane is down", a misdiagnosis rather than a gap.
+    """
+
+    @pytest.mark.parametrize("value,expected", [
+        (4, 4), ("4", 4), (4.0, 4), ("4x", 4), ("48 cores", 48),
+        ("unlimited", 0), ("n/a", 0), ("", 0), (None, 0),
+        (-2, 0), ("-2", 0),                      # a negative count is not one
+        (True, 0), (False, 0),                   # a flag is not a count
+    ])
+    def test_count_reads_what_it_can_and_refuses_the_rest(self, value, expected):
+        from nodetop.backends.base import count
+
+        assert count(value) == expected
+
+    @pytest.mark.parametrize("value", ["unlimited", "4x", -2, None, "n/a"])
+    def test_a_pbs_node_survives_an_odd_resource_value(self, value):
+        import json
+
+        from nodetop.backends.pbs import PbsBackend
+        from nodetop.runner import RecordedRunner
+
+        doc = {"nodes": {"n1": {"state": "free",
+               "resources_available": {"ncpus": 48, "ngpus": value},
+               "resources_assigned": {}}}}
+        nodes = PbsBackend(RecordedRunner({})).parse_nodes_json(json.dumps(doc))
+        assert [n.name for n in nodes] == ["n1"]
+        assert nodes[0].cpus_total == 48          # the good field still lands
+        assert nodes[0].gpus_total >= 0
+
+    def test_a_pbs_text_node_survives_it_too(self):
+        from nodetop.backends.pbs import PbsBackend
+        from nodetop.runner import RecordedRunner
+
+        nodes = PbsBackend(RecordedRunner({})).parse_nodes_text(
+            "n1\n     state = free\n"
+            "     resources_available.ncpus = 48\n"
+            "     resources_available.ngpus = unlimited\n")
+        assert [(n.name, n.cpus_total, n.gpus_total) for n in nodes] == [("n1", 48, 0)]
 
 
 class TestDuplicateRecords:

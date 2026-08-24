@@ -64,6 +64,195 @@ class TestNodes:
         assert n.is_gpu_node is False
 
 
+class TestMemoryIsAConsumableResourceOrItIsNot:
+    """Whether a full `AllocMem` is a ceiling depends on the cluster's config.
+
+    `CR_CORE_MEMORY` makes it one: a node whose memory is fully allocated can
+    host nothing more, however many cores are idle. Without the `_MEMORY`
+    suffix Slurm never decrements memory, so `AllocMem` records what jobs
+    asked for and reading it as a ceiling would report a whole cluster as full.
+    """
+
+    NODE = ("NodeName=n1 CPUTot=48 CPUAlloc=4 RealMemory=1000 AllocMem=1000 "
+            "State=MIXED Partitions=p\n")
+
+    def _backend(self, select: str | None):
+        recorded = {"scontrol show node": (0, self.NODE, "")}
+        if select is not None:
+            recorded["scontrol show config"] = (
+                0, f"SelectType              = select/cons_tres\n"
+                   f"SelectTypeParameters    = {select}\n", "")
+        return SlurmBackend(RecordedRunner(recorded))
+
+    def test_memory_tracking_config_makes_a_full_node_full(self):
+        backend = self._backend("CR_CORE_MEMORY,CR_ONE_TASK_PER_CORE")
+        assert backend.memory_is_consumable() is True
+        node = backend.load_nodes()[0]
+        assert node.cpus_free == 44          # what the scheduler claims
+        assert node.effective_free_cpus == 0  # what it can hand out
+        assert node.has_room is False
+
+    def test_a_config_without_memory_leaves_the_cores_countable(self):
+        backend = self._backend("CR_CORE,CR_ONE_TASK_PER_CORE")
+        assert backend.memory_is_consumable() is False
+        node = backend.load_nodes()[0]
+        assert node.memory_consumable is False
+        assert node.effective_free_cpus == 44
+        assert node.has_room is True
+
+    def test_unreadable_config_claims_less_capacity(self):
+        # No recording for `show config`, so the query raises. Applying the
+        # constraint is the safe direction: the alternative is recommending a
+        # node the scheduler will refuse.
+        backend = self._backend(None)
+        assert backend.memory_is_consumable() is True
+        assert backend.load_nodes()[0].has_room is False
+
+    def test_config_without_the_parameter_line_claims_less_too(self):
+        backend = SlurmBackend(RecordedRunner({
+            "scontrol show node": (0, self.NODE, ""),
+            "scontrol show config": (0, "ClusterName = x\n", ""),
+        }))
+        assert backend.memory_is_consumable() is True
+
+    def test_the_config_is_asked_for_once(self):
+        backend = self._backend("CR_CORE_MEMORY")
+        backend.load_nodes()
+        config_calls = [c for c in backend.runner.calls if "config" in c]
+        assert len(config_calls) == 1
+
+
+class TestGresCountsAreNotDeviceIndices:
+    """`Gres=` carries the devices, and the suffix looks like the count.
+
+    Slurm appends which accelerators, not just how many -- `gpu:2(IDX:0,3)` on
+    a job's allocation, `gpu:v100:4(S:0-1)` on a node's socket affinity -- and
+    the contents hold both colons and commas, the two characters the field is
+    split on. Splitting first read the device *index* as the count. Measured on
+    one node's three jobs: 0, 2, 1 where the truth was 2, 1, 1.
+    """
+
+    @pytest.mark.parametrize("gres,expected", [
+        ("gpu:4", 4),                                   # plain
+        ("gpu:a30:4", 4),                               # typed
+        ("gpu:2(IDX:0,3)", 2),                          # the comma case: read 0
+        ("gpu:1(IDX:2)", 1),                            # read 2 -- another job's
+        ("gpu:1(IDX:1)", 1),                            # right by coincidence
+        ("gpu:v100:4(S:0-1)", 4),                       # socket affinity: read 0
+        ("gpu:v100:2(IDX:0-1),gpu:a100:1(IDX:0)", 3),   # two models on one node
+        ("gpu:2,mps:1", 2),                             # another gres beside it
+        ("mps:1", 0),
+        ("(null)", 0),
+        ("", 0),
+        (None, 0),
+    ])
+    def test_it_counts_devices_not_their_ids(self, gres, expected):
+        from nodetop.backends.slurm import _gres_gpus
+
+        assert _gres_gpus(gres) == expected
+
+    def test_a_node_reporting_socket_affinity_still_has_its_accelerators(self):
+        # This cluster does not print the suffix on nodes, so the node-level
+        # half of the bug was latent -- and it would have made every GPU node
+        # on a cluster that does print it look like a CPU node.
+        backend = SlurmBackend(RecordedRunner({
+            "scontrol show node": (
+                0, "NodeName=g1 CPUTot=48 CPUAlloc=0 RealMemory=1000 AllocMem=0 "
+                   "State=IDLE Gres=gpu:v100:4(S:0-1) Partitions=p\n", ""),
+        }))
+        node = backend.load_nodes()[0]
+        assert node.gpus_total == 4
+        assert node.is_gpu_node is True
+
+    def test_a_jobs_share_of_the_accelerators_is_the_count(self):
+        backend = SlurmBackend(RecordedRunner({}))
+        got = {(a.job, a.node): a for a in backend.parse_allocations(
+            "JobId=1 JobName=x\n"
+            "     Nodes=n1 CPU_IDs=0-15 Mem=60960 GRES=gpu:2(IDX:0,3)\n"
+            "JobId=2 JobName=y\n"
+            "     Nodes=n1 CPU_IDs=32-39 Mem=16384 GRES=gpu:1(IDX:2)\n")}
+        assert got[("1", "n1")].gpus == 2
+        assert got[("2", "n1")].gpus == 1
+
+    def test_the_shares_of_one_node_sum_to_what_it_holds(self):
+        # The invariant that would have caught this at once: 0 + 2 + 1 = 3 on a
+        # node reporting all four of its accelerators allocated.
+        backend = SlurmBackend(RecordedRunner({}))
+        shares = [a for a in backend.parse_allocations(
+            "JobId=1 JobName=x\n"
+            "     Nodes=n1 CPU_IDs=0-15 Mem=1 GRES=gpu:2(IDX:0,3)\n"
+            "JobId=2 JobName=y\n"
+            "     Nodes=n1 CPU_IDs=32-39 Mem=1 GRES=gpu:1(IDX:2)\n"
+            "JobId=3 JobName=z\n"
+            "     Nodes=n1 CPU_IDs=1 Mem=1 GRES=gpu:1(IDX:1)\n")
+            if a.node == "n1"]
+        assert sum(a.gpus for a in shares) == 4
+
+
+class TestPerNodeShares:
+    """`scontrol show job -d` is the only source for a job's share of a node.
+
+    A job list reports totals over every node held, so a 42-node job read as
+    512 cores on a 48-core machine.
+    """
+
+    DUMP = """JobId=53272514 JobName=_interactive
+   NumNodes=42 NumCPUs=512
+   JOB_GRES=(null)
+     Nodes=midway3-0002 CPU_IDs=33,35,37,39 Mem=4096 GRES=
+     Nodes=midway3-0114 CPU_IDs=41-47 Mem=7168 GRES=
+JobId=54465084 ArrayJobId=54462542 ArrayTaskId=65 JobName=ffgs
+   NumNodes=1 NumCPUs=1
+     Nodes=midway3-0500 CPU_IDs=3 Mem=28672 GRES=gpu:1(IDX:1)
+JobId=54480000 ArrayJobId=54480000 ArrayTaskId=1-20%10 JobName=pending-array
+     Nodes=midway3-[0521-0522] CPU_IDs=78-94 Mem=29750 GRES=gpu:2
+"""
+
+    def _by_key(self):
+        backend = SlurmBackend(RecordedRunner({}))
+        return {(a.job, a.node): a for a in backend.parse_allocations(self.DUMP)}
+
+    def test_a_range_of_core_ids_is_counted_not_read(self):
+        # `CPU_IDs=41-47` is seven cores, not the number 41.
+        got = self._by_key()[("53272514", "midway3-0114")]
+        assert (got.cpus, got.memory_mb) == (7, 7168)
+
+    def test_a_comma_list_is_counted_too(self):
+        assert self._by_key()[("53272514", "midway3-0002")].cpus == 4
+
+    def test_an_array_task_is_registered_under_squeues_spelling(self):
+        # `squeue` says `54462542_65`; `scontrol` says JobId=54465084 with the
+        # array recorded separately. 1864 of 2928 jobs on the reference cluster
+        # are array tasks, so keying on JobId alone found a share for none.
+        keys = self._by_key()
+        assert ("54462542_65", "midway3-0500") in keys
+        assert ("54465084", "midway3-0500") in keys
+
+    def test_a_pending_array_range_is_not_mistaken_for_a_task(self):
+        keys = self._by_key()
+        assert not any(k[0].startswith("54480000_") for k in keys)
+
+    def test_a_collapsed_nodelist_applies_to_every_node_in_it(self):
+        # Slurm collapses consecutive nodes that got the same shape.
+        keys = self._by_key()
+        for node in ("midway3-0521", "midway3-0522"):
+            assert keys[("54480000", node)].cpus == 17, node
+
+    def test_gres_becomes_an_accelerator_count(self):
+        assert self._by_key()[("54462542_65", "midway3-0500")].gpus == 1
+        assert self._by_key()[("54480000", "midway3-0521")].gpus == 2
+
+    def test_the_whole_cluster_is_one_call(self):
+        # 0.6s for 2928 jobs against 0.13s for one: asking about five jobs
+        # already pays for asking about all of them, and a node with 49 tasks
+        # would otherwise stall an interactive repaint for six seconds.
+        backend = SlurmBackend(RecordedRunner({
+            "scontrol show job -d": (0, self.DUMP, ""),
+        }))
+        assert backend.load_allocations()
+        assert len(backend.runner.calls) == 1
+
+
 class TestPartitions:
     def _queues(self, slurm_backend):
         return {q.name: q for q in slurm_backend.load_queues()}

@@ -42,6 +42,7 @@ from ..render import sanitize
 from .hardware import AcceleratorSpec, supports
 
 __all__ = [
+    "Allocation",
     "BackendCapabilities",
     "Blocker",
     "Identity",
@@ -184,6 +185,13 @@ class Node:
     #: Scheduling restrictions the node imposes (k8s taints, and any
     #: equivalent).  A job must tolerate these to land here.
     taints: tuple[str, ...] = ()
+    #: Whether the scheduler treats memory as a consumable resource here, so
+    #: that a node with none unallocated can host nothing.  True everywhere
+    #: except a Slurm cluster configured without `_MEMORY` in
+    #: `SelectTypeParameters`, where `memory_alloc_mb` records what jobs asked
+    #: for rather than a ceiling the scheduler enforces.  See
+    #: :attr:`memory_exhausted`.
+    memory_consumable: bool = True
 
     def __post_init__(self) -> None:
         # Scheduler-supplied free text, scrubbed of control characters once, at
@@ -249,6 +257,63 @@ class Node:
     def memory_free_mb(self) -> int:
         """Memory the scheduler considers unallocated (not the OS's free RAM)."""
         return max(0, self.memory_mb - self.memory_alloc_mb)
+
+    @property
+    def memory_exhausted(self) -> bool:
+        """Every byte the scheduler can hand out here is already handed out.
+
+        A node in this state can start nothing, however many cores are idle.
+        Slurm allocates memory to every job -- ``DefMemPerCPU`` if the site
+        sets one, the whole node if it does not -- so there is no such thing
+        as a job that needs cores and no memory.  Measured on the cluster this
+        was written against: ``caslake`` advertised **2322 free cores** across
+        190 nodes, of which 2035 sat on 47 nodes whose memory was fully
+        allocated to a handful of small jobs.  A four-core job sent at the
+        biggest number on the screen would pend indefinitely.
+
+        ``memory_mb <= 0`` means the backend does not report memory at all,
+        which is not the same as reporting none: the answer there is "cannot
+        tell", so the constraint is not applied.  Claiming less about capacity
+        is the bias everywhere in this file, but inventing a shortage on a
+        system that never mentioned memory would be its own kind of lie.
+
+        :attr:`memory_consumable` is the same distinction one level up: a
+        scheduler that does not account for memory when it places work has an
+        ``AllocMem`` that is a record of requests, not a ceiling, and reading
+        it as one would report a whole cluster as full.
+        """
+        return (self.memory_consumable and self.memory_mb > 0
+                and self.memory_free_mb <= 0)
+
+    @property
+    def effective_free_cpus(self) -> int:
+        """Free cores that still have memory behind them.
+
+        The counterpart of :attr:`Queue.effective_free_cpus` one level down,
+        and for the same reason: a count that cannot be acted on does not
+        belong in an answer to "where is there room".
+        """
+        return 0 if self.memory_exhausted else self.cpus_free
+
+    @property
+    def effective_free_gpus(self) -> int:
+        """Free accelerators that still have memory behind them.
+
+        A GPU job needs host memory too, so an accelerator on a node with
+        none allocatable is as unreachable as an idle core there.
+        """
+        return 0 if self.memory_exhausted else self.gpus_free
+
+    @property
+    def has_room(self) -> bool:
+        """Something here could actually be allocated right now.
+
+        The predicate every "with room" count and every ``--free`` filter
+        shares, so they cannot drift apart -- and so that adding a reason a
+        node is unreachable is one edit rather than six.
+        """
+        return self.schedulable and bool(self.effective_free_cpus
+                                         or self.effective_free_gpus)
 
     @property
     def idle(self) -> bool:
@@ -409,6 +474,33 @@ class Job:
 
     def __str__(self) -> str:  # pragma: no cover - cosmetic
         return f"{self.id} {self.user} on {len(self.nodes)} node(s)"
+
+
+@dataclass
+class Allocation:
+    """One job's share of ONE node, as the scheduler actually assigned it.
+
+    A job list reports totals over every node a job holds, and in a per-node
+    view that is not merely imprecise -- it is a number the reader knows to be
+    impossible.  A 42-node job appeared as **512 cores on a 48-core machine**,
+    with a `x42` marker nobody could decode: "the cpu column doesn't make any
+    sense.  what do the column entries mean?"  Its actual share of that node
+    was seven cores and seven gigabytes.
+
+    Only the scheduler knows the split -- a job need not be allocated uniformly
+    -- so this is fetched rather than derived.  Dividing the total by the node
+    count would be a guess dressed as a fact.
+    """
+
+    job: str
+    node: str
+    cpus: int = 0
+    memory_mb: int = 0
+    gpus: int = 0
+
+    def __post_init__(self) -> None:
+        self.job = sanitize(self.job)
+        self.node = sanitize(self.node)
 
 
 # ---------------------------------------------------------------------------
@@ -601,8 +693,18 @@ class Queue:
         The plain count stays available via ``len(q.idle_nodes)``; this is
         what any summary should show, so a dead queue never advertises
         phantom capacity.
+
+        :attr:`Node.idle` means "nothing is running here", which is not the
+        same as "something could".  A node with every core free and all of its
+        memory allocated is idle and unusable at once -- reachable on
+        Kubernetes, where a pod may request memory with no CPU request at all,
+        so the node reports zero allocated CPU and no allocatable memory.  It
+        would have been counted here, in the one column that claims a node is
+        wholly free.
         """
-        return len(self.idle_nodes) if self.usable else 0
+        if not self.usable:
+            return 0
+        return sum(1 for n in self.idle_nodes if n.has_room)
 
     @property
     def effective_free_cpus(self) -> int:
@@ -628,12 +730,20 @@ class Queue:
         A node is not the unit of room; a core is. ``cmd_nodes`` already
         meters ``cpus_free / cpus_total`` per node -- this is the same
         arithmetic, one level up.
+
+        Cores on a node whose memory is fully allocated are not counted; see
+        :attr:`Node.memory_exhausted` for why, and for what it was worth on a
+        real cluster.
         """
-        return self.cpus_free if self.usable else 0
+        if not self.usable:
+            return 0
+        return sum(n.effective_free_cpus for n in self.schedulable_nodes)
 
     @property
     def effective_free_gpus(self) -> int:
-        return self.gpus_free if self.usable else 0
+        if not self.usable:
+            return 0
+        return sum(n.effective_free_gpus for n in self.schedulable_nodes)
 
     #: An allowlist no wider than this is treated as a group's own hardware.
     #: Two rather than one because a PI partition routinely names the group
