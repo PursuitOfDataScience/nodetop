@@ -1194,6 +1194,45 @@ existence, whose parts are 128 GB: `where -g 6 --gpu-mem 64` ruled out all 10,62
 `PVC` is the codename both SKUs share, so it now carries the same "at least" uncertainty a
 bare `A100` does.
 
+A fourth and fifth Slurm cluster -- 24.11 and 25.11, at a site that runs both --
+produced the first outright *crash* and the first case of a report that was
+honest and still useless.
+
+**`nodetop check` died with `AttributeError: 'NoneType' object has no attribute
+'lower'`.** It took two conditions at once, and no cluster before had both: a
+caller with NO accounts, and a queue naming specific ones. `None` is the
+sentinel for "probe without naming an account", which is exactly what a caller
+holds on a cluster that enforces associations and has no association row for
+them -- and it was being fed to the pass that narrows accounts against a
+queue's allowlist. Four clusters had all given the caller at least one account,
+so the sentinel had never met an allowlist.
+
+**And nothing said why.** That same cluster refuses every submission from this
+caller, because `AccountingStorageEnforce=associations` and `sacctmgr show
+assoc` returns nothing for them. Six partitions: four came back
+ACCOUNT_MISMATCH, two were refused by a site `job_submit` plugin -- and the
+overview reported "2 open to you (2 unconfirmed)" over a table of free GPUs,
+never naming the cause the control plane had already given twice. An empty
+account list is two different facts, and only the cluster's own config tells
+them apart: without enforcement it means "this site does not use accounts", and
+with it, "nothing you submit will run". The overview now says the second one in
+four words, and `Identity.accounts_required` carries the distinction rather
+than leaving every reader to infer it.
+
+The site plugin's own sentence was being thrown away too. `sbatch` printed both
+layers::
+
+    sbatch: error: Job submission rejected: Batch jobs cannot use the
+        `interactive_*` partitions.
+    allocation failure: Unspecified error
+
+and the parser kept the second -- so two partitions were filed under `UNKNOWN:
+Unspecified error` while the cluster had explained itself in one line. The
+plugin channel is now read, preferred as the reason, and fed to the classifier
+alongside the other two layers; `check` prints what the control plane said
+under an `unanswered` heading, because a category is a bucket and the sentence
+is the answer.
+
 Two smaller lessons, same root:
 
 * **Ask both lists at the same visibility.** Partitions were fetched with `--all` and nodes
@@ -1552,6 +1591,16 @@ Four honesty rules are enforced in code rather than left to the reader:
   format-faithful fixtures, which predicts that they will not crash, not that the numbers
   are right. Every live cluster so far has produced defects a green suite could not — see
   §7.
+- **A RESERVED node is assumed to be someone else's.** Slurm says a node is in a
+  reservation but not whether *you* may use it, so nodetop treats the state as
+  blocking -- the conservative direction, and wrong on a site whose reservations
+  are `MAGNETIC` with an open ACL. Measured on one such cluster: three nodes and
+  up to 12 of 168 accelerators sat outside the reported total while being
+  usable. Reading `scontrol show reservation` and evaluating its ACL (including
+  the negated `Accounts=-a,-b` form) against the caller would settle it; until
+  that is verified against a live reservation the caller can actually enter,
+  `health` names the state so the reader can check with `scontrol show
+  reservation` themselves.
 - **`health` only finds impairment somebody wrote down.** It keyword-matches the reason
   field, so a node throttled with no reason recorded is invisible from a login node. That
   needs per-node telemetry, which is a different tool's job.

@@ -347,6 +347,7 @@ class SlurmBackend:
 
     def __init__(self, runner: Runner | None = None) -> None:
         self.runner = runner or SubprocessRunner()
+        self._config_cache: str | None = None
 
     @classmethod
     def detect(cls) -> bool:
@@ -448,6 +449,22 @@ class SlurmBackend:
             return nodes
         return [dataclasses.replace(n, memory_consumable=False) for n in nodes]
 
+    def _config(self) -> str | None:
+        """``scontrol show config``, fetched at most once, ``None`` if it failed.
+
+        Cached because two questions are answered from it -- whether memory is
+        consumable, and whether this cluster refuses a caller with no
+        association -- and asking twice would put two instants in one report.
+        The failure is cached too, so a controller that cannot answer is asked
+        once rather than once per consumer.
+        """
+        if self._config_cache is None:
+            try:
+                self._config_cache = self.runner.run(["scontrol", "show", "config"])
+            except Exception:
+                self._config_cache = ""
+        return self._config_cache or None
+
     def memory_is_consumable(self) -> bool:
         """Whether this cluster accounts for memory when it places work.
 
@@ -469,9 +486,8 @@ class SlurmBackend:
         everywhere else here, and the alternative is recommending a node the
         scheduler will refuse.
         """
-        try:
-            out = self.runner.run(["scontrol", "show", "config"])
-        except Exception:
+        out = self._config()
+        if out is None:
             return True
         for line in out.splitlines():
             if "SelectTypeParameters" in line:
@@ -592,6 +608,16 @@ class SlurmBackend:
                 defaults.add(default_field)
         return Identity.from_account_queues(
             user, account_queues, qos, _unix_groups(user),
+            # Whether an empty account list is a fact about the site or about
+            # the caller. `AccountingStorageEnforce=associations` means Slurm
+            # refuses a submission from a user with no association row, so an
+            # empty list there is not "this cluster does not use accounts" --
+            # it is "nothing you submit will run". Read from the config query
+            # `memory_is_consumable` already makes, so it costs nothing.
+            accounts_required=(
+                "associations" in (self._config() or "")
+                .partition("AccountingStorageEnforce")[2].partition("\n")[0].lower()
+            ),
             # One default across every association, or none: two accounts whose
             # jobs run under different ceilings have no single answer, and
             # picking one of them would invent a limit for the other.
@@ -872,6 +898,22 @@ _ALLOC_FAIL = re.compile(r"allocation failure:\s*(?P<msg>.+?)\s*$", re.IGNORECAS
 _SUBMIT_FAIL = re.compile(
     r"Batch job submission failed:\s*(?P<msg>.+?)\s*$", re.IGNORECASE | re.MULTILINE
 )
+#: A site `job_submit` plugin's own sentence, as Slurm renders its `err_msg`.
+#:
+#: This is the most specific thing sbatch prints, and the core line beside it is
+#: generic by construction -- the plugin is *why* the submission failed, so
+#: Slurm has nothing of its own to report. Observed on a Slurm 24.11 cluster::
+#:
+#:     sbatch: error: Job submission rejected: Batch jobs cannot use the
+#:         `interactive_*` partitions.
+#:     allocation failure: Unspecified error
+#:
+#: Reading only the core line gave `UNKNOWN: Unspecified error` for two of six
+#: partitions -- the tool discarding the one sentence that explained the
+#: refusal, on a cluster where it was the whole answer.
+_PLUGIN_REJECT = re.compile(
+    r"Job submission rejected:\s*(?P<msg>.+?)\s*$", re.IGNORECASE | re.MULTILINE
+)
 _QOS_FLAG = re.compile(r"QOS-Flag:\s*(?P<qos>\S+)", re.IGNORECASE)
 _ACCOUNT = re.compile(r"^\s*Account:\s*(?P<acct>\S+)", re.IGNORECASE | re.MULTILINE)
 
@@ -914,6 +956,8 @@ def parse_probe(
     acct = _ACCOUNT.search(clean)
     core_fail = _ALLOC_FAIL.search(clean) or _SUBMIT_FAIL.search(clean)
     core_msg = core_fail.group("msg").strip() if core_fail else ""
+    plugin = _PLUGIN_REJECT.search(clean)
+    plugin_msg = plugin.group("msg").strip() if plugin else ""
     rm = _REASON.search(clean)
     filter_reason = rm.group("reason").strip() if rm else ""
     # The other two facts are read from the line the start verdict is on, not
@@ -946,13 +990,15 @@ def parse_probe(
     }
 
     # Slurm core's refusal outranks a site plugin's PASSED.
-    if filter_verdict == "REJECTED" or core_msg:
-        reason = filter_reason or core_msg
+    if filter_verdict == "REJECTED" or core_msg or plugin_msg:
+        reason = filter_reason or plugin_msg or core_msg
         if filter_verdict == "PASSED" and core_msg:
             reason = f"{core_msg} (site submit filter reported PASSED)"
         return Verdict(
             allowed=False,
-            category=classify(f"{filter_reason} {core_msg}"),
+            # All three layers, because the recognisable phrase can be in any
+            # of them and the generic one is usually not it.
+            category=classify(f"{filter_reason} {plugin_msg} {core_msg}"),
             reason=reason,
             **common,
         )

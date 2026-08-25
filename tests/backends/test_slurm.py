@@ -667,6 +667,59 @@ class TestIdentityQuery:
         assert ident.accounts == ("acct-a",)
 
 
+class TestAnEmptyAccountListIsTwoDifferentFacts:
+    """"This site does not use accounts" and "you have none" look identical.
+
+    `AccountingStorageEnforce=associations` means Slurm refuses a submission
+    from a caller with no association row, so an empty list on such a cluster is
+    not a shrug -- it is the reason nothing will run. Observed on a Slurm 24.11
+    cluster where `sacctmgr show assoc` returned nothing for the caller: four
+    partitions came back ACCOUNT_MISMATCH, two were refused by a site plugin,
+    and the overview said "2 open to you (2 unconfirmed)" without naming the
+    cause the control plane had already given.
+    """
+
+    ENFORCED = "AccountingStorageEnforce = associations,limits,qos\n"
+
+    def _identity(self, config, assoc=""):
+        return SlurmBackend(RecordedRunner({
+            "sacctmgr": (0, assoc, ""),
+            "scontrol show config": (0, config, ""),
+        })).load_identity()
+
+    def test_enforced_associations_are_recorded(self):
+        ident = self._identity(self.ENFORCED)
+        assert ident.accounts == ()
+        assert ident.accounts_required is True
+
+    @pytest.mark.parametrize("config", [
+        "AccountingStorageEnforce = (null)\n",
+        "AccountingStorageEnforce = limits,qos\n",     # enforced, but not this
+        "ClusterName = x\n",                           # field absent
+    ])
+    def test_anything_else_claims_nothing(self, config):
+        assert self._identity(config).accounts_required is False
+
+    def test_an_unreadable_config_claims_nothing(self):
+        # The conservative direction here is silence: asserting "nothing you
+        # submit will run" from a failed query would be a fabrication.
+        backend = SlurmBackend(RecordedRunner({"sacctmgr": (0, "", "")}))
+        assert backend.load_identity().accounts_required is False
+
+    def test_the_config_is_read_once_for_both_consumers(self):
+        # Memory-consumability asks the same query. Two readings of one file is
+        # two instants in one report, which is what the caching is for.
+        backend = SlurmBackend(RecordedRunner({
+            "sacctmgr": (0, "", ""),
+            "scontrol show config": (0, self.ENFORCED + "SelectTypeParameters = CR_CORE\n", ""),
+            "scontrol show node": (0, "NodeName=n1 CPUTot=8 State=IDLE Partitions=p\n", ""),
+        }))
+        backend.load_identity()
+        backend.load_nodes()
+        asked = [c for c in backend.runner.calls if "config" in " ".join(c)]
+        assert len(asked) == 1, asked
+
+
 class TestLocalGroupLookupIsAllOrNothing:
     """A half-collected group list is worse than none at all.
 

@@ -932,6 +932,12 @@ class Identity:
     #: an access fact like the fields above it: it says which *ceilings* apply,
     #: which is why :meth:`Cluster.limits_for` reaches for it.
     default_qos: str | None = None
+    #: True where this system refuses a submission from a caller who holds no
+    #: account at all -- Slurm's ``AccountingStorageEnforce=associations``, and
+    #: the equivalent elsewhere.  Only meaningful beside an empty
+    #: :attr:`accounts`, and then it is the difference between "this site does
+    #: not use accounts" and "you have none and nothing you submit will run".
+    accounts_required: bool = False
     #: account -> queues the scheduler associates with it.
     account_queues: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
     #: True when every account claims an identical queue list -- a strong hint
@@ -958,6 +964,7 @@ class Identity:
         qos: Iterable[str] = (),
         groups: Iterable[str] = (),
         default_qos: str | None = None,
+        accounts_required: bool = False,
     ) -> Identity:
         """Build an identity and run the templated-entitlements check."""
         lists = [frozenset(v) for v in account_queues.values() if v]
@@ -967,6 +974,7 @@ class Identity:
             qos=tuple(sorted(set(qos))),
             groups=tuple(sorted(set(groups))),
             default_qos=default_qos,
+            accounts_required=accounts_required,
             account_queues={k: tuple(sorted(v)) for k, v in account_queues.items()},
             entitlements_look_templated=len(lists) > 1 and len(set(lists)) == 1,
         )

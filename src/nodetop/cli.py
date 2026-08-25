@@ -1405,6 +1405,23 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             "DECLARED ONLY  allowlists over-report; drop --declared to dry-run"
         ))
 
+    # The one fact that outranks every number above it. A cluster that enforces
+    # associations refuses a submission from a caller who holds no account, so
+    # an empty account list there is not "this site does not use accounts" but
+    # "nothing you submit will run". Observed on a Slurm 24.11 cluster: six
+    # partitions, four refused outright and two refused by a site plugin, and
+    # the report said "2 open to you (2 unconfirmed)" without ever naming the
+    # cause the control plane had already given.
+    if ident is not None and ident.accounts_required and not ident.accounts:
+        body.append("")
+        body.append(
+            # Short, like the two warnings below it: the panel truncates rather
+            # than wraps, and the first casualty of a long line is the
+            # consequence at the end of it.
+            st.bad("NO ASSOCIATION")
+            + st.dim("  nothing you submit will run: you hold no account here")
+        )
+
     if (ident is not None and ident.entitlements_look_templated
             and args.declared):
         # Suppressed under --check, where it is moot: the point of that flag is
@@ -3070,6 +3087,24 @@ def cmd_check(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             "them anyway. Reading only the filter's verdict gives the opposite of "
             "the truth.", st))
         print(tree([(st.bad(r.queue), r.reason) for r in disagree], st))
+
+    # A category is a bucket, and for an unanswered probe the bucket is
+    # `UNKNOWN`, which tells the reader nothing they did not already know. What
+    # the control plane actually said is the answer: on a Slurm 24.11 cluster
+    # two of six partitions came back UNKNOWN because a site `job_submit`
+    # plugin refused with "Batch jobs cannot use the `interactive_*`
+    # partitions" -- a complete explanation, reported as a shrug. Shown only
+    # here, and only where the text adds something the CATEGORY column did not,
+    # because a refusal that already names itself does not need saying twice.
+    said = [
+        results[q] for q in sorted(results)
+        if not results[q].allowed and not results[q].durable
+        and results[q].reason and q not in disagreements
+    ]
+    if said:
+        print()
+        print(section("unanswered", st, "what the control plane said"))
+        print(tree([(st.warn(r.queue), r.reason) for r in said], st))
     if not results:
         print()
         print(st.warn(wrap_indent(

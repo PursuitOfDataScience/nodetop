@@ -131,6 +131,61 @@ class TestEmptyClusterIsTreatedAsAFinding:
         assert "no queue can run this shape" in out
 
 
+class TestNoAssociationIsSaidOutLoud:
+    """The one fact that outranks every number on the overview.
+
+    A cluster enforcing associations refuses a submission from a caller with no
+    account, so the numbers above are about hardware the reader cannot touch.
+    Observed on a Slurm 24.11 cluster: six partitions, four refused outright,
+    two refused by a site plugin, and the overview said "2 open to you
+    (2 unconfirmed)" while never naming the cause.
+    """
+
+    def _run_status(self, ident):
+        cluster = _cluster([_node("n1")], [Queue(name="q", node_names=("n1",))])
+        cluster.identity = ident
+        return _run(cluster, ["status"])[1]
+
+    def test_it_is_stated_when_the_cluster_enforces_accounts(self):
+        out = " ".join(self._run_status(
+            Identity(user="u", accounts=(), accounts_required=True)).split())
+        assert "NO ASSOCIATION" in out
+        assert "nothing you submit will run" in out
+
+    def test_silence_where_the_site_simply_does_not_use_accounts(self):
+        # An empty list with no enforcement is not a finding, and saying it
+        # anyway would put a false alarm on every such cluster.
+        out = self._run_status(Identity(user="u", accounts=()))
+        assert "NO ASSOCIATION" not in out
+
+    def test_silence_when_the_caller_holds_one(self):
+        out = self._run_status(
+            Identity(user="u", accounts=("mine",), accounts_required=True))
+        assert "NO ASSOCIATION" not in out
+
+    @pytest.mark.parametrize("size", [80, 100, 200])
+    def test_the_whole_sentence_survives_a_narrow_window(self, monkeypatch, size):
+        # The panel truncates rather than wraps, and the first casualty of a
+        # long line is the consequence at the end of it. 80 is the floor here
+        # because that is where the neighbouring `DECLARED ONLY` warning also
+        # fits whole -- below it every warning in this panel is cut.
+        monkeypatch.setenv("COLUMNS", str(size))
+        line = [x for x in self._run_status(
+            Identity(user="u", accounts=(), accounts_required=True)).splitlines()
+            if "NO ASSOCIATION" in x]
+        assert line, f"missing at {size}"
+        assert "\u2026" not in line[0], f"truncated at {size}: {line[0]}"
+
+    def test_the_tag_survives_even_where_the_sentence_cannot(self, monkeypatch):
+        # At the narrowest supported window the sentence is cut, as every
+        # warning in this panel is. The TAG has to outlive the cut, or the
+        # finding disappears entirely on a small terminal.
+        monkeypatch.setenv("COLUMNS", str(MIN_WIDTH))
+        out = self._run_status(
+            Identity(user="u", accounts=(), accounts_required=True))
+        assert "NO ASSOCIATION" in out
+
+
 class TestGpusYouCannotReachAreNotAbsentGpus:
     """"None" and "none for you" are different answers, and one is a lie.
 
