@@ -147,3 +147,38 @@ class TestSupports:
 
     def test_unrecognised_requirement(self):
         assert supports(ACCELERATORS["H100"], "quantum") is None
+
+
+class TestACodenameIsNotASku:
+    """`PVC` names two parts, 48 GB and 128 GB, and a scheduler hands over both.
+
+    A 10,624-node PBS Pro cluster advertises `resources_available.gputype = PVC`
+    and nothing else, where the hardware is the 128 GB Max 1550. The bare
+    codename used to alias straight to the 1100, so nodetop named a SKU it had
+    no evidence for and reported its 48 GB as certain -- and `where -g 6
+    --gpu-mem 64` then ruled out every node on a machine whose every GPU has
+    128. Same shape as a bare `A100` standing for 40 or 80.
+    """
+
+    def test_the_bare_codename_claims_no_sku(self):
+        spec = identify_accelerator(None, "gputype=PVC")
+        assert spec is not None
+        assert spec.model == "PVC"
+        assert spec.memory_certain is False
+        assert spec.memory_variants == (48, 128)
+        # The conservative variant, per the module's stated rule: a needless
+        # warning beats an OOM ninety minutes in.
+        assert spec.memory_gb == 48
+
+    def test_an_explicit_part_still_pins_it(self):
+        assert identify_accelerator(None, "gputype=max1550").model == "PVC1550"
+        assert identify_accelerator(None, "gputype=max1550").memory_gb == 128
+        assert identify_accelerator(None, "gputype=max1100").model == "PVC1100"
+        assert identify_accelerator(None, "gpu_model=Intel-Data-Center-GPU-Max-1550"
+                                    ).memory_gb == 128
+
+    def test_it_is_still_an_intel_xe_hpc_part(self):
+        spec = identify_accelerator(None, "gputype=pvc")
+        assert (spec.vendor, spec.arch) == ("Intel", "Xe-HPC")
+        assert spec.bf16 is True and spec.fp8 is False
+        assert spec.cuda is False

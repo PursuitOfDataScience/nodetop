@@ -134,8 +134,19 @@ _SPECS: tuple[AcceleratorSpec, ...] = (
     AcceleratorSpec("MI325X", "AMD", "gfx942", 256, bf16=True, fp8=True,
                     flash_attention=True, aliases=("mi325", "mi325x")),
     # -- Intel --------------------------------------------------------------
+    # `PVC` is Ponte Vecchio, the codename BOTH parts share, so on its own it
+    # pins the model no more than a bare `A100` pins 40 GB against 80 -- and it
+    # is exactly what a scheduler hands over. A 10,624-node PBS Pro cluster
+    # advertises `resources_available.gputype = PVC` and nothing else, where the
+    # hardware is the 128 GB Max 1550; the bare codename used to alias to the
+    # 1100, so nodetop named a specific SKU it had no evidence for and called
+    # its 48 GB certain. `where -g 6 --gpu-mem 64` then ruled out every node on
+    # a machine whose every GPU has 128.
+    AcceleratorSpec("PVC", "Intel", "Xe-HPC", 48, memory_variants=(48, 128),
+                    memory_certain=False, bf16=True, fp8=False,
+                    aliases=("pvc", "pontevecchio")),
     AcceleratorSpec("PVC1100", "Intel", "Xe-HPC", 48, bf16=True, fp8=False,
-                    aliases=("pvc", "datacentergpumax1100", "max1100")),
+                    aliases=("datacentergpumax1100", "max1100")),
     AcceleratorSpec("PVC1550", "Intel", "Xe-HPC", 128, bf16=True, fp8=False,
                     aliases=("datacentergpumax1550", "max1550")),
     AcceleratorSpec("GAUDI2", "Intel", "Gaudi2", 96, bf16=True, fp8=True,

@@ -396,3 +396,148 @@ class TestWrappedAttributeValuesAreNotTruncated:
     def test_unwrapped_output_is_unaffected(self, pbs_backend):
         # The format in use must parse exactly as before the hardening.
         assert len(pbs_backend.load_nodes()) >= 1
+
+
+class TestExclusivePlacementIsNotFreeCapacity:
+    """PBS records whole-node exclusivity in the STATE, not in every resource.
+
+    Measured on a 10,624-node PBS Pro 2022.1 cluster: 10,194 nodes
+    `job-exclusive`, and not one node anywhere carried `ngpus` under
+    `resources_assigned` -- whole-node placement means the scheduler never has
+    to account for a GPU individually. `ncpus` happened to be assigned in full,
+    so the CPU figures were right and the accelerator figures were not: nodetop
+    announced **62,886 of 63,744 GPUs free** where 1,722 were. A 36x
+    overstatement on the axis people pick that machine for.
+
+    Cross-checked against a second PBS Pro site (2026.1, 24 nodes) whose jobs
+    DO share nodes and where every `ngpus` is accounted: there not one
+    `job-exclusive` node was partially assigned, so this rule changed nothing
+    and the free count still matched `available - assigned` exactly. It
+    corrects the site that omits the accounting without disturbing the site
+    that keeps it.
+    """
+
+    EXCLUSIVE = """{"nodes": {
+     "x1": {"state":"job-exclusive",
+            "resources_available":{"ncpus":208,"ngpus":6,"mem":"1000gb"},
+            "resources_assigned":{"ncpus":208}},
+     "x2": {"state":"free",
+            "resources_available":{"ncpus":208,"ngpus":6,"mem":"1000gb"},
+            "resources_assigned":{}}
+    }}"""
+
+    def _nodes(self, payload, cmd="pbsnodes -a -F json"):
+        backend = PbsBackend(RecordedRunner({cmd: (0, payload, "")}))
+        parse = (backend.parse_nodes_json if "json" in cmd
+                 else backend.parse_nodes_text)
+        return {n.name: n for n in parse(payload)}
+
+    def test_nothing_on_an_exclusive_node_is_free(self):
+        got = self._nodes(self.EXCLUSIVE)
+        held = got["x1"]
+        assert (held.gpus_free, held.cpus_free, held.memory_free_mb) == (0, 0, 0)
+        # And the neighbour is untouched, so this is not a blanket zeroing.
+        assert (got["x2"].gpus_free, got["x2"].cpus_free) == (6, 208)
+
+    def test_a_full_node_is_not_a_broken_one(self):
+        # Occupancy, not a condition. Calling it unschedulable would report 96%
+        # of that cluster as out of service and bury it in `health` -- trading
+        # one wrong answer for a louder one.
+        held = self._nodes(self.EXCLUSIVE)["x1"]
+        assert held.schedulable is True
+        assert held.conditions == frozenset()
+        assert held.degraded is False
+
+    def test_the_classic_text_format_gets_the_same_rule(self):
+        # Torque and PBS before 18 speak only this one.
+        text = ("x1\n     state = job-exclusive\n"
+                "     resources_available.ncpus = 208\n"
+                "     resources_available.ngpus = 6\n"
+                "     resources_assigned.ncpus = 208\n")
+        held = self._nodes(text, cmd="pbsnodes -a")["x1"]
+        assert (held.gpus_free, held.cpus_free) == (0, 0)
+        assert held.schedulable is True
+
+    def test_a_state_set_carrying_it_still_blocks_on_the_other_word(self):
+        # `offline,job-exclusive` is real output: full AND drained.
+        payload = self.EXCLUSIVE.replace('"job-exclusive"', '"offline,job-exclusive"')
+        held = self._nodes(payload)["x1"]
+        assert held.schedulable is False
+        assert held.gpus_free == 0
+
+
+class TestQueueAttributesAreFetchedOnce:
+    """Two spellings of one query is two instants in one report -- and 38s.
+
+    `load_queues` asked for `qstat -Qf -F json` while `load_limits` asked for
+    the plain `qstat -Qf`, so the same 37 KB of queue attributes came back
+    twice. On the 10,624-node cluster that was 23.9s + 14.9s of a 65s run.
+    """
+
+    JSON = """{"Queue": {"workq": {"queue_type":"Execution","enabled":"True",
+        "started":"True","resources_max":{"walltime":"24:00:00","nodect":"16"}}}}"""
+    TEXT = ("Queue: workq\n    queue_type = Execution\n    enabled = True\n"
+            "    started = True\n    resources_max.walltime = 24:00:00\n"
+            "    resources_max.nodect = 16\n")
+
+    def _backend(self, *, json_ok=True):
+        responses = {"pbsnodes -a -F json": (0, '{"nodes": {}}', "")}
+        responses["qstat -Qf -F json"] = ((0, self.JSON, "") if json_ok
+                                          else (1, "", "unknown option"))
+        responses["qstat -Qf"] = (0, self.TEXT, "")
+        return PbsBackend(RecordedRunner(responses))
+
+    def test_one_query_serves_queues_and_limits(self):
+        backend = self._backend()
+        backend.load_queues()
+        limits = backend.load_limits()
+        asked = [c for c in backend.runner.calls if c[:2] == ["qstat", "-Qf"]]
+        assert len(asked) == 1, asked
+        # And the ceilings still arrive, from the payload already in hand.
+        assert limits["workq"].max_walltime_seconds == 86400
+        assert limits["workq"].per_job["node"] == 16
+
+    def test_a_pbs_without_json_falls_back_and_still_asks_once(self):
+        # Torque has no JSON mode at all, and the failure is cached: asking
+        # every consumer to rediscover that costs a round trip each.
+        backend = self._backend(json_ok=False)
+        queues = backend.load_queues()
+        limits = backend.load_limits()
+        assert [q.name for q in queues] == ["workq"]
+        assert limits["workq"].max_walltime_seconds == 86400
+        assert len([c for c in backend.runner.calls if c == ["qstat", "-Qf"]]) == 1
+        assert len([c for c in backend.runner.calls
+                    if c == ["qstat", "-Qf", "-F", "json"]]) == 1
+
+
+class TestQueueMembershipStaysLinear:
+    """The membership rebuild was quadratic in the node count.
+
+    `set(members)` sat inside a generator's `if` clause, so it was rebuilt once
+    per node: 51 queues over 10,624 nodes took **151 seconds**, in a 3m10s run
+    whose scheduler queries accounted for 11s. The ceiling here is loose on
+    purpose -- it is not a benchmark, it is a guard against the shape coming
+    back, and the quadratic form needs minutes to do what this does in under a
+    second.
+    """
+
+    def test_five_thousand_nodes_across_thirty_queues(self):
+        import json as _json
+        import time
+
+        nodes = {f"n{i:05d}": {"state": "free",
+                               "resources_available": {"ncpus": 8}}
+                 for i in range(5000)}
+        queues = {f"q{i:02d}": {"queue_type": "Execution", "enabled": "True",
+                                "started": "True"} for i in range(30)}
+        backend = PbsBackend(RecordedRunner({
+            "pbsnodes -a -F json": (0, _json.dumps({"nodes": nodes}), ""),
+            "qstat -Qf -F json": (0, _json.dumps({"Queue": queues}), ""),
+        }))
+        start = time.time()
+        got = backend.load_queues()
+        elapsed = time.time() - start
+        assert elapsed < 10.0, f"{elapsed:.1f}s for 30 queues x 5000 nodes"
+        # Unrestricted nodes belong to every execution queue, which is the
+        # rule the slow version was implementing correctly and expensively.
+        assert all(q.declared_nodes == 5000 for q in got)

@@ -33,6 +33,34 @@ from .base import BackendCapabilities, count
 
 __all__ = ["PbsBackend"]
 
+#: Ceiling for the two whole-cluster enumerations, in place of the 30s
+#: default. Measured on a 10,624-node PBS Pro cluster: `pbsnodes -a -F json`
+#: returns 14 MB and took 9s on an idle server and 26s on a loaded one -- a 3x
+#: spread that puts the default within four seconds of expiring, and a timeout
+#: there is not a small delay but the whole node list gone, reported as "query
+#: failed: nodes" on a healthy cluster. Only these two queries are raised:
+#: everywhere else a slow answer is still evidence, which is what the default
+#: is for.
+_ENUMERATE_TIMEOUT = 90.0
+
+#: States meaning "a job holds the whole machine", where PBS records the
+#: exclusivity in the state and *not* in every resource.
+#:
+#: Measured on a 10,624-node PBS Pro 2022.1 cluster: 10,194 nodes
+#: `job-exclusive`, and not one node anywhere reported `ngpus` under
+#: `resources_assigned` -- because whole-node placement means the scheduler
+#: never has to account for a GPU individually. `ncpus` happened to be
+#: assigned in full, so the CPU figures were right and the accelerator figures
+#: were not: nodetop announced **62,886 of 63,744 GPUs free** on a machine
+#: whose true free count was 1,722. A 36x overstatement, on the one axis people
+#: pick that cluster for, from the tool written to find phantom capacity.
+#:
+#: Modelled as occupancy rather than as a condition on purpose. These nodes are
+#: healthy and working; they are not drained, and calling them unschedulable
+#: would report 96% of that cluster as out of service and hide it from `health`
+#: -- swapping one wrong answer for a louder one. Full is not broken.
+_WHOLLY_ALLOCATED = frozenset({"job-exclusive", "resv-exclusive"})
+
 #: PBS node states that mean "will not take new work".
 _STATE_TO_CONDITION = {
     "down": "DOWN",
@@ -102,6 +130,7 @@ class PbsBackend:
         self.runner = runner or SubprocessRunner()
         self._nodes: list[Node] | None = None
         self._queue_text_cache: str | None = None
+        self._queue_json_cache: str | None = None
 
     @classmethod
     def detect(cls) -> bool:
@@ -137,17 +166,24 @@ class PbsBackend:
                 "",
             )
             labels = [f"{k}={v}" for k, v in avail.items() if isinstance(v, str)]
+            # See _WHOLLY_ALLOCATED: exclusive placement is recorded in the
+            # state, and the unassigned resources behind it are not free.
+            whole = bool(_WHOLLY_ALLOCATED.intersection(states))
+            cpus_total = count(avail.get("ncpus"))
+            memory_mb = _mem_to_mb(avail.get("mem"))
+            gpus_total = count(avail.get("ngpus"))
             out.append(
                 Node(
                     name=name,
                     state_raw=str(n.get("state", "")),
                     conditions=frozenset(conditions),
-                    cpus_total=count(avail.get("ncpus")),
-                    cpus_alloc=count(used.get("ncpus")),
-                    memory_mb=_mem_to_mb(avail.get("mem")),
-                    memory_alloc_mb=_mem_to_mb(used.get("mem")),
-                    gpus_total=count(avail.get("ngpus")),
-                    gpus_alloc=count(used.get("ngpus")),
+                    cpus_total=cpus_total,
+                    cpus_alloc=cpus_total if whole else count(used.get("ncpus")),
+                    memory_mb=memory_mb,
+                    memory_alloc_mb=(
+                        memory_mb if whole else _mem_to_mb(used.get("mem"))),
+                    gpus_total=gpus_total,
+                    gpus_alloc=gpus_total if whole else count(used.get("ngpus")),
                     accelerator=identify_accelerator(None, model or labels),
                     labels=tuple(labels),
                     queues=tuple(
@@ -178,24 +214,35 @@ class PbsBackend:
                 "resources_available.gputype", ""
             )
             labels = [f"{k.split('.', 1)[-1]}={v}" for k, v in fields.items() if "." in k]
+            # Same rule as the JSON path, and it has to be in both: Torque and
+            # PBS before 18 speak only this one. See _WHOLLY_ALLOCATED.
+            whole = bool(_WHOLLY_ALLOCATED.intersection(states))
+            cpus_total = count(
+                fields.get("resources_available.ncpus")
+                or fields.get("pcpus")
+                or fields.get("np")
+            )
+            memory_mb = _mem_to_mb(fields.get("resources_available.mem"))
+            gpus_total = count(
+                fields.get("resources_available.ngpus") or fields.get("gpus")
+            )
             out.append(
                 Node(
                     name=name,
                     state_raw=fields.get("state", ""),
                     conditions=frozenset(conditions),
-                    cpus_total=count(
-                        fields.get("resources_available.ncpus")
-                        or fields.get("pcpus")
-                        or fields.get("np")
-                    ),
-                    cpus_alloc=count(fields.get("resources_assigned.ncpus")),
-                    memory_mb=_mem_to_mb(fields.get("resources_available.mem")),
-                    memory_alloc_mb=_mem_to_mb(fields.get("resources_assigned.mem")),
-                    gpus_total=count(
-                        fields.get("resources_available.ngpus")
-                        or fields.get("gpus")
-                    ),
-                    gpus_alloc=count(fields.get("resources_assigned.ngpus")),
+                    cpus_total=cpus_total,
+                    cpus_alloc=(
+                        cpus_total if whole
+                        else count(fields.get("resources_assigned.ncpus"))),
+                    memory_mb=memory_mb,
+                    memory_alloc_mb=(
+                        memory_mb if whole
+                        else _mem_to_mb(fields.get("resources_assigned.mem"))),
+                    gpus_total=gpus_total,
+                    gpus_alloc=(
+                        gpus_total if whole
+                        else count(fields.get("resources_assigned.ngpus"))),
                     accelerator=identify_accelerator(None, model or labels),
                     labels=tuple(labels),
                     queues=tuple(
@@ -233,19 +280,39 @@ class PbsBackend:
             return self._nodes
         try:
             nodes = self.parse_nodes_json(
-                self.runner.run(["pbsnodes", "-a", "-F", "json"])
+                self.runner.run(
+                    ["pbsnodes", "-a", "-F", "json"], timeout=_ENUMERATE_TIMEOUT)
             )
         except Exception:
             # Torque and PBS before 18 have no JSON mode at all.
-            nodes = self.parse_nodes_text(self.runner.run(["pbsnodes", "-a"]))
+            nodes = self.parse_nodes_text(
+                self.runner.run(["pbsnodes", "-a"], timeout=_ENUMERATE_TIMEOUT))
         self._nodes = nodes
         return nodes
 
     def _queue_text(self) -> str:
         """``qstat -Qf`` output, fetched once and reused for limits."""
         if self._queue_text_cache is None:
-            self._queue_text_cache = self.runner.run(["qstat", "-Qf"])
+            self._queue_text_cache = self.runner.run(
+                ["qstat", "-Qf"], timeout=_ENUMERATE_TIMEOUT)
         return self._queue_text_cache
+
+    def _queue_json(self) -> str | None:
+        """``qstat -Qf -F json`` output, fetched once; ``None`` where absent.
+
+        Cached including the failure, so a PBS without JSON mode (Torque, PBS
+        before 18) is asked exactly once rather than once per consumer. The
+        empty string is the "asked, unavailable" sentinel; `None` from this
+        method means the same thing to callers, which all fall back to the text
+        form.
+        """
+        if self._queue_json_cache is None:
+            try:
+                self._queue_json_cache = self.runner.run(
+                    ["qstat", "-Qf", "-F", "json"], timeout=_ENUMERATE_TIMEOUT)
+            except Exception:
+                self._queue_json_cache = ""
+        return self._queue_json_cache or None
 
     # -- queues -------------------------------------------------------------
     def parse_queues_json(self, text: str) -> list[Queue]:
@@ -305,10 +372,11 @@ class PbsBackend:
         )
 
     def load_queues(self) -> list[Queue]:
+        payload = self._queue_json()
         try:
-            queues = self.parse_queues_json(
-                self.runner.run(["qstat", "-Qf", "-F", "json"])
-            )
+            if payload is None:
+                raise ValueError("no JSON mode")
+            queues = self.parse_queues_json(payload)
         except Exception:
             queues = self.parse_queues_text(self._queue_text())
         # PBS does not list a queue's nodes; the mapping lives on the nodes'
@@ -320,28 +388,82 @@ class PbsBackend:
         # instead orphans every unrestricted node -- its capacity becomes
         # invisible to every queue -- and leaves a queue no node happens to
         # name looking genuinely empty, with nothing said about it.
+        # Sets, and built ONCE per queue. The membership test used to run
+        # against a list, and `set(members)` sat inside the generator's `if`
+        # clause -- so the set was rebuilt for every node, making this
+        # quadratic in the node count and cubic-ish overall. Measured on a
+        # 10,624-node PBS Pro cluster: 51 queues took **151 seconds**, out of a
+        # 3m10s run whose scheduler queries accounted for 11s of it. A tool you
+        # reach for while a cluster misbehaves cannot spend three minutes
+        # arriving. Same output, 0.2s.
         nodes = self.load_nodes()
-        unrestricted = [n.name for n in nodes if not n.queues]
+        unrestricted = {n.name for n in nodes if not n.queues}
         for q in queues:
             if q.routes:
                 # Its capacity belongs to the destinations, not to it.
                 q.node_names = ()
                 q.declared_nodes = 0
                 continue
-            named = [n.name for n in nodes if q.name in n.queues]
-            members = named + [n for n in unrestricted if n not in named]
-            q.node_names = tuple(n.name for n in nodes if n.name in set(members))
+            members = {n.name for n in nodes if q.name in n.queues} | unrestricted
+            q.node_names = tuple(n.name for n in nodes if n.name in members)
             q.declared_nodes = len(q.node_names)
         return queues
 
     # -- limits -------------------------------------------------------------
+    def _limits_from_fields(self, name: str, fields: dict[str, str]) -> Limits:
+        """One queue's ceilings, from its flat ``key.subkey = value`` map."""
+        per_job: dict[str, int] = {}
+        per_user: dict[str, int] = {}
+        for key, value in fields.items():
+            target = None
+            if key.startswith("max_run_res."):
+                target = per_user
+            elif key.startswith("resources_max."):
+                target = per_job
+            if target is None:
+                continue
+            resource = key.split(".", 1)[1]
+            got = _strip_pbs_limit(value)
+            if got is None:
+                continue
+            mapped = {"ngpus": "gpu", "ncpus": "cpu", "nodect": "node"}.get(resource)
+            if mapped:
+                target[mapped] = got
+        return Limits(
+            name=name,
+            max_walltime_seconds=_pbs_walltime(fields.get("resources_max.walltime")),
+            per_job=per_job,
+            per_user=per_user,
+            max_jobs=_int_or_none(fields.get("max_run")),
+            max_submitted=_int_or_none(fields.get("max_queued")),
+            source="pbs queue limits",
+        )
+
     def load_limits(self) -> dict[str, Limits]:
         # Raised, not turned into "no limits". PBS has no dry-run at all, so its
         # declared ceilings are the ONLY warning a caller gets before a job is
         # accepted and then pends forever -- and an empty dict is
         # indistinguishable from a cluster that declares none. Same rule as the
         # Slurm, LSF and Kubernetes backends; Cluster.load records it.
-        text = self._queue_text()
+        #
+        # The JSON payload is preferred because `load_queues` has usually
+        # fetched it already, and the two carry the same fields under the same
+        # names -- `_flat` gives the dotted keys the text form prints verbatim.
+        # Asking twice used to cost a whole extra query: on a 10,624-node PBS
+        # Pro cluster `qstat -Qf -F json` took 23.9s and the plain `qstat -Qf`
+        # another 14.9s, 38 seconds for the same 37 KB of queue attributes,
+        # fetched at two different instants -- which is also how one report
+        # comes to describe two moments.
+        payload = self._queue_json()
+        if payload is not None:
+            try:
+                return {
+                    name: self._limits_from_fields(
+                        name, {k: str(v) for k, v in _flat(q).items()})
+                    for name, q in (json.loads(payload).get("Queue") or {}).items()
+                }
+            except Exception:
+                pass  # malformed JSON: fall through to the text form below
         out: dict[str, Limits] = {}
         name: str | None = None
         fields: dict[str, str] = {}
@@ -349,34 +471,9 @@ class PbsBackend:
         def flush() -> None:
             if not name:
                 return
-            per_job: dict[str, int] = {}
-            per_user: dict[str, int] = {}
-            for key, value in fields.items():
-                target = None
-                if key.startswith("max_run_res."):
-                    target = per_user
-                elif key.startswith("resources_max."):
-                    target = per_job
-                if target is None:
-                    continue
-                resource = key.split(".", 1)[1]
-                got = _strip_pbs_limit(value)
-                if got is None:
-                    continue
-                mapped = {"ngpus": "gpu", "ncpus": "cpu", "nodect": "node"}.get(resource)
-                if mapped:
-                    target[mapped] = got
-            out[name] = Limits(
-                name=name,
-                max_walltime_seconds=_pbs_walltime(fields.get("resources_max.walltime")),
-                per_job=per_job,
-                per_user=per_user,
-                max_jobs=_int_or_none(fields.get("max_run")),
-                max_submitted=_int_or_none(fields.get("max_queued")),
-                source="pbs queue limits",
-            )
+            out[name] = self._limits_from_fields(name, fields)
 
-        for raw in _unwrap(text):
+        for raw in _unwrap(self._queue_text()):
             if raw.startswith("Queue:"):
                 flush()
                 name, fields = raw.split(":", 1)[1].strip(), {}

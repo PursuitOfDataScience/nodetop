@@ -1168,6 +1168,32 @@ informational condition -- it is the backfill scheduler's *plan*, not an outage 
 `POWERING_UP` is deliberately left schedulable, because that is the one powersave state
 Slurm does place work on.
 
+The same hour on two live PBS Pro clusters, one 10,624 nodes and one 24, produced the
+same class of finding and the worst single number yet. **10,194 of those nodes were
+`job-exclusive`, and not one node on that cluster recorded `ngpus` under
+`resources_assigned`** — whole-node placement means the scheduler never has to account
+for a GPU individually. `ncpus` happened to be assigned in full, so the CPU figures were
+right and the accelerator figures were not: nodetop announced **62,886 of 63,744 GPUs
+free** where 1,722 were, a 36x overstatement on the one axis people pick that machine
+for. It is modelled as occupancy rather than as a condition, because those nodes are
+healthy and working: calling them unschedulable would report 96% of the cluster as out of
+service and bury it in `health`, trading one wrong answer for a louder one. Full is not
+broken. The second cluster is what makes the rule safe rather than lucky — its jobs share
+nodes and every `ngpus` is accounted, and not one `job-exclusive` node there was
+partially assigned, so the rule changes nothing and the free count still matches
+`available - assigned` exactly.
+
+Scale came with it, since a 10,624-node answer is 14 MB. `load_queues` held a `set(...)`
+inside a generator's `if` clause, so the set was rebuilt once per node: 51 queues took
+**151 seconds** of a 3m10s run whose queries accounted for 11s. Queue attributes were
+also fetched twice — `qstat -Qf -F json` for the queues and the plain `qstat -Qf` for the
+limits, 38 seconds for the same 37 KB, at two different instants, which is also how one
+report comes to describe two moments. And `resources_available.gputype = PVC` was resolved
+to the 1100 SKU with its 48 GB stated as certain, on the largest Ponte Vecchio machine in
+existence, whose parts are 128 GB: `where -g 6 --gpu-mem 64` ruled out all 10,624 nodes.
+`PVC` is the codename both SKUs share, so it now carries the same "at least" uncertainty a
+bare `A100` does.
+
 Two smaller lessons, same root:
 
 * **Ask both lists at the same visibility.** Partitions were fetched with `--all` and nodes
@@ -1518,10 +1544,14 @@ Four honesty rules are enforced in code rather than left to the reader:
 
 ### Known limits
 
-- **Only the Slurm backend has been validated end-to-end against a live cluster**, plus
-  the ssh pool against a real unscheduled GPU box. PBS, LSF, Grid Engine and Kubernetes
+- **Slurm and PBS have been validated end-to-end against live clusters** — Slurm against
+  two (a 607-node site and a Slurm 25.11 one), PBS against two more (PBS Pro 2022.1 at
+  10,624 nodes and 2026.1 at 24) — plus the ssh pool against a real unscheduled GPU box.
+  **LSF, Grid Engine and Kubernetes are not confirmed against a live control plane**: they
   are built from those systems' documented output formats and tested against
-  format-faithful fixtures — solid, but not yet confirmed against a live control plane.
+  format-faithful fixtures, which predicts that they will not crash, not that the numbers
+  are right. Every live cluster so far has produced defects a green suite could not — see
+  §7.
 - **`health` only finds impairment somebody wrote down.** It keyword-matches the reason
   field, so a node throttled with no reason recorded is invisible from a login node. That
   needs per-node telemetry, which is a different tool's job.
