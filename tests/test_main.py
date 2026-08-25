@@ -222,6 +222,39 @@ class TestBackendSelection:
         capsys.readouterr()
 
 
+class TestClosingThePipeIsNotAnError:
+    """`nodetop health | head` is how a long report gets read.
+
+    Python's default SIGPIPE disposition makes that print "Exception ignored
+    in: <_io.TextIOWrapper name='<stdout>'> BrokenPipeError: [Errno 32]" after
+    the output, because the interpreter flushes a closed stdout at shutdown.
+    Seen on a 10,624-node cluster, where `health` lists 147 unschedulable nodes
+    and piping is the only way to read it.
+    """
+
+    def test_the_default_disposition_is_restored(self, capsys):
+        import signal
+
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)   # the Python default
+        main(["--json"])
+        assert signal.getsignal(signal.SIGPIPE) == signal.SIG_DFL
+        capsys.readouterr()
+
+    def test_a_real_pipe_closing_early_stays_quiet(self):
+        # End to end through a shell, because the noise this prevents is
+        # emitted by the interpreter at shutdown rather than by any code path a
+        # unit test can reach.
+        import subprocess
+        import sys
+
+        out = subprocess.run(
+            f"{sys.executable} -m nodetop backends --no-color | head -2",
+            shell=True, capture_output=True, text=True,
+        )
+        assert "BrokenPipeError" not in out.stderr
+        assert "Exception ignored" not in out.stderr
+
+
 class TestAnOldInterpreterSaysSoInsteadOfBlamingTheCluster:
     """The floor is stated where the failure happens.
 

@@ -14,6 +14,7 @@ import difflib
 import json
 import pathlib
 import re
+import signal
 import sys
 from collections.abc import Callable, Sequence
 from datetime import datetime
@@ -3460,6 +3461,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     # out was "every query failed, so there is nothing to report" -- a sentence
     # about the cluster, printed on a healthy cluster, because of the
     # interpreter. Observed on a Slurm 25.11 site whose system python3 is 3.9.
+    # `nodetop health | head` is how a long report gets read, and Python's
+    # default SIGPIPE handling turns that into noise: the interpreter flushes a
+    # closed stdout at shutdown and prints "Exception ignored in:
+    # <_io.TextIOWrapper name='<stdout>'> BrokenPipeError: [Errno 32]", after
+    # the output the reader wanted. Seen on a 10,624-node cluster, where
+    # `health` lists 147 unschedulable nodes and piping is the only way to read
+    # it. Restoring the default disposition makes this behave like every other
+    # Unix filter: the process dies quietly on the closed pipe.
+    if hasattr(signal, "SIGPIPE"):  # pragma: no branch - POSIX only, as shipped
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     if sys.version_info < _MIN_PYTHON:
         have = ".".join(str(v) for v in sys.version_info[:3])
         want = ".".join(str(v) for v in _MIN_PYTHON)
