@@ -435,15 +435,26 @@ def probe_accounts(
     """
     if shape.account:
         return [shape.account]
-    if not accounts:
+    # `None` is the "name no account" sentinel, and callers reach for it when
+    # the caller HAS none: on a cluster that enforces associations, a user with
+    # no association row has no account to name, and the honest probe is one
+    # with `--account` omitted. Narrowing that against an allowlist crashed --
+    # `AttributeError: 'NoneType' object has no attribute 'lower'` -- and it
+    # took both halves to trigger: an identity with no accounts AND a queue
+    # naming specific ones. Every cluster tested before had accounts, so
+    # `nodetop check` died on the first cluster that did not.
+    if not accounts:                       # None, or an empty list
+        return [None]
+    named = [a for a in accounts if a]
+    if not named:                          # the sentinel, or a list of blanks
         return [None]
     allowed = {a.lower() for a in queue.allow_accounts}
     if allowed and "all" not in allowed:
-        narrowed = [a for a in accounts if a.lower() in allowed]
+        narrowed = [a for a in named if a.lower() in allowed]
         # An empty intersection is itself informative: probe once anyway so the
         # control plane, not our reading of the allowlist, has the last word.
-        return list(narrowed) or [accounts[0]]
-    return list(accounts)
+        return list(narrowed) or [named[0]]
+    return list(named)
 
 
 def _verdict_rank(v: Verdict) -> int:

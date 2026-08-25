@@ -497,6 +497,28 @@ class TestProbeAccounts:
 
         assert probe_accounts(Queue(name="q"), None, JobShape()) == [None]
 
+    def test_the_none_sentinel_survives_an_allowlist(self):
+        # A crash, and it took both halves to reach: an identity with NO
+        # accounts -- which is what a cluster enforcing associations gives a
+        # user who has no association row -- AND a queue naming specific
+        # accounts. `nodetop check` then died with
+        # `AttributeError: 'NoneType' object has no attribute 'lower'`, because
+        # the sentinel meaning "name no account" was fed to the narrowing pass.
+        # Observed on a Slurm 24.11 cluster; every cluster tested before it
+        # happened to give the caller at least one account.
+        from nodetop.core.fit import probe_accounts
+
+        q = Queue(name="q", allow_accounts=("faculty-x", "pi-x"))
+        assert probe_accounts(q, [None], JobShape()) == [None]
+        assert probe_accounts(q, [], JobShape()) == [None]
+        assert probe_accounts(q, ["", None], JobShape()) == [None]
+
+    def test_a_real_account_beside_the_sentinel_is_still_used(self):
+        from nodetop.core.fit import probe_accounts
+
+        q = Queue(name="q", allow_accounts=("keep",))
+        assert probe_accounts(q, [None, "keep"], JobShape()) == ["keep"]
+
     def test_an_allowlist_narrows_the_candidates(self):
         # An account a queue does not list cannot be accepted, so trying it
         # spends a round trip to learn nothing.
