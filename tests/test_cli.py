@@ -36,6 +36,17 @@ def width_of() -> int:
     return term_width()
 
 
+def _capture(command, cluster, args, style=PLAIN) -> str:
+    """Run a command and return what it printed, colour off."""
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        command(cluster, args, style)
+    return buf.getvalue()
+
+
 def _args(argv: list[str]):
     return build_parser().parse_args(argv)
 
@@ -555,6 +566,93 @@ class TestTheWaitSaysWhatItIsWaitingFor:
         err = capsys.readouterr().err
         assert err.count("\n") == 0
         assert err.count("checking") == 40      # nothing interleaved or lost
+
+
+class TestFourNodesWithRoomIsNotFourNodesYouCanHave:
+    """A per-user ceiling is invisible in every view that counts nodes.
+
+    From a real complaint: four idle `beagle3-bigmem` nodes on screen, a user who
+    could not get on them, and `MaxTRESPerUser=cpu=64,node=2` on the QOS that
+    partition demands -- so nobody may hold more than half of what the listing
+    shows, and a three-node request pends behind nothing at all. `where -N 4`
+    said `MAX_NODE_USER` correctly; the frame the reader was actually looking at
+    said "4 nodes · 4 with room" and stopped there.
+
+    Shown only when it binds: a ceiling at or above what the queue holds is not
+    a ceiling, and a line that never changes an answer is a line in the way.
+    """
+
+    def _cluster(self, per_user, nodes=4):
+        import dataclasses
+
+        from nodetop.core.cluster import Cluster
+        from nodetop.core.model import Limits, Node, Queue
+
+        ns = [Node(name=f"bigmem{i}", state_raw="IDLE", cpus_total=32,
+                   cpus_alloc=0, memory_mb=500_000, memory_alloc_mb=0,
+                   queues=("big",)) for i in range(nodes)]
+        q = Queue(name="big", node_names=tuple(n.name for n in ns), nodes=ns,
+                  declared_nodes=nodes, limits_name="bigq")
+        return dataclasses.replace(
+            Cluster(backend_name="t", queue_term="partition", nodes=ns,
+                    queues={"big": q},
+                    limits={"bigq": Limits(name="bigq", source="slurm QOS",
+                                           per_user=per_user)}),
+            _jobs=[])
+
+    def test_the_zoom_header_says_what_one_caller_may_hold(self):
+        cluster = self._cluster({"node": 2, "cpu": 64})
+        out = _capture(cmd_zoom, cluster, _args(["zoom", "big"]))
+        assert "at once" in out
+        assert "2 of 4 nodes" in out and "64 of 128 cores" in out
+        assert "slurm QOS bigq" in out
+
+    def test_a_ceiling_that_cannot_bind_is_not_mentioned(self):
+        # 8 nodes allowed on a 4-node partition changes nothing, ever.
+        out = _capture(cmd_zoom, self._cluster({"node": 8, "cpu": 999}),
+                       _args(["zoom", "big"]))
+        assert "at once" not in out
+
+    def test_no_ceiling_at_all_is_not_mentioned(self):
+        out = _capture(cmd_zoom, self._cluster({}), _args(["zoom", "big"]))
+        assert "at once" not in out
+
+    def test_the_browse_frame_says_it_too(self, monkeypatch, capsys):
+        """The view the complaint came from, not just the one `zoom` prints.
+
+        `4 nodes · 4 with room` is what a reader plans against, so the ceiling
+        has to be on that line. Short there because it competes for the frame's
+        width; `zoom` spells out where the number comes from.
+        """
+        import nodetop.interactive as inter
+
+        cluster = self._cluster({"node": 2, "cpu": 64})
+        monkeypatch.setenv("COLUMNS", "100")
+        monkeypatch.setenv("LINES", "40")
+        frames = []
+
+        def scripted(render, _count, **_kw):
+            frames.append(list(render(0)))
+            return 2 if len(frames) == 1 else inter.Key.QUIT
+
+        monkeypatch.setattr(inter, "supported", lambda *_a, **_k: True)
+        monkeypatch.setattr(inter, "select", scripted)
+        monkeypatch.setattr(inter, "read_key", lambda *_a, **_k: inter.Key.QUIT)
+        assert cmd_status(cluster, _args(["status"]), PLAIN) == 0
+        capsys.readouterr()
+        listing = [f for f in frames if any("bigmem0" in line for line in f)]
+        assert listing, "the browse never reached the node list"
+        head = listing[0][1]
+        assert "4 nodes" in head and "4 with room" in head
+        assert "2 at once, per user" in head, head
+
+    def test_the_helper_reports_only_a_binding_node_cap(self):
+        from nodetop.cli import _user_cap_nodes
+
+        cluster = self._cluster({"node": 2})
+        assert _user_cap_nodes(cluster, cluster.queues["big"]) == 2
+        loose = self._cluster({"node": 4})
+        assert _user_cap_nodes(loose, loose.queues["big"]) is None
 
 
 class TestMovingTheCursorDoesNotRebuildTheRows:

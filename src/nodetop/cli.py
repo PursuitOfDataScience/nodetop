@@ -2006,6 +2006,12 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         facts = [st.head(queue.name),
                  st.muted(f"{len(nodes)} nodes"),
                  st.muted(f"{with_room} with room")]
+        # "4 with room" invites the reader to plan for four, and a per-user
+        # ceiling is invisible in a view that counts nodes. Short here because
+        # this line competes for the frame's width; `zoom` spells out where the
+        # number comes from. See `_per_user_ceiling`.
+        if (cap := _user_cap_nodes(cluster, queue)) is not None:
+            facts.append(st.warn(f"{cap} at once, per user"))
         return framed([f"  {st.dim(st.g.sep)}  ".join(facts), "", head, *shown])
 
     def node_detail(node, jobs: list) -> list[str]:
@@ -2695,11 +2701,56 @@ def _queues_detail(cluster: Cluster, queues: list, st: Style) -> None:
             ("models", ", ".join(f"{k}x{v}" for k, v in q.accelerator_models.items())
              or st.dim("none")),
             ("maxtime", _wall_detail(cluster, q, st)),
+            *([("at once", ceiling)]
+              if (ceiling := _per_user_ceiling(cluster, q, st)) else []),
         ], st, indent="    "))
         blockers = q.structural_blockers()
         if blockers:
             print(tree([(st.bad(b.code), b.detail) for b in blockers], st, indent="    "))
         print()
+
+
+def _user_cap_nodes(cluster: Cluster, queue) -> int | None:
+    """How many of this queue's nodes one caller may hold, if fewer than all."""
+    limits = cluster.limits_for(queue.name)
+    if limits is None:
+        return None
+    cap = limits.per_user.get("node")
+    return cap if cap is not None and cap < len(queue.nodes) else None
+
+
+def _per_user_ceiling(cluster: Cluster, queue, st: Style) -> str | None:
+    """What ONE caller may hold here at once, when that is less than the queue.
+
+    A partition of four idle nodes reads as four nodes you could have, and a
+    per-user ceiling is invisible in every view that counts nodes. Reported from
+    a live complaint: four idle `beagle3-bigmem` nodes on screen, and
+    `MaxTRESPerUser=cpu=64,node=2` on the QOS the partition demands -- so nobody
+    may hold more than half of what the listing shows, and a three-node request
+    pends behind nothing at all. `where -N 4` said `MAX_NODE_USER` correctly;
+    the listing the reader was looking at said "4 with room".
+
+    Only when it BINDS: a ceiling at or above what the queue has is not a
+    ceiling, and printing it would add a line that never changes an answer.
+    """
+    limits = cluster.limits_for(queue.name)
+    if limits is None or not limits.per_user:
+        return None
+    parts = []
+    nodes = limits.per_user.get("node")
+    if nodes is not None and nodes < len(queue.nodes):
+        parts.append(f"{nodes} of {len(queue.nodes)} nodes")
+    cpus = limits.per_user.get("cpu")
+    if cpus is not None and cpus < queue.cpus_total:
+        parts.append(f"{cpus} of {queue.cpus_total} cores")
+    gpus = limits.per_user.get("gres/gpu")
+    if gpus is not None and queue.gpus_total and gpus < queue.gpus_total:
+        parts.append(f"{gpus} of {queue.gpus_total} GPUs")
+    if not parts:
+        return None
+    return (", ".join(parts)
+            + st.dim(f"  (per user, from {limits.source or 'limits'} "
+                     f"{limits.name})"))
 
 
 def _wall_detail(cluster: Cluster, queue, st: Style) -> str:
