@@ -22,6 +22,7 @@ import getpass
 import json
 import os
 import re
+import threading
 from collections.abc import Iterable
 from datetime import datetime, timedelta
 
@@ -131,6 +132,10 @@ class PbsBackend:
         self._nodes: list[Node] | None = None
         self._queue_text_cache: str | None = None
         self._queue_json_cache: str | None = None
+        # `load_queues` needs the nodes too, and the two now run together. One
+        # lock for all three caches: they are only ever taken briefly, and a
+        # second `pbsnodes -a -F json` is 14 MB on the largest cluster tested.
+        self._cache_lock = threading.RLock()
 
     @classmethod
     def detect(cls) -> bool:
@@ -271,13 +276,17 @@ class PbsBackend:
         flush()
         return out
 
-    def load_nodes(self) -> list[Node]:
+    def load_nodes(self) -> list[Node]:  # noqa: D401 - see the cache note below
         # Cached deliberately. load_queues() needs the nodes too, and
         # re-deriving them there would query the control plane a second time --
         # so a single report could mix two different instants, which is exactly
         # what taking one snapshot is supposed to prevent.
-        if self._nodes is not None:
-            return self._nodes
+        with self._cache_lock:
+            if self._nodes is not None:
+                return self._nodes
+            return self._load_nodes_uncached()
+
+    def _load_nodes_uncached(self) -> list[Node]:
         try:
             nodes = self.parse_nodes_json(
                 self.runner.run(
@@ -292,6 +301,10 @@ class PbsBackend:
 
     def _queue_text(self) -> str:
         """``qstat -Qf`` output, fetched once and reused for limits."""
+        with self._cache_lock:
+            return self._queue_text_locked()
+
+    def _queue_text_locked(self) -> str:
         if self._queue_text_cache is None:
             self._queue_text_cache = self.runner.run(
                 ["qstat", "-Qf"], timeout=_ENUMERATE_TIMEOUT)
@@ -306,13 +319,14 @@ class PbsBackend:
         method means the same thing to callers, which all fall back to the text
         form.
         """
-        if self._queue_json_cache is None:
-            try:
-                self._queue_json_cache = self.runner.run(
-                    ["qstat", "-Qf", "-F", "json"], timeout=_ENUMERATE_TIMEOUT)
-            except Exception:
-                self._queue_json_cache = ""
-        return self._queue_json_cache or None
+        with self._cache_lock:
+            if self._queue_json_cache is None:
+                try:
+                    self._queue_json_cache = self.runner.run(
+                        ["qstat", "-Qf", "-F", "json"], timeout=_ENUMERATE_TIMEOUT)
+                except Exception:
+                    self._queue_json_cache = ""
+            return self._queue_json_cache or None
 
     # -- queues -------------------------------------------------------------
     def parse_queues_json(self, text: str) -> list[Queue]:
@@ -352,7 +366,22 @@ class PbsBackend:
         return Queue(
             forwards_to=destinations,
             name=name,
-            state_raw=f"enabled={enabled} started={started}",
+            # A word, not the two booleans. `enabled=True started=True` is 27
+            # characters of which the first 12 fit the state column, so every
+            # PBS queue rendered as `enabled=Tru…` -- truncated exactly where
+            # the answer was, and the same string whether the queue was open or
+            # shut. Seen on a live 2026.1.0 cluster, where six queues showed
+            # `enabled=Tru…` and `enabled=Fal…` side by side and neither said
+            # anything. The two switches are independent, so all four states get
+            # their own word, and PBS's own vocabulary is the one used:
+            # `enabled` gates accepting a job, `started` gates running it.
+            #
+            # Nothing loses information: `enabled` and `started` stay on the
+            # Queue as booleans, and they are what every decision reads.
+            state_raw=("UP" if enabled and started
+                       else "STOPPED" if enabled
+                       else "DISABLED" if started
+                       else "DOWN"),
             enabled=enabled,
             started=started,
             # An ACL that is switched off is not a restriction; one that is on

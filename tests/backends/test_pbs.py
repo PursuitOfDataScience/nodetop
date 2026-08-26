@@ -104,6 +104,52 @@ class TestQueues:
         }
 
 
+class TestTheStateColumnSaysWhichStateItIs:
+    """`enabled=True started=True` does not fit a table, and truncates to a lie.
+
+    The state column is twelve characters, sized for Slurm's `UP`/`DOWN`, so
+    every PBS queue rendered as `enabled=Tru…` -- cut off exactly at the
+    answer, and the same eleven characters whether the queue was open or shut.
+    Seen on a live 2026.1.0 cluster with ten queues, two of them closed:
+    indistinguishable. The two switches are independent, so each of the four
+    combinations gets its own word.
+    """
+
+    def _queues(self, pbs_backend):
+        return {q.name: q for q in pbs_backend.load_queues()}
+
+    def test_each_combination_has_its_own_word(self, pbs_backend):
+        q = self._queues(pbs_backend)
+        assert q["gpuq"].state_raw == "UP"            # accepts and runs
+        assert q["drainq"].state_raw == "STOPPED"     # accepts, never runs
+        assert q["closedq"].state_raw == "DOWN"       # neither
+
+    def test_the_booleans_are_still_there(self, pbs_backend):
+        # The word is for reading; every decision reads the switches, so
+        # shortening the text must not cost the data.
+        q = self._queues(pbs_backend)["drainq"]
+        assert (q.enabled, q.started) == (True, False)
+
+    def test_a_disabled_queue_names_itself_in_the_blocked_column(
+            self, pbs_backend):
+        # `Queue.structural_blockers` takes the first word of `state_raw` as
+        # the short reason, which used to make the column read `enabled=False`.
+        blocker = next(b for b in
+                       self._queues(pbs_backend)["closedq"].structural_blockers()
+                       if b.code == "QUEUE_DISABLED")
+        assert blocker.short == "DOWN"
+
+    def test_a_disabled_but_started_queue_is_not_called_down(self):
+        # The fourth combination is missing from the fixture and is the one a
+        # naive two-way mapping gets wrong: `qstop` without `qdisable`.
+        from nodetop.backends.pbs import PbsBackend
+        from nodetop.runner import RecordedRunner
+
+        queue = PbsBackend(RecordedRunner({})).parse_queues_text(
+            "Queue: shutq\n    enabled = False\n    started = True\n")[0]
+        assert queue.state_raw == "DISABLED"
+
+
 class TestLimits:
     def test_per_entity_table_is_unwrapped(self, pbs_backend):
         # "max_run_res.ngpus = [u:PBS_GENERIC=8]" -> 8
