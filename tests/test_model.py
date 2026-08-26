@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 from nodetop.core.hardware import ACCELERATORS
@@ -78,6 +80,85 @@ class TestNodeDegraded:
 
     def test_an_ordinary_reason_is_not_degradation(self):
         assert Node(name="n", reason="reserved for the workshop").degraded is False
+
+
+class TestANodeIsOneReadingAndIsNotEdited:
+    """The invariant that lets the hot answers be memoised.
+
+    The same node is asked the same question once per queue it belongs to:
+    `memory_exhausted` was called **4,830 times for 607 nodes** on a cluster
+    with 84 partitions. Memoising it turns the aggregate capacity pass from
+    53.9 ms into 13.1 ms (-76%) on a worst case of 607 nodes in 84 queues, and
+    costs 1.4% on the one path that visits each node exactly once -- building
+    a 10,624-row table, where the cost is string work either way.
+
+    That is only correct while a Node is written once and never edited, so the
+    tests here pin the invariant rather than the timing: a fresh object per
+    correction, and no assignment to a Node's fields anywhere in the source.
+    """
+
+    def _node(self, **kw):
+        from nodetop.core.model import Node
+
+        base = {"name": "n1", "state_raw": "MIXED", "cpus_total": 8,
+                "cpus_alloc": 4, "memory_mb": 1000, "memory_alloc_mb": 400}
+        return Node(**{**base, **kw})
+
+    def test_the_answer_is_remembered_on_the_instance(self):
+        node = self._node()
+        assert node.memory_exhausted is False
+        # The cache lives in the instance dict, so two nodes cannot share one.
+        assert "memory_exhausted" in node.__dict__
+        assert "memory_exhausted" not in self._node().__dict__
+
+    def test_replacing_a_field_gives_an_object_with_no_stale_answer(self):
+        # This is what Grid Engine relies on: it has to correct accelerator
+        # counts after `qhost` has been parsed, and it rebuilds rather than
+        # patching precisely so a memoised answer cannot outlive its input.
+        import dataclasses
+
+        node = self._node(memory_alloc_mb=400)
+        assert node.memory_exhausted is False
+        fixed = dataclasses.replace(node, memory_alloc_mb=1000)
+        assert "memory_exhausted" not in fixed.__dict__
+        assert fixed.memory_exhausted is True
+
+    def test_nothing_in_the_source_writes_a_nodes_fields(self):
+        """A source scan, because this cannot be tested from behaviour.
+
+        A backend that assigns `n.cpus_alloc = ...` after something has read
+        `n.effective_free_cpus` gets the old answer, silently and only on that
+        backend. Grid Engine did exactly that (accelerator counts from
+        `qconf -se`, patched in place) and is why this test exists.
+        """
+        import ast
+        import dataclasses
+
+        from nodetop.core.model import Node
+
+        fields = {f.name for f in dataclasses.fields(Node)}
+        root = pathlib.Path(__file__).resolve().parent.parent / "src" / "nodetop"
+        offenders = []
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                targets = []
+                if isinstance(node, ast.Assign):
+                    targets = node.targets
+                elif isinstance(node, ast.AugAssign):
+                    targets = [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Attribute) and target.attr in fields:
+                        # `self.x = ...` inside the model's own dataclasses is
+                        # construction, not editing.
+                        if path.name == "model.py" and isinstance(
+                                target.value, ast.Name) and target.value.id == "self":
+                            continue
+                        offenders.append(
+                            f"{path.relative_to(root)}:{node.lineno} "
+                            f"-> .{target.attr}")
+        assert not offenders, "a Node field is written after construction: " + \
+            "; ".join(offenders)
 
 
 class TestQueueStructuralGates:
@@ -212,6 +293,48 @@ class TestCoresWithNoMemoryBehindThem:
         assert n.memory_exhausted is False
         assert n.effective_free_cpus == 44
         assert n.has_room is True
+
+    def test_the_floor_is_the_schedulers_own_not_zero(self):
+        # The case that got away, by 250 megabytes. A 128-core node with 31
+        # cores allocated, RealMemory=250000, AllocMem=249750, on a cluster
+        # whose DefMemPerCPU is 3810 -- so one core of a default job needs
+        # fifteen times what is left, and the row read "97/128" cores free with
+        # a three-quarters-full meter beside "0/244G", sorted to the top of the
+        # listing as the roomiest thing on the screen. 250 MB rounds down to
+        # 0 GiB, which is why the memory column looked right while the CPU
+        # column did not.
+        n = Node(name="n", cpus_total=128, cpus_alloc=31, memory_mb=250000,
+                 memory_alloc_mb=249750, memory_floor_mb=3810)
+        assert n.cpus_free == 97            # still reported, for diagnosis
+        assert n.memory_free_mb == 250      # above zero, below the floor
+        assert n.memory_exhausted is True
+        assert n.effective_free_cpus == 0
+        assert n.has_room is False
+
+    def test_memory_above_the_floor_is_still_room(self):
+        # Not a blanket "nearly full is full": a node that can seat one default
+        # core seats one, and the meter says so.
+        n = Node(name="n", cpus_total=128, cpus_alloc=31, memory_mb=250000,
+                 memory_alloc_mb=250000 - 4000, memory_floor_mb=3810)
+        assert n.memory_exhausted is False
+        assert n.effective_free_cpus == 97
+
+    def test_a_site_with_no_published_floor_keeps_the_zero_test(self):
+        # Slurm defaults a job to the WHOLE node where DefMemPerCPU is unset,
+        # which is a shortage this cannot quantify -- so it claims nothing
+        # rather than erasing most of a cluster.
+        n = Node(name="n", cpus_total=128, cpus_alloc=31, memory_mb=250000,
+                 memory_alloc_mb=249750)
+        assert n.memory_floor_mb == 0
+        assert n.memory_exhausted is False
+        assert n.effective_free_cpus == 97
+
+    def test_the_floor_is_irrelevant_where_memory_is_not_consumable(self):
+        n = Node(name="n", cpus_total=128, cpus_alloc=31, memory_mb=250000,
+                 memory_alloc_mb=250000, memory_floor_mb=3810,
+                 memory_consumable=False)
+        assert n.memory_exhausted is False
+        assert n.effective_free_cpus == 97
 
     def test_an_unschedulable_node_has_no_room_whatever_it_reports(self):
         n = Node(name="n", cpus_total=48, memory_mb=1000,

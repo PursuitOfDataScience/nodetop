@@ -33,6 +33,7 @@ these objects is scheduler-specific, and that lives behind
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -192,6 +193,12 @@ class Node:
     #: for rather than a ceiling the scheduler enforces.  See
     #: :attr:`memory_exhausted`.
     memory_consumable: bool = True
+    #: The smallest memory allocation this scheduler will make here -- Slurm's
+    #: ``DefMemPerCPU``, the amount a job that names no ``--mem`` consumes per
+    #: core.  ``0`` where the system publishes no such floor, and then
+    #: :attr:`memory_exhausted` falls back to asking whether *any* memory is
+    #: left.  See that property for what the difference cost.
+    memory_floor_mb: int = 0
 
     def __post_init__(self) -> None:
         # Scheduler-supplied free text, scrubbed of control characters once, at
@@ -205,7 +212,25 @@ class Node:
         self.taints = tuple(sanitize(x) for x in self.taints)
 
     # -- availability -------------------------------------------------------
-    @property
+    #: The next few answers are memoised, and the reason it is safe is the
+    #: reason this class exists: **a Node is one reading, taken at one instant,
+    #: and never edited afterwards.** Rebuilding is `dataclasses.replace`, which
+    #: produces a fresh object with an empty cache -- so a backend that has to
+    #: correct a field (Grid Engine has to, for accelerator counts) gets a new
+    #: Node rather than a stale answer attached to an old one.
+    #:
+    #: Worth doing because the same node is asked the same question once per
+    #: queue it belongs to. Measured with `nodes --all` on a 607-node cluster
+    #: across 84 partitions: `memory_exhausted` was called **4,830 times** for
+    #: 607 nodes. On a synthetic worst case -- every node in every queue -- the
+    #: aggregate capacity pass went 54.2 -> 40.4 ms at 607x84 and 118.6 ->
+    #: 102.1 ms at 10,624x10, with identical answers.
+    #:
+    #: Queue-level aggregates are deliberately NOT memoised: `Queue.nodes` is
+    #: wired up after construction (`Cluster.load`) and four backends patch
+    #: `node_names` later still, so a cache there would be a cache of an
+    #: unfinished object.
+    @functools.cached_property
     def schedulable(self) -> bool:
         """Whether the scheduler would place new work here.
 
@@ -253,12 +278,12 @@ class Node:
     def cpus_free(self) -> int:
         return max(0, self.cpus_total - self.cpus_alloc)
 
-    @property
+    @functools.cached_property
     def memory_free_mb(self) -> int:
         """Memory the scheduler considers unallocated (not the OS's free RAM)."""
         return max(0, self.memory_mb - self.memory_alloc_mb)
 
-    @property
+    @functools.cached_property
     def memory_exhausted(self) -> bool:
         """Every byte the scheduler can hand out here is already handed out.
 
@@ -277,15 +302,31 @@ class Node:
         is the bias everywhere in this file, but inventing a shortage on a
         system that never mentioned memory would be its own kind of lie.
 
+        **The floor is the scheduler's, not zero.**  Tested against zero this
+        missed the case it exists to catch, by 250 megabytes: a 128-core node
+        with 31 cores allocated, ``RealMemory=250000``, ``AllocMem=249750`` --
+        and ``DefMemPerCPU=3810`` on that cluster, so a single core of a
+        default job needs fifteen times what is left. The row read
+        ``97/128`` cores free with a three-quarters-full meter beside
+        ``0/244G``, which is the most misleading thing this table can say, and
+        the reason `0` displayed there at all is that 250 MB rounds down to
+        0 GiB. :attr:`memory_floor_mb` carries the site's own minimum so the
+        comparison is against what the scheduler will actually hand out.
+
+        A job naming a smaller ``--mem`` explicitly can still land on such a
+        node, so this is the same "claims less capacity" bias as everywhere
+        else here rather than a hard impossibility -- and the claimed counts
+        stay in the column beside the meter, unaltered.
+
         :attr:`memory_consumable` is the same distinction one level up: a
         scheduler that does not account for memory when it places work has an
         ``AllocMem`` that is a record of requests, not a ceiling, and reading
         it as one would report a whole cluster as full.
         """
         return (self.memory_consumable and self.memory_mb > 0
-                and self.memory_free_mb <= 0)
+                and self.memory_free_mb < max(1, self.memory_floor_mb))
 
-    @property
+    @functools.cached_property
     def effective_free_cpus(self) -> int:
         """Free cores that still have memory behind them.
 
@@ -295,7 +336,7 @@ class Node:
         """
         return 0 if self.memory_exhausted else self.cpus_free
 
-    @property
+    @functools.cached_property
     def effective_free_gpus(self) -> int:
         """Free accelerators that still have memory behind them.
 
@@ -304,7 +345,7 @@ class Node:
         """
         return 0 if self.memory_exhausted else self.gpus_free
 
-    @property
+    @functools.cached_property
     def has_room(self) -> bool:
         """Something here could actually be allocated right now.
 

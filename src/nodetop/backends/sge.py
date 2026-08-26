@@ -14,6 +14,7 @@ instances still appear in ``qhost`` output with their slot counts intact.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import getpass
 import os
 import re
@@ -302,15 +303,25 @@ class SgeBackend:
         ]
         if candidates:
             totals, skipped = self.accelerator_totals(candidates)
+            # Rebuilt, not patched in place. A Node is a reading taken at one
+            # instant, and several of its answers are now memoised on first
+            # access (see `Node.memory_exhausted`), so a field written after
+            # construction could be a field somebody has already read. Nothing
+            # reads these nodes before this line today -- `replace` is what
+            # keeps that true without anyone having to check.
+            fixed = []
             for n in nodes:
                 if n.name in totals:
                     available = n.gpus_total  # what hc: reported as free
-                    n.gpus_total = totals[n.name]
-                    n.gpus_alloc = max(0, totals[n.name] - available)
+                    n = dataclasses.replace(
+                        n, gpus_total=totals[n.name],
+                        gpus_alloc=max(0, totals[n.name] - available))
                 elif n.name in skipped and n.accelerator is not None:
-                    n.reason = n.reason or (
+                    n = dataclasses.replace(n, reason=n.reason or (
                         "accelerator count unknown: qconf -se gave no complex_values"
-                    )
+                    ))
+                fixed.append(n)
+            nodes = fixed
             self._skipped_hosts = skipped
         self._nodes = nodes
         return nodes
