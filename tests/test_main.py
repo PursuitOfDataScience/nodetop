@@ -12,27 +12,6 @@ from nodetop.cli import main
 from nodetop.exceptions import NoBackendError
 
 
-@pytest.fixture(autouse=True)
-def _detect_finds_the_recorded_backend(request, monkeypatch, slurm_backend):
-    """Make `main()` detect a recorded cluster instead of the host's own.
-
-    **These tests were not hermetic and only passed where they were written.**
-    `main()` does live backend detection and then queries it, so every
-    `main(["status"])` below ran real `scontrol` calls -- fine on a login node,
-    guaranteed to fail on CI, which has no batch system at all. That is the sort
-    of green suite that goes red the first time somebody else runs it.
-
-    Only `detect` is replaced, not `get`: the `--backend NAME` tests are about
-    the real registry -- an unknown name, or forcing an adapter whose client is
-    absent -- and substituting that would test nothing.
-    """
-    if request.node.get_closest_marker("live_detect"):
-        # Opted out: a test that simulates a broken control plane has to own
-        # detection itself, or it would be handed a working recorded one.
-        return
-    monkeypatch.setattr(registry, "detect", lambda: slurm_backend)
-
-
 class TestOneReportIsOneSnapshot:
     """Every number in a report must describe the same instant.
 

@@ -41,6 +41,46 @@ def read(*parts: str) -> str:
     return (FIXTURES.joinpath(*parts)).read_text()
 
 
+@pytest.fixture(autouse=True)
+def _detect_finds_a_recorded_backend(request, monkeypatch):
+    """No test does live backend detection, wherever it happens to run.
+
+    `main()` detects a backend and then queries it, so a test that calls it runs
+    real `scontrol` on whatever host it is on -- fine on a login node, and on CI,
+    which has no batch system at all, exit 3. This lived in `test_main.py`, whose
+    own docstring called that "the sort of green suite that goes red the first
+    time somebody else runs it" -- and then `test_access.py` was written without
+    it and did exactly that: three tests green here, red on all four Pythons in
+    CI, because this machine has a live Slurm cluster and the runners do not.
+
+    So it is autouse for the whole suite, not one module of it. Only `detect` is
+    replaced, never `get`: the `--backend NAME` tests are about the real
+    registry. `probe` is answered too, and `which` is forced, because whether a
+    dry-run is available must not depend on the host either.
+    """
+    if request.node.get_closest_marker("live_detect"):
+        # Opted out: a test that simulates a broken control plane, or one that
+        # asks what this host really has, owns detection itself.
+        return
+    from nodetop import backends as registry
+    from nodetop.backends.slurm import SlurmBackend
+    from nodetop.runner import RecordedRunner
+
+    recorded = SlurmBackend(RecordedRunner({
+        "scontrol show node": (0, read("slurm", "nodes.txt"), ""),
+        "scontrol show partition": (0, read("slurm", "partitions.txt"), ""),
+        "show qos": (0, read("slurm", "qos.txt"), ""),
+        "show assoc": (0, "acct-a||gn\nacct-b||gpu\n", ""),
+        "squeue": (0, "", ""),
+        # Accepted, so the dry-run path is reachable without a scheduler.
+        "sbatch": (0, "sbatch: Job 1 to start at 2026-08-26T00:00:00 "
+                      "using 1 processors on nodes gpu001 in partition gn\n", ""),
+    }))
+    monkeypatch.setattr(registry, "detect", lambda: recorded)
+    # `capabilities()` asks the PATH whether `sbatch` exists; on CI it does not.
+    monkeypatch.setattr("nodetop.backends.slurm.which", lambda _b: True)
+
+
 # -- slurm ------------------------------------------------------------------
 @pytest.fixture
 def slurm_nodes() -> str:
