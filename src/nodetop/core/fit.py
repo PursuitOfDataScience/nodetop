@@ -19,6 +19,8 @@ lands.
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 
@@ -26,8 +28,8 @@ from .capacity import Capacity, assess_capacity
 from .duration import format_duration
 from .model import Blocker, JobShape, Limits, Queue, Verdict, VerdictCategory
 
-__all__ = ["Placement", "ProbeBudget", "evaluate", "probe_accounts",
-           "probe_queue", "rank", "unsettled"]
+__all__ = ["PROBE_WORKERS", "Placement", "ProbeBudget", "evaluate",
+           "probe_accounts", "probe_queue", "rank", "unsettled"]
 
 
 @dataclass
@@ -236,7 +238,28 @@ def evaluate(
 
     verdict: Verdict | None = None
     caps = cluster.capabilities
-    if use_probe and caps is not None and caps.probe:
+    # A queue that accepts nothing from anybody cannot be talked round by a
+    # dry-run, and asking costs a round trip -- the most expensive thing this
+    # tool does. `reachable` is already False the moment a fatal blocker
+    # exists, whatever the control plane would say, so the answer could not
+    # change the verdict on screen.
+    #
+    # Only the OPERATIONAL blockers count here: disabled, never-starts, an
+    # empty allowlist, no nodes, every node down. Access is deliberately NOT in
+    # that list -- a declared ACL disagreeing with the control plane is the
+    # thing this tool exists to catch, so a queue whose allowlist appears to
+    # exclude you is still asked. Nor a soft blocker: "your job is too big" is
+    # about the request, and the entitlement answer beside it is still worth
+    # having.
+    #
+    # Measured on a 607-node cluster, and the honest figure is small: **3 of 89
+    # probes on `where --all`**, and none at all on the default views -- there
+    # the entitlement filter and `usable_queues` have already dropped the dead
+    # partitions before ranking sees them. It pays where those filters step
+    # aside: `--all`, and a queue named explicitly. Free either way, since the
+    # blockers are computed above regardless.
+    dead = [b for b in blockers if b.fatal and b.code in _OPERATIONAL_BLOCKERS]
+    if use_probe and caps is not None and caps.probe and not dead:
         budget = budget if budget is not None else ProbeBudget()
         verdict, tried, of = probe_queue(
             cluster, queue, queue.name, shape, accounts, budget
@@ -364,6 +387,22 @@ MAX_PROBES_PER_QUEUE = 12
 MAX_PROBES_TOTAL = 150
 
 
+#: How many dry-runs may be in flight at once.
+#:
+#: They are independent round trips to the control plane and the tool used to
+#: make them one after another: on a 607-node cluster a bare `nodetop` spent
+#: **6.40s of its 10.26s in 21 sequential probes**, two of which took 2.2s each.
+#: Run together they cost about as much as the slowest one.
+#:
+#: Three, and measured rather than picked: ten probes against a live controller,
+#: five interleaved rounds, medians -- 0.91s sequential, 0.73s at three
+#: concurrent, 0.73s at six. It saturates at three because the controller takes
+#: a lock for the submit path, so all concurrency can overlap is the process
+#: spawn and the RPC. Going wider buys nothing and asks more of somebody else's
+#: controller, which a login node is already busy with.
+PROBE_WORKERS = 3
+
+
 class ProbeBudget:
     """Shared probe accounting for one question.
 
@@ -382,6 +421,10 @@ class ProbeBudget:
 
     def __init__(self, total: int = MAX_PROBES_TOTAL,
                  queues: int | None = None) -> None:
+        # Guards `left` and the learned account order: with probes in flight
+        # together, two queues can reach for the last of the budget at once,
+        # and a lost decrement is a probe fired past the ceiling.
+        self._lock = threading.Lock()
         self.left = total
         # Spend the budget where it was asked for. A fixed per-queue ceiling is
         # wrong at both ends: too small when the caller named two queues and
@@ -399,21 +442,45 @@ class ProbeBudget:
 
     def spend(self) -> bool:
         """Claim one probe.  False when the budget is gone."""
-        if self.left <= 0:
-            return False
-        self.left -= 1
-        return True
+        with self._lock:
+            if self.left <= 0:
+                return False
+            self.left -= 1
+            return True
 
     def accepted(self, account: str | None) -> None:
-        if account and account not in self._accepted:
-            self._accepted.append(account)
+        with self._lock:
+            if account and account not in self._accepted:
+                self._accepted.append(account)
 
     def order(self, candidates: list[str | None]) -> list[str | None]:
         """``candidates`` with known-good accounts moved to the front."""
-        if not self._accepted:
+        with self._lock:
+            known = list(self._accepted)
+        if not known:
             return candidates
-        rank = {a: i for i, a in enumerate(self._accepted)}
+        rank = {a: i for i, a in enumerate(known)}
         return sorted(candidates, key=lambda a: rank.get(a or "", len(rank)))
+
+
+#: Blocker codes that mean "this queue accepts nothing from anyone".
+#:
+#: Distinguished from an ACCESS blocker (which the control plane may contradict,
+#: and that contradiction is the point of probing at all) and from a soft one
+#: (which is about the size of the request, not the queue). See `evaluate`.
+#: Every code here is one a `Blocker` in this codebase actually carries, and
+#: each was checked against where it is raised -- a set with a code nobody
+#: emits silently stops saving anything, and a missing one silently keeps paying.
+#: `REQUIRES_RESERVATION` is deliberately absent: that queue does accept work,
+#: from a job that names a reservation, so the dry-run's answer is real.
+_OPERATIONAL_BLOCKERS = frozenset({
+    "QUEUE_DISABLED",
+    "QUEUE_NOT_STARTED",
+    "NO_ACCOUNTS",
+    "NO_QOS",
+    "NO_USERS",
+    "ALL_NODES_UNSCHEDULABLE",
+})
 
 
 def probe_accounts(
@@ -574,12 +641,20 @@ def rank(
     use_probe: bool = False,
     accounts: list[str] | None = None,
     include_unusable: bool = False,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> list[Placement]:
     """Evaluate every candidate queue and order them best-first.
 
     By default queues with no chance are dropped; ``include_unusable`` keeps
     them with their blockers attached, which is what you want when the
     question is "why can nothing run anywhere?" rather than "where do I go?".
+
+    ``on_progress(done, total)`` is called as each queue settles, from whichever
+    worker thread settled it. It exists because this is the slow part of a run
+    by a wide margin -- 1.60s of a 1.93s `status` on a 607-node cluster, all of
+    it somebody else's controller -- and a caller that can say so is the
+    difference between a wait and a hang. Optional, and this module does not
+    know what a terminal is: it hands over two integers.
     """
     names = queues or list(cluster.queues)
     out: list[Placement] = []
@@ -607,6 +682,7 @@ def rank(
                 n,
             ),
         )
+    candidates: list[Queue] = []
     for name in names:
         queue = cluster.queues.get(name)
         if queue is None:
@@ -623,10 +699,52 @@ def rank(
         )
         if no_accel and not include_unusable:
             continue
-        placement = evaluate(
+        candidates.append(queue)
+
+    def assess(queue: Queue) -> Placement:
+        return evaluate(
             cluster, shape, queue, use_probe=use_probe, accounts=accounts,
             budget=budget,
         )
+
+    # Together where the work is a round trip, one at a time where it is
+    # arithmetic. Each queue's own probe sequence stays sequential -- it learns
+    # from what the last account did -- but the queues do not have to wait for
+    # each other: 21 probes took 6.40s of a 10.26s run on a 607-node cluster,
+    # and they are 21 independent questions.
+    #
+    # Without probes this is pure computation, and threads would buy contention
+    # instead of speed, so that path is left exactly as it was. Submitted in the
+    # cheapest-first order above, so the account learning still happens roughly
+    # in the order it was designed to.
+    if budget is not None and len(candidates) > 1:
+        import concurrent.futures as _cf
+
+        with _cf.ThreadPoolExecutor(
+                max_workers=min(PROBE_WORKERS, len(candidates))) as pool:
+            if on_progress is None:
+                placements = list(pool.map(assess, candidates))
+            else:
+                # `map` yields in submission order, so the last queue to finish
+                # would be reported as the last to start -- which is exactly
+                # backwards for a progress count. Futures keyed by position
+                # keep the order of the RESULTS while reporting completions as
+                # they land.
+                futures = {pool.submit(assess, q): i
+                           for i, q in enumerate(candidates)}
+                done: dict[int, Placement] = {}
+                for future in _cf.as_completed(futures):
+                    done[futures[future]] = future.result()
+                    on_progress(len(done), len(candidates))
+                placements = [done[i] for i in range(len(candidates))]
+    else:
+        placements = []
+        for queue in candidates:
+            placements.append(assess(queue))
+            if on_progress is not None:
+                on_progress(len(placements), len(candidates))
+
+    for placement in placements:
         if not include_unusable and placement.fatal_blockers:
             continue
         out.append(placement)

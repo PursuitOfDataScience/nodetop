@@ -23,6 +23,20 @@ FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 sys.path.insert(0, str(FIXTURES.parent))
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cache(tmp_path, monkeypatch):
+    """No test reads or writes the developer's own access cache.
+
+    `nodetop.core.access` remembers the last dry-run answer under
+    `$XDG_CACHE_HOME`, so without this every run of the suite would write
+    fixture verdicts into a real cache -- and, worse, a test would pick up what
+    an earlier test left there and take a branch nobody asked for. Found exactly
+    that way: two tests about the idle timer started seeing a background recheck
+    because a previous test had populated the file.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+
 def read(*parts: str) -> str:
     return (FIXTURES.joinpath(*parts)).read_text()
 

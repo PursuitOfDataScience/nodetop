@@ -9,6 +9,7 @@ import pytest
 
 from nodetop.cli import (
     STATUS_ROWS,
+    _node_rows,
     build_parser,
     cmd_backends,
     cmd_check,
@@ -24,6 +25,15 @@ from nodetop.core.model import JobShape
 from nodetop.render import Style, table, width
 
 PLAIN = Style(enabled=False)
+#: Colour on, because the interactive cursor is inverse video and a test that
+#: counts highlights needs the escapes to exist.
+COLOUR = Style(enabled=True)
+
+
+def width_of() -> int:
+    from nodetop.render import term_width
+
+    return term_width()
 
 
 def _args(argv: list[str]):
@@ -465,6 +475,285 @@ class TestAJobHasItsOwnView:
         # own view does not.
         assert any("cores free" in ln for ln in frames[4])
         assert any("n1" in ln for ln in frames[4])
+
+
+class TestTheWaitSaysWhatItIsWaitingFor:
+    """The progress line, and the three ways it must not misbehave.
+
+    1.60s of a 1.93s `status` is dry-runs against somebody else's controller.
+    Nothing here makes that faster; the line makes it legible. Which means the
+    risks are all about what else is on the terminal: debris left behind,
+    carriage returns in a redirected log, and a byte on stdout.
+    """
+
+    def _ticker(self, monkeypatch, on=True):
+        from nodetop.cli import _Ticker
+
+        t = _Ticker(PLAIN, "checking")
+        monkeypatch.setattr(t, "on", on)
+        return t
+
+    def test_it_rewrites_one_line_rather_than_scrolling(self, monkeypatch, capsys):
+        t = self._ticker(monkeypatch)
+        for i in (1, 2, 3):
+            t(i, 3)
+        err = capsys.readouterr().err
+        assert err.count("\n") == 0, repr(err)      # one line, rewritten
+        assert err.split("\r")[0].endswith("1/3")
+        assert "3/3" in err
+
+    def test_clearing_wipes_what_was_written(self, monkeypatch, capsys):
+        t = self._ticker(monkeypatch)
+        t(7, 19)
+        capsys.readouterr()
+        t.clear()
+        wiped = capsys.readouterr().err
+        # Exactly as wide as the widest line written, so it neither leaves
+        # debris nor scrubs the line above.
+        assert wiped.strip("\r") == " " * t.width
+        assert t.width >= len("  checking 7/19")
+
+    def test_nothing_is_written_when_stderr_is_not_a_terminal(
+            self, monkeypatch, capsys):
+        # A redirected stderr is a log file, and a log file full of `\r` is
+        # worse than a log file with no progress in it.
+        t = self._ticker(monkeypatch, on=False)
+        t(1, 2)
+        t.clear()
+        assert capsys.readouterr().err == ""
+
+    def test_stdout_is_never_touched(self, monkeypatch, capsys):
+        # `nodetop status --json | jq` and `nodetop where > file` both have to
+        # survive this.
+        t = self._ticker(monkeypatch)
+        t(1, 2)
+        t.clear()
+        assert capsys.readouterr().out == ""
+
+    def test_a_missing_stderr_does_not_raise(self, monkeypatch):
+        # Under some launchers `sys.stderr` is None; asking it for `isatty` is
+        # then an AttributeError in the middle of a command that was working.
+        from nodetop.cli import _Ticker
+
+        monkeypatch.setattr("sys.stderr", None)
+        t = _Ticker(PLAIN, "checking")
+        assert t.on is False
+        t(1, 2)   # must be a no-op rather than a crash
+        t.clear()
+
+    def test_the_count_is_thread_safe_under_the_probe_pool(self, monkeypatch,
+                                                           capsys):
+        # It is called from the probe pool's workers, three at a time.
+        import threading
+
+        t = self._ticker(monkeypatch)
+        threads = [threading.Thread(target=t, args=(i, 40)) for i in range(1, 41)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        err = capsys.readouterr().err
+        assert err.count("\n") == 0
+        assert err.count("checking") == 40      # nothing interleaved or lost
+
+
+class TestMovingTheCursorDoesNotRebuildTheRows:
+    """The snapshot is fixed between reloads, so the rows are too.
+
+    Every keypress used to rebuild and re-render every row of the partition,
+    with about twenty-five of them on screen. Measured on a synthetic partition
+    the size of the largest one tested -- 10,624 nodes, the shape of a real PBS
+    cluster -- **344 ms per frame**, so that was the cost of one arrow key;
+    17.6 ms at 607 nodes. Built once per browse instead: 0.85 ms and 0.75 ms.
+
+    The risk that comes with caching is a stale cursor, because `highlight`
+    replaces a row in place, so that is what these pin hardest.
+    """
+
+    @staticmethod
+    def _browse(monkeypatch, capsys, replies, count=6, columns=90):
+        import dataclasses
+
+        import nodetop.cli as cli_mod
+        import nodetop.interactive as inter
+        from nodetop.core.cluster import Cluster
+        from nodetop.core.model import Node, Queue
+
+        monkeypatch.setenv("COLUMNS", str(columns))
+        monkeypatch.setenv("LINES", "40")
+        nodes = [Node(name=f"n{i}", state_raw="MIXED", cpus_total=48,
+                      cpus_alloc=i, memory_mb=1000, memory_alloc_mb=i,
+                      queues=("q",)) for i in range(count)]
+        queue = Queue(name="q", node_names=tuple(n.name for n in nodes),
+                      nodes=nodes, declared_nodes=count)
+        cluster = dataclasses.replace(
+            Cluster(backend_name="t", queue_term="partition", nodes=nodes,
+                    queues={"q": queue}), _jobs=[])
+
+        widths = []
+
+        def counting(ns, style):
+            widths.append(width_of())
+            return _node_rows(ns, style)      # the real one, imported above
+
+        monkeypatch.setattr(cli_mod, "_node_rows", counting)
+        frames, answers = [], iter(replies)
+
+        def scripted(render, n, **_kw):
+            # `select` owns the keypress loop and calls `render(index)` once per
+            # key, so walking the cursor here is what a reader holding Down
+            # does -- and it is the path the cache has to survive.
+            for at in range(min(n, 4)):
+                frames.append(list(render(at)))
+            return next(answers, inter.Key.QUIT)
+
+        monkeypatch.setattr(inter, "supported", lambda *_a, **_k: True)
+        monkeypatch.setattr(inter, "select", scripted)
+        monkeypatch.setattr(inter, "read_key", lambda *_a, **_k: inter.Key.QUIT)
+        assert cmd_status(cluster, _args(["status"]), COLOUR) == 0
+        capsys.readouterr()
+        return widths, frames
+
+    #: The partition's row in the status list: the totals line, "open to you",
+    #: then the partitions.
+    ROW = 2
+
+    def test_the_rows_are_built_once_however_far_the_cursor_moves(
+            self, monkeypatch, capsys):
+        builds, _ = self._browse(monkeypatch, capsys, [self.ROW])
+        assert builds == [90], builds          # one build, not one per keypress
+
+    def test_only_the_row_under_the_cursor_carries_it(self, monkeypatch, capsys):
+        # `highlight` replaces a row in place, so a cached list handed out twice
+        # would accumulate cursors -- two rows marked and no way to tell which
+        # one Enter would open.
+        from nodetop.render import Glyphs
+
+        _, frames = self._browse(monkeypatch, capsys, [self.ROW])
+        cursor = Glyphs().cursor
+        node_frames = [f for f in frames if any("n0 " in line for line in f)]
+        assert len(node_frames) >= 3, len(node_frames)
+        for frame in node_frames:
+            marked = [ln for ln in frame if cursor in ln]
+            assert len(marked) == 1, [ln[:60] for ln in marked]
+
+    def test_a_resize_rebuilds_rather_than_stretching_stale_rows(
+            self, monkeypatch, capsys):
+        # `table` sizes its columns to the terminal, so the cache is keyed on
+        # the width and a narrower window must not reuse the wide rendering.
+        narrow, _ = self._browse(monkeypatch, capsys, [self.ROW], columns=70)
+        wide, _ = self._browse(monkeypatch, capsys, [self.ROW], columns=95)
+        assert narrow == [70] and wide == [95], (narrow, wide)
+
+
+class TestTheNodeListStartsTheFetchItsChildNeeds:
+    """The signal is stepping into a node listing, not opening the browse.
+
+    Speculatively firing a whole-cluster `scontrol show job -d` every time
+    somebody looks at the overview would be a worse trade than the hitch it
+    hides -- most readers look and leave. Entering a partition's node list is
+    the point where a job list becomes likely.
+    """
+
+    def _prefetches_at(self, monkeypatch, capsys, replies):
+        """Was the prefetch started, by the time these keys were consumed?"""
+        import dataclasses
+
+        import nodetop.interactive as inter
+        from nodetop.core.cluster import Cluster
+        from nodetop.core.model import Node, Queue
+
+        node = Node(name="n1", state_raw="MIXED", cpus_total=48, cpus_alloc=40,
+                    memory_mb=1000, queues=("q",))
+        queue = Queue(name="q", node_names=("n1",), declared_nodes=1, nodes=[node])
+        cluster = dataclasses.replace(
+            Cluster(backend_name="synthetic", queue_term="partition",
+                    nodes=[node], queues={"q": queue}), _jobs=[])
+        started = []
+        monkeypatch.setattr(type(cluster), "prefetch_job_view",
+                            lambda _self: started.append(1))
+        answers = iter(replies)
+
+        def scripted(render, count, **_kw):
+            got = next(answers, inter.Key.QUIT)
+            render(0 if not isinstance(got, int) else min(got, max(0, count - 1)))
+            return got
+
+        monkeypatch.setattr(inter, "supported", lambda *_a, **_k: True)
+        monkeypatch.setattr(inter, "select", scripted)
+        monkeypatch.setattr(inter, "read_key", lambda *_a, **_k: inter.Key.QUIT)
+        assert cmd_status(cluster, _args(["status"]), PLAIN) == 0
+        capsys.readouterr()
+        return bool(started)
+
+    ROW = 2   # total, "open to you", then the partition row
+
+    def test_opening_the_overview_does_not_start_it(self, monkeypatch, capsys):
+        import nodetop.interactive as inter
+
+        assert self._prefetches_at(monkeypatch, capsys, [inter.Key.QUIT]) is False
+
+    def test_stepping_into_a_node_list_does(self, monkeypatch, capsys):
+        assert self._prefetches_at(monkeypatch, capsys, [self.ROW]) is True
+
+
+class TestTheLeafIsTheEnd:
+    """Right means deeper, and at the job detail there is nothing deeper.
+
+    It returned the index anyway, which the caller could only read as "step
+    back" -- so the key for going in landed on the job list it had just come
+    from: "pressing right arrow will go into the same interface ... this is
+    very confusing". Left is the way back out; Right is nothing.
+    """
+
+    def _flags(self, monkeypatch, capsys, jobs, replies):
+        """The kwargs `select` was handed at each level, in order."""
+        import dataclasses
+
+        import nodetop.interactive as inter
+        from nodetop.core.cluster import Cluster
+        from nodetop.core.model import Node, Queue
+
+        node = Node(name="n1", state_raw="MIXED", cpus_total=48, cpus_alloc=40,
+                    memory_mb=1000, queues=("q",))
+        queue = Queue(name="q", node_names=("n1",), declared_nodes=1, nodes=[node])
+        cluster = dataclasses.replace(
+            Cluster(backend_name="synthetic", queue_term="partition",
+                    nodes=[node], queues={"q": queue}), _jobs=list(jobs))
+        seen: list[dict] = []
+        answers = iter(replies)
+
+        def scripted(render, _count, **kw):
+            seen.append(kw)
+            got = next(answers, inter.Key.QUIT)
+            render(got if isinstance(got, int) else 0)
+            return got
+
+        monkeypatch.setattr(inter, "supported", lambda *_a, **_k: True)
+        monkeypatch.setattr(inter, "select", scripted)
+        monkeypatch.setattr(inter, "read_key", lambda *_a, **_k: inter.Key.QUIT)
+        assert cmd_status(cluster, _args(["status"]), PLAIN) == 0
+        capsys.readouterr()
+        return seen
+
+    ROW = 2   # total, "open to you", then the partition row
+
+    def test_the_job_detail_refuses_to_open_anything(self, monkeypatch, capsys):
+        from nodetop.core.model import Job
+
+        job = Job(id="42", user="alice", cpus=8, nodes=("n1",))
+        seen = self._flags(monkeypatch, capsys, [job], [self.ROW, 0, 0])
+        # partitions, nodes, jobs, job -- the last is the leaf.
+        assert len(seen) == 4
+        assert seen[-1].get("openable") is False
+        # And every level above it still opens, or the browser would not descend.
+        assert all(lvl.get("openable", True) for lvl in seen[:-1])
+
+    def test_a_node_running_nothing_is_a_leaf_too(self, monkeypatch, capsys):
+        # The single row there is a placeholder, not something to open.
+        seen = self._flags(monkeypatch, capsys, [], [self.ROW, 0])
+        assert len(seen) == 3                       # partitions, nodes, jobs
+        assert seen[-1].get("openable") is False
 
 
 class TestJobTotalsAreNotPerNodeShares:

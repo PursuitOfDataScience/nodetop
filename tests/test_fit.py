@@ -483,6 +483,62 @@ class TestClusterHelpers:
         assert bool(cl.gpu_nodes) is expected
 
 
+class TestADeadQueueIsNotWorthARoundTrip:
+    """A dry-run cannot talk round a queue that accepts nothing from anybody.
+
+    `reachable` is already False the moment a fatal blocker exists, whatever the
+    control plane would answer, so asking cost the most expensive thing this
+    tool does and changed nothing on screen. Measured on a 607-node cluster:
+    **3 of 89 probes** on `where --all`, and none at all on the default views,
+    where the entitlement filter has already dropped those partitions before
+    ranking sees them -- a probe is ~90 ms on an idle controller, 3.3s on a
+    busy one, so the saving is small and the reasoning is the point.
+    """
+
+    UP = _node("n1", model=None, gpus=0)
+    DOWN = _node("n2", model=None, gpus=0, conditions=("DOWN",))
+
+    def _asked(self, queue: Queue) -> bool:
+        """Was the control plane asked about this queue?"""
+        cl = _cluster([Queue(name="live", nodes=[self.UP], node_names=("n1",)), queue])
+        backend = _FakeBackend(Verdict(queue=queue.name, allowed=True,
+                                       category=VerdictCategory.OK))
+        asked: list[str] = []
+        real = backend.probe
+        backend.probe = lambda q, s, account=None: (asked.append(q), real(q, s, account))[1]
+        cl._backend = backend
+        rank(cl, JobShape(cpus_per_task=1), use_probe=True, include_unusable=True)
+        return queue.name in asked
+
+    @pytest.mark.parametrize("queue", [
+        Queue(name="disabled", enabled=False, nodes=[UP], node_names=("n1",)),
+        Queue(name="stopped", started=False, nodes=[UP], node_names=("n1",)),
+        Queue(name="no-accounts", allow_accounts=("none",), nodes=[UP],
+              node_names=("n1",)),
+        Queue(name="no-qos", allow_qos=("none",), nodes=[UP], node_names=("n1",)),
+        Queue(name="all-down", nodes=[DOWN], node_names=("n2",)),
+    ], ids=lambda q: q.name)
+    def test_an_operationally_dead_queue_is_not_asked(self, queue):
+        assert self._asked(queue) is False
+
+    def test_a_queue_whose_allowlist_excludes_you_is_still_asked(self):
+        # The thesis of the whole tool: a declared ACL over-reports, and the
+        # control plane is the authority. Skipping this probe would be reading
+        # the config as gospel, which is what everything here argues against.
+        assert self._asked(Queue(name="theirs", allow_accounts=("someone-else",),
+                                nodes=[self.UP], node_names=("n1",))) is True
+
+    def test_a_queue_too_small_for_the_job_is_still_asked(self):
+        # A soft blocker is about the size of the request, not the queue, and
+        # the entitlement answer beside it is still worth having.
+        assert self._asked(Queue(name="tight", max_nodes=1, nodes=[self.UP],
+                                 node_names=("n1",))) is True
+
+    def test_a_live_queue_is_asked(self):
+        assert self._asked(Queue(name="fine", nodes=[self.UP],
+                                 node_names=("n1",))) is True
+
+
 class TestProbeAccounts:
     """Which accounts are worth a control-plane round trip."""
 
@@ -571,6 +627,67 @@ class TestProbeAccounts:
         many = [f"acct{i}" for i in range(50)] + ["winner"]
         q = Queue(name="q", allow_accounts=("winner",))
         assert probe_accounts(q, many, JobShape()) == ["winner"]
+
+
+class TestTheSlowPartCanSayHowFarAlongItIs:
+    """`rank` reports settled queues, because the wait is 83% of the command.
+
+    Measured on a 607-node cluster: `status` takes 1.93s and **1.60s of it is
+    dry-runs**, during which the terminal showed nothing. Painting the
+    partition list first is not available -- the declared list is 19 partitions
+    where the dry-run accepts 8, so a first frame would over-report by eleven
+    and then take them away -- so the wait stays and says what it is for.
+
+    `rank` hands over two integers and knows nothing about terminals; see
+    `_Ticker` in the CLI for the half that does.
+    """
+
+    QUEUES = [Queue(name=f"q{i}", nodes=[_node(f"n{i}", model=None, gpus=0)],
+                    node_names=(f"n{i}",)) for i in range(5)]
+
+    def _ranked(self, **kw):
+        cl = _cluster(self.QUEUES)
+        cl._backend = _FakeBackend(Verdict(queue="q0", allowed=True,
+                                           category=VerdictCategory.OK))
+        seen: list[tuple[int, int]] = []
+        places = rank(cl, JobShape(cpus_per_task=1), use_probe=True,
+                      include_unusable=True, on_progress=lambda d, t: seen.append((d, t)),
+                      **kw)
+        return places, seen
+
+    def test_every_queue_is_counted_exactly_once_and_it_ends_at_the_total(self):
+        _, seen = self._ranked()
+        assert [d for d, _ in seen] == [1, 2, 3, 4, 5]
+        assert {t for _, t in seen} == {5}
+
+    def test_the_results_keep_their_order_however_the_probes_finish(self):
+        # The count is completion order; the RETURN is not. `pool.map` gave both
+        # for free and reported the slowest queue as the last to start, which is
+        # backwards for a progress line -- so the futures are keyed by position
+        # and reassembled. Ranking then sorts, which is the point of `rank`, so
+        # what this pins is that nothing is lost or duplicated on the way.
+        places, _ = self._ranked()
+        assert sorted(p.queue for p in places) == [q.name for q in self.QUEUES]
+
+    def test_a_single_queue_still_reports(self):
+        # One candidate takes the sequential path, which is a separate branch
+        # and the one a small cluster always uses.
+        cl = _cluster(self.QUEUES[:1])
+        cl._backend = _FakeBackend(Verdict(queue="q0", allowed=True,
+                                           category=VerdictCategory.OK))
+        seen: list[tuple[int, int]] = []
+        rank(cl, JobShape(cpus_per_task=1), use_probe=True, include_unusable=True,
+             on_progress=lambda d, t: seen.append((d, t)))
+        assert seen == [(1, 1)]
+
+    def test_no_callback_is_the_default_and_changes_nothing(self):
+        cl = _cluster(self.QUEUES)
+        cl._backend = _FakeBackend(Verdict(queue="q0", allowed=True,
+                                           category=VerdictCategory.OK))
+        quiet = rank(cl, JobShape(cpus_per_task=1), use_probe=True,
+                     include_unusable=True)
+        loud, _ = self._ranked()
+        assert [p.queue for p in quiet] == [p.queue for p in loud]
 
 
 class TestVerdictLabel:

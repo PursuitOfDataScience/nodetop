@@ -434,6 +434,40 @@ class TestNavigationHasThreeOutcomes:
                      write=lambda _s: None, raw=False, escapable=False)
         assert got == Key.QUIT
 
+    def test_right_at_a_leaf_does_nothing(self):
+        """The mirror of Left at the root, and it was missing.
+
+        Right means "deeper" everywhere in this browser, and at the job detail
+        there is nothing deeper. It returned the index anyway, which the caller
+        could only read as "step back" -- so the key for going in jumped a
+        level out, landing on the job list it had just come from: "pressing
+        right arrow will go into the same interface ... this is very
+        confusing."
+        """
+        # Right three times, then Left. Only the Left may end it.
+        seq = iter([Key.RIGHT, Key.RIGHT, Key.RIGHT, Key.BACK])
+        got = select(lambda _i: ["detail"], 1, keys=lambda: next(seq, Key.QUIT),
+                     write=lambda _s: None, raw=False, openable=False)
+        assert got == Key.BACK
+
+    def test_enter_at_a_leaf_does_nothing_either(self):
+        # Enter is "open the selected thing", and at a leaf there is no such
+        # thing. It must not stand in for going back.
+        seq = iter([Key.ENTER, Key.ENTER, Key.ESCAPE])
+        got = select(lambda _i: ["detail"], 1, keys=lambda: next(seq, Key.QUIT),
+                     write=lambda _s: None, raw=False, openable=False)
+        assert got == Key.BACK
+
+    def test_quit_still_leaves_from_a_leaf(self):
+        assert select(lambda _i: ["detail"], 1, keys=lambda: Key.QUIT,
+                      write=lambda _s: None, raw=False, openable=False) == Key.QUIT
+
+    def test_a_normal_level_still_opens_on_right(self):
+        # The flag is off by default: every level above the leaf keeps working.
+        got = select(lambda _i: ["a", "b"], 2, keys=lambda: Key.RIGHT,
+                     write=lambda _s: None, raw=False)
+        assert got == 0
+
     def test_left_at_the_root_still_does_nothing(self):
         seq = iter([Key.BACK, Key.BACK, Key.ENTER])
         got = select(lambda _i: ["a", "b"], 2, keys=lambda: next(seq, Key.QUIT),

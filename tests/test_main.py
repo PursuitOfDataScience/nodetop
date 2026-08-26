@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -222,6 +223,328 @@ class TestBackendSelection:
         capsys.readouterr()
 
 
+class TestTheJobViewsWaitIsHiddenNotPaid:
+    """Opening a node's job list was a visible stall, and it had two halves.
+
+    That frame waits on two lazy queries, measured cold on a 2,116-job cluster:
+    175 ms for `jobs` (from `squeue`) and 1042 ms for `allocations` (a 9 MB
+    `scontrol show job -d` plus ~92 ms of parsing). Stepping into a partition's
+    node list starts both, so the wait happens while the reader is choosing a
+    row. With only the shares warmed, `jobs` still cost 126 ms on the keypress
+    -- half a fix. With both: 0.3 ms after half a second of reading.
+    """
+
+    def test_it_warms_both_halves(self):
+        # One of these used to be missed, and the frame needs both before it
+        # can draw a single row.
+        asked = []
+        cluster = self._cluster(lambda: asked.append("allocations") or [])
+        cluster._backend.load_jobs = lambda: asked.append("jobs") or []
+        cluster.prefetch_job_view()
+        for _ in range(200):
+            if len(asked) == 2:
+                break
+            time.sleep(0.01)
+        # `jobs` first: the frame reads it first and it is six times cheaper.
+        assert asked == ["jobs", "allocations"], asked
+
+    @staticmethod
+    def _cluster(loader):
+        from nodetop.core.cluster import Cluster
+        from nodetop.core.model import BackendCapabilities
+
+        class _Backend:
+            name, queue_term = "test", "queue"
+
+            def load_allocations(self):
+                return loader()
+
+            def load_jobs(self):
+                return []
+
+            def capabilities(self):
+                return BackendCapabilities(probe=False)
+
+        return Cluster(backend_name="test", capabilities=BackendCapabilities(),
+                       _backend=_Backend())
+
+    def test_it_returns_before_the_work_is_done(self):
+        import threading
+        import time
+
+        started, release = threading.Event(), threading.Event()
+
+        def slow():
+            started.set()
+            release.wait(5)
+            return []
+
+        cluster = self._cluster(slow)
+        begun = time.time()
+        cluster.prefetch_job_view()
+        assert time.time() - begun < 0.5      # it must not block the frame
+        assert started.wait(5), "the fetch never started"
+        release.set()
+
+    def test_the_view_and_the_prefetch_do_not_both_fetch(self):
+        # One whole-cluster query is the most expensive duplicate available.
+        calls = []
+
+        def counted():
+            calls.append(1)
+            return []
+
+        cluster = self._cluster(counted)
+        cluster.prefetch_job_view()
+        cluster.allocations()
+        cluster.allocations()
+        assert len(calls) == 1, calls
+
+    def test_a_failing_prefetch_is_recorded_not_raised(self):
+        def boom():
+            raise RuntimeError("scontrol died")
+
+        cluster = self._cluster(boom)
+        cluster.prefetch_job_view()
+        # The view still works, and says what went wrong.
+        assert cluster.allocations() == {}
+        assert "allocations" in cluster.errors
+
+    def test_it_does_nothing_once_the_answer_is_in_hand(self):
+        calls = []
+        cluster = self._cluster(lambda: calls.append(1) or [])
+        cluster.allocations()
+        cluster.prefetch_job_view()
+        cluster.prefetch_job_view()
+        assert len(calls) == 1
+
+
+class TestOneSnapshotIsTakenConcurrently:
+    """The queries behind a snapshot are independent reads, so they overlap.
+
+    Measured on a 607-node cluster, five interleaved rounds: 0.57s issuing them
+    one after another against 0.23s together, out of a 10.26s run whose 3.53s
+    of queries this was. Nothing races on the control plane's side -- these
+    commands only look -- and the readings land closer together in time, which
+    is the property this class exists to provide.
+    """
+
+    def test_a_failure_in_one_query_is_still_recorded_against_its_name(self):
+        # The errors dict is written from several threads now.
+        from nodetop.core.cluster import Cluster
+
+        class _Half:
+            name, queue_term = "half", "queue"
+
+            def load_nodes(self):
+                raise RuntimeError("nodes are gone")
+
+            def load_queues(self):
+                raise RuntimeError("queues are gone")
+
+            def load_limits(self):
+                return {}
+
+            def load_identity(self):
+                return None
+
+            def load_node_free_times(self):
+                raise RuntimeError("no free times")
+
+            def capabilities(self):
+                from nodetop.core.model import BackendCapabilities
+
+                return BackendCapabilities(probe=False)
+
+        cluster = Cluster.load(_Half(), with_free_times=True)
+        assert sorted(cluster.errors) == ["free_times", "nodes", "queues"]
+        assert "nodes are gone" in cluster.errors["nodes"]
+        assert cluster.nodes == [] and cluster.queues == {}
+
+    def test_a_shared_answer_is_still_fetched_once(self):
+        # Slurm's `load_nodes` and `load_identity` both read `scontrol show
+        # config`, and they now run together: without a lock they would each
+        # fetch it, which is two readings of one file in one report.
+        from nodetop.backends.slurm import SlurmBackend
+        from nodetop.core.cluster import Cluster
+        from nodetop.runner import RecordedRunner
+
+        runner = RecordedRunner({
+            "scontrol show node": (
+                0, "NodeName=n1 CPUTot=8 State=IDLE Partitions=p\n", ""),
+            "scontrol show partition": (
+                0, "PartitionName=p\n   State=UP\n   TotalNodes=1\n", ""),
+            "scontrol show config": (
+                0, "SelectTypeParameters = CR_CORE_MEMORY\n"
+                   "DefMemPerCPU = 1000\nAccountingStorageEnforce = associations\n", ""),
+            "sacctmgr": (0, "acct||qos\n", ""),
+            "squeue": (0, "", ""),
+        })
+        Cluster.load(SlurmBackend(runner), with_free_times=True)
+        config = [c for c in runner.calls if "config" in " ".join(c)]
+        assert len(config) == 1, config
+
+
+class TestABrowseCanAskForFresherNumbers:
+    """A browse renders ONE read for as long as it is open, and clusters move.
+
+    Every number in a report has to describe one instant, so the frame is a
+    single snapshot and deliberately not re-rendered in place. That leaves the
+    reader studying figures that stopped being true minutes ago, with nothing
+    saying so. `r` -- and an idle interval where a re-read is cheap -- asks for
+    the whole reading again; `main` takes it and the browse reopens on the row
+    it was on.
+    """
+
+    def _run(self, monkeypatch, replies):
+        """Drive `main` with scripted `select` results; count the loads."""
+        import nodetop.interactive as inter
+        from nodetop.core.cluster import Cluster
+
+        loads = {"n": 0}
+        real = Cluster.load
+
+        @classmethod
+        def counting(_cls, *a, **kw):
+            loads["n"] += 1
+            return real(*a, **kw)
+
+        monkeypatch.setattr(Cluster, "load", counting)
+        monkeypatch.setattr(inter, "supported", lambda *_a, **_k: True)
+        monkeypatch.setattr(inter, "read_key", lambda *_a, **_k: inter.Key.QUIT)
+        answers = iter(replies)
+        seen: list[dict] = []
+
+        def scripted(render, count, **kw):
+            seen.append(kw)
+            got = next(answers, inter.Key.QUIT)
+            render(0 if not isinstance(got, int) else min(got, max(0, count - 1)))
+            return got
+
+        monkeypatch.setattr(inter, "select", scripted)
+        rc = main(["status"])
+        return rc, loads["n"], seen
+
+    def test_a_reload_takes_the_reading_again(self, monkeypatch, capsys):
+        import nodetop.interactive as inter
+
+        rc, loads, _ = self._run(
+            monkeypatch, [inter.Key.RELOAD, inter.Key.RELOAD, inter.Key.QUIT])
+        capsys.readouterr()
+        assert rc == 0            # and never the sentinel
+        assert loads == 3         # the first read, then one per reload
+
+    def test_it_reopens_where_the_reader_was(self, monkeypatch, capsys):
+        # Two levels down, then a reload: the rebuilt browse must not dump the
+        # reader back at the top of the partition list.
+        import nodetop.interactive as inter
+        from nodetop.cli import _RESUME_CURSORS, _RESUME_STACK
+
+        _RESUME_STACK.clear()
+        _RESUME_CURSORS.clear()
+        rc, loads, _ = self._run(monkeypatch, [0, 0, inter.Key.RELOAD])
+        capsys.readouterr()
+        assert rc == 0
+        assert loads == 2
+        # Consumed by the reopened browse, so it cannot leak into the next run.
+        assert not _RESUME_STACK and not _RESUME_CURSORS
+
+    def test_the_sentinel_never_escapes_as_an_exit_status(self, monkeypatch, capsys):
+        import nodetop.interactive as inter
+        from nodetop.cli import RELOAD
+
+        rc, _, _ = self._run(monkeypatch, [inter.Key.RELOAD, inter.Key.QUIT])
+        capsys.readouterr()
+        assert rc != RELOAD
+        assert rc == 0
+
+    def test_a_slow_rebuild_switches_the_timer_off(self, monkeypatch, capsys):
+        """The dry-runs count towards the cost, even though the load does not.
+
+        `status` re-runs a dry-run per partition, so a rebuild can cost far more
+        than the queries it starts with -- ~20s against 3.3s on one 607-node
+        cluster. Pacing off `load_seconds` alone would stall the view under the
+        reader's hands, so the browse stamps what the rebuild *actually* took at
+        the moment it has something to show. Simulated here by making the
+        dry-run pass slow, which is the thing that is missing from
+        `load_seconds`.
+        """
+        import nodetop.cli as cli
+        import nodetop.interactive as inter
+        from nodetop.cli import _TURNAROUND
+
+        monkeypatch.setenv("NODETOP_ACCESS_TTL", "0")   # no remembered answer
+        real = cli.rank
+
+        def slow(cluster, shape, **kw):
+            if kw.get("use_probe"):
+                time.sleep(1.2)
+            return real(cluster, shape, **kw)
+
+        monkeypatch.setattr(cli, "rank", slow)
+        _TURNAROUND.clear()
+        try:
+            _rc, _loads, seen = self._run(monkeypatch, [inter.Key.QUIT])
+            capsys.readouterr()
+            assert seen[0].get("idle") is None
+        finally:
+            _TURNAROUND.clear()
+
+    def test_the_reader_sitting_there_is_not_part_of_the_cost(self, monkeypatch,
+                                                              capsys):
+        """What the previous version of this measured, and why it was wrong.
+
+        `main` timed the whole dispatch, and for an interactive command that
+        includes however long the reader looked at the screen. So the first idle
+        refresh after five seconds concluded a rebuild costs five seconds and
+        switched the refresh off for good: **one re-read in a hundred idle
+        seconds**, where the point was a paced series of them. Found by counting
+        query bursts against a live session, not by a test.
+        """
+        import nodetop.cli as cli
+        import nodetop.interactive as inter
+
+        monkeypatch.setenv("NODETOP_ACCESS_TTL", "0")
+        cli._TURNAROUND.clear()
+        cli._IDLE_BACKOFF[0] = 0
+
+        def dawdling(render, _count, **_kw):
+            render(0)
+            time.sleep(0.6)          # the reader, thinking
+            return inter.Key.QUIT
+
+        monkeypatch.setattr(inter, "supported", lambda *_a, **_k: True)
+        monkeypatch.setattr(inter, "select", dawdling)
+        monkeypatch.setattr(inter, "read_key", lambda *_a, **_k: inter.Key.QUIT)
+        cli.main(["status"])
+        capsys.readouterr()
+        assert cli._TURNAROUND, "the browse never stamped what the rebuild cost"
+        assert cli._TURNAROUND[-1] < 0.6, cli._TURNAROUND
+
+    def test_an_idle_interval_is_offered_only_where_a_re_read_is_cheap(
+            self, monkeypatch, capsys):
+        monkeypatch.setenv("NODETOP_ACCESS_TTL", "0")   # see the test above
+        # 0.07s on one cluster, 70s on another. A fixed interval would either
+        # waste the first or wreck the second, so the browse asks what the last
+        # read cost.
+        import dataclasses
+
+        import nodetop.interactive as inter
+        from nodetop.core.cluster import Cluster
+
+        real = Cluster.load
+        for cost, expected in ((0.05, True), (9.0, False)):
+
+            @classmethod
+            def priced(_cls, *a, c=cost, **kw):
+                return dataclasses.replace(real(*a, **kw), load_seconds=c)
+
+            monkeypatch.setattr(Cluster, "load", priced)
+            _rc, _loads, seen = self._run(monkeypatch, [inter.Key.QUIT])
+            capsys.readouterr()
+            assert bool(seen[0].get("idle")) is expected, (cost, seen[0])
+
+
 class TestClosingThePipeIsNotAnError:
     """`nodetop health | head` is how a long report gets read.
 
@@ -253,6 +576,134 @@ class TestClosingThePipeIsNotAnError:
         )
         assert "BrokenPipeError" not in out.stderr
         assert "Exception ignored" not in out.stderr
+
+
+class TestABrowseNobodyIsWatchingBacksOff:
+    """The refresh interval doubles while nobody is there, and any key resets it.
+
+    A browse re-reads by itself when a re-read is cheap, and remembering the
+    access answer made it cheap on a cluster where it never used to be. So a
+    terminal that used to sit still started re-reading every 6.6s forever, six
+    queries at a time -- fine for one reader, and 45 queries a second if fifty
+    people leave one open. Counted with `ps` against a live session, which is
+    how it was noticed at all.
+    """
+
+    def test_the_interval_doubles_each_untouched_refresh(self):
+        from nodetop.cli import _IDLE_BACKOFF, _IDLE_CAP, _IDLE_FIRED, _touched
+
+        class Keys:
+            RELOAD = "\x00reload"
+
+        _IDLE_BACKOFF[0] = 0
+        _IDLE_FIRED[0] = False
+        seen = []
+        for _ in range(12):
+            seen.append(min(6.6 * (2 ** _IDLE_BACKOFF[0]), _IDLE_CAP))
+            # what `still_waiting` does when the quiet timer expires
+            _IDLE_BACKOFF[0] += 1
+            _IDLE_FIRED[0] = True
+            _touched(Keys.RELOAD, Keys)
+        assert seen[:4] == [6.6, 13.2, 26.4, 52.8]
+        assert seen[-1] == _IDLE_CAP          # and it stops there
+        _IDLE_BACKOFF[0] = 0
+
+    def test_a_keypress_puts_it_back(self):
+        from nodetop.cli import _IDLE_BACKOFF, _IDLE_FIRED, _touched
+
+        class Keys:
+            RELOAD = "\x00reload"
+
+        _IDLE_BACKOFF[0] = 5
+        _IDLE_FIRED[0] = False
+        _touched(3, Keys)                     # a row was opened
+        assert _IDLE_BACKOFF[0] == 0
+
+    def test_an_explicit_reload_puts_it_back_too(self):
+        # `r` and the timer both come back as RELOAD, so the timer flags itself
+        # on the way out; anything else is a person.
+        from nodetop.cli import _IDLE_BACKOFF, _IDLE_FIRED, _touched
+
+        class Keys:
+            RELOAD = "\x00reload"
+
+        _IDLE_BACKOFF[0] = 5
+        _IDLE_FIRED[0] = False                # not the timer: someone pressed r
+        _touched(Keys.RELOAD, Keys)
+        assert _IDLE_BACKOFF[0] == 0
+
+    def test_a_browse_hands_the_backed_off_interval_to_select(self, monkeypatch,
+                                                              capsys):
+        import nodetop.cli as cli
+        import nodetop.interactive as inter
+
+        monkeypatch.setenv("NODETOP_ACCESS_TTL", "0")   # no recheck poll here
+        cli._IDLE_BACKOFF[0] = 3
+        seen = []
+
+        def scripted(render, _count, **kw):
+            seen.append(kw.get("idle"))
+            render(0)
+            return inter.Key.QUIT
+
+        monkeypatch.setattr(inter, "supported", lambda *_a, **_k: True)
+        monkeypatch.setattr(inter, "select", scripted)
+        monkeypatch.setattr(inter, "read_key", lambda *_a, **_k: inter.Key.QUIT)
+        monkeypatch.setattr(cli, "_TURNAROUND", [0.05])
+        try:
+            cli.main(["status"])
+        finally:
+            cli._IDLE_BACKOFF[0] = 0
+        capsys.readouterr()
+        # 8x whatever the base was, or the cap.
+        assert seen and seen[0] is not None
+        assert seen[0] >= 5.0 * 8 or seen[0] == cli._IDLE_CAP
+
+
+class TestCtrlCIsAnAnswerNotACrash:
+    """An interrupt before the browse opens had nowhere to land.
+
+    `select` has always caught it -- Ctrl-C while browsing quits -- but the
+    window a reader is most likely to use it in is the wait *before* the first
+    frame: the dry-runs are 1.6s of a 1.93s `status`. There the interrupt
+    arrived inside the probe pool's shutdown join and printed twenty lines of
+    `threading.py ... waiter.acquire()`. Verified against the real controller
+    afterwards: exit **130** in 0.5-1.0s (one in-flight `sbatch`), no traceback.
+    """
+
+    def test_the_load_being_interrupted_exits_130(self, monkeypatch, capsys):
+        import nodetop.cli as cli
+
+        def interrupted(*_a, **_k):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli.Cluster, "load", staticmethod(interrupted))
+        assert cli.main(["queues"]) == 130
+        # 130 is 128 + SIGINT, which is what a shell reports for Ctrl-C.
+        assert "Traceback" not in capsys.readouterr().err
+
+    def test_a_command_being_interrupted_exits_130(self, monkeypatch, capsys):
+        # The other side of the same window: the load finished, the dry-runs are
+        # running, and the reader gives up.
+        import nodetop.cli as cli
+
+        monkeypatch.setitem(cli._COMMANDS, "queues",
+                            lambda *_a: (_ for _ in ()).throw(KeyboardInterrupt))
+        assert cli.main(["queues"]) == 130
+        capsys.readouterr()
+
+    def test_the_progress_line_is_closed_before_the_prompt_returns(
+            self, monkeypatch, capsys):
+        # The ticker writes with `\r` and no newline, so an interrupt mid-count
+        # would leave the shell prompt inside "checking ... 5/19".
+        import nodetop.cli as cli
+
+        def interrupted(*_a, **_k):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli.Cluster, "load", staticmethod(interrupted))
+        cli.main(["queues"])
+        assert capsys.readouterr().err.endswith("\n")
 
 
 class TestAnOldInterpreterSaysSoInsteadOfBlamingTheCluster:

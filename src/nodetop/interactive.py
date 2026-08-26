@@ -46,6 +46,11 @@ class Key:
     #: Escape is how a reader leaves.
     ESCAPE = "escape"
     QUIT = "quit"
+    #: Re-read the cluster and redraw. A browse renders one snapshot for as long
+    #: as it is open, and a cluster changes every second, so there has to be a
+    #: way to ask again -- explicitly with `r`, and on a timer where a re-read is
+    #: cheap enough to spend without being noticed.
+    RELOAD = "reload"
     TOP = "top"
     BOTTOM = "bottom"
     OTHER = "other"
@@ -68,6 +73,7 @@ _KEYS = {
     "\x1b": Key.ESCAPE, "\x7f": Key.BACK, "h": Key.BACK,
     "q": Key.QUIT, "\x03": Key.QUIT, "\x04": Key.QUIT,
     "g": Key.TOP, "G": Key.BOTTOM,
+    "r": Key.RELOAD,
 }
 
 #: How long to wait for the rest of an escape sequence. Long enough that a
@@ -176,6 +182,25 @@ def input_pending() -> bool:
         return bool(ready)
     except Exception:  # pragma: no cover - closed or non-selectable descriptor
         return False
+
+
+def key_ready(timeout: float) -> bool:
+    """Is a keystroke available within ``timeout`` seconds?
+
+    True on a terminal that has one queued, and **True whenever stdin is not a
+    terminal** -- an injected key source in a test must never be told to wait,
+    and a run with stdin redirected has no idle to speak of. False is what makes
+    an idle refresh fire, so the safe default is "a key is coming".
+    """
+    try:
+        if not sys.stdin.isatty():
+            return True
+        import select as _select
+
+        ready, _, _ = _select.select([sys.stdin.fileno()], [], [], timeout)
+        return bool(ready)
+    except Exception:  # pragma: no cover - closed or non-selectable descriptor
+        return True
 
 
 def read_key(readch: Callable[[float | None], str] | None = None) -> str:
@@ -337,7 +362,11 @@ def select(
     erase: bool = True,
     rows: Sequence[int] | None = None,
     escapable: bool = True,
+    openable: bool = True,
+    idle: float | None = None,
+    on_idle: Callable[[], bool] | None = None,
     pending: Callable[[], bool] | None = None,
+    wait: Callable[[float], bool] | None = None,
 ) -> int | str:
     """Move a highlight over ``count`` rows; return the chosen index or ``None``.
 
@@ -368,20 +397,42 @@ def select(
     and Left and Right move *within* one; Right at the end of a row opens, which
     is what it does everywhere else.
 
+    ``openable`` is False at a LEAF, where there is nothing to step into. Right
+    and Enter there do nothing, and only Left, Escape and `q` leave -- the mirror
+    of ``escapable`` at the root, and for the same reason. It used to return the
+    index, and a caller with nothing deeper to open read that as "step back", so
+    Right at the job detail landed on the job list: "pressing right arrow will
+    go into the same interface ... this is very confusing". Right means deeper
+    everywhere in this tool, and at the bottom deeper is nowhere.
+
     ``escapable`` is False at the root of a stack, where there is nothing to step
     back to. Left there does nothing: it used to return, and returning at the
     root exits, so a stray press took the whole program down -- "when pressing
     the left arrow, the entire app is gone". Escape is not a movement, so at the
     root it means what a reader means by it and leaves.
 
-    ``keys`` and ``write`` are injectable so the loop can be driven by a test
-    without a terminal, which is the only way this path gets exercised at all.
+    ``idle`` is how many seconds of quiet mean "ask the cluster again": with it
+    set, a browse that nobody is touching returns :data:`Key.RELOAD` instead of
+    blocking forever on a snapshot that gets older every second. Left unset the
+    view is as static as it always was, which is what an expensive cluster
+    wants -- the caller decides, from what its own last read cost.
+
+    ``on_idle`` makes that timeout a *question* rather than a decision: it is
+    called each time the wait expires and only ``True`` means reload. That is
+    what lets a caller poll something of its own -- a background access check --
+    on a short interval without turning every quiet quarter-second into a
+    re-read. Unset, the timeout means reload exactly as it used to.
+
+    ``keys``, ``write`` and ``wait`` are injectable so the loop can be driven by
+    a test without a terminal, which is the only way this path gets exercised at
+    all.
     """
     if count <= 0:
         return Key.BACK
     keys = keys or read_key
     out = write or (lambda s: (sys.stdout.write(s), sys.stdout.flush()))
     pending = pending or input_pending
+    wait = wait or key_ready
     index = max(0, min(initial, count - 1))
     painted = 0
     # Entry -> display row, and the entries on each row in order. A flat list
@@ -435,13 +486,25 @@ def select(
         paint()
         skipped = 0
         while True:
+            # The clock, before the blocking read: with nothing queued for
+            # `idle` seconds the caller is handed RELOAD so it can re-read and
+            # come back, rather than the reader studying numbers that stopped
+            # being true a minute ago.
+            if idle is not None and not wait(idle):
+                if on_idle is None or on_idle():
+                    return Key.RELOAD
+                # The caller looked and said "not yet". Back to waiting, which
+                # is the difference between polling and refreshing.
+                continue
             try:
                 key = keys()
             except KeyboardInterrupt:
                 return Key.QUIT
+            if key == Key.RELOAD:
+                return key
             if key == Key.QUIT:
                 return key
-            if key == Key.ENTER:
+            if key == Key.ENTER and openable:
                 return index
             if key == Key.ESCAPE:
                 # Out of this view, or out of the program when this is the only
@@ -465,7 +528,7 @@ def select(
                 column = siblings.index(index)
                 if column + 1 < len(siblings):
                     index = siblings[column + 1]
-                else:
+                elif openable:
                     return index          # nothing further right: open it
             elif key == Key.TOP:
                 index = by_row[order[0]][0]

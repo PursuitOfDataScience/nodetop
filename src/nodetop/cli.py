@@ -10,19 +10,19 @@ Kubernetes) but the reasoning does not.
 from __future__ import annotations
 
 import argparse
-import difflib
-import json
-import pathlib
 import re
 import signal
 import sys
+import threading
+import time
 from collections.abc import Callable, Sequence
 from datetime import datetime
+from typing import ClassVar
 
 from . import backends as backend_registry
-from . import interactive
 from ._version import VERSION
 from .backends.base import Backend
+from .core import access
 from .core.cluster import Cluster
 from .core.duration import (
     format_age,
@@ -31,6 +31,7 @@ from .core.duration import (
     parse_timestamp,
 )
 from .core.fit import (
+    PROBE_WORKERS,
     Placement,
     ProbeBudget,
     probe_accounts,
@@ -244,6 +245,16 @@ def _reject_unknown_queues(cluster: Cluster, args: argparse.Namespace,
     unknown = [w for w in wanted if w not in cluster.queues]
     if not unknown:
         return 0
+    # Imported here, not at the top. `difflib` is 1.1 ms and `pathlib` 8.5 ms
+    # of a start that is 83 ms in total, and between them they are reached by
+    # exactly four call sites: this error path, and the two ends of `snapshot`.
+    # Every other command paid for both and used neither. Deferring an import
+    # that a hot path needs would only move the cost, so the test in
+    # `test_startup.py` names these two by module and asserts they are absent
+    # after an ordinary command -- the property is "not on the common path",
+    # which is not visible in the code once the import is inside a function.
+    import difflib
+
     term = cluster.queue_term
     for name in unknown:
         # A near miss is worth naming: with 87 partitions the answer to "which
@@ -279,6 +290,249 @@ NODE_ALIGNS = ["left", "left", "left", "left", "right", "left", "right", "left",
 NODE_LIMITS = [0, 0, 24, 18, 0, 0, 0, 0, 34]
 
 
+def _interactive():
+    """The keyboard layer, imported when something is actually going to browse.
+
+    Deferred because on an NFS home every module file is a network round trip.
+    Measured on a cluster whose home is NFS: the interpreter floor is 64 ms and
+    `import nodetop` is 443 ms, which is roughly **19 ms per module** -- and
+    only a non-`--json` `status` ever needs this one. `--version`, `--help`,
+    `nodes`, `queues`, `health`, `accelerators`, `where` and `check` now do not
+    pay for it at all.
+
+    Returns the module rather than binding names, so a test that patches
+    `nodetop.interactive.select` is still patching the object this uses: both
+    reach the same entry in `sys.modules`.
+    """
+    from . import interactive
+
+    return interactive
+
+
+#: Returned by a command that wants the whole snapshot taken again.
+#:
+#: A browse renders ONE read for as long as it is open -- deliberately, because
+#: every number in a report has to describe one instant -- and a cluster changes
+#: every second, so the only honest way to show current figures is to take the
+#: reading again and rebuild from it. `main` loops on this; nothing else may
+#: return it, and it is never an exit status.
+RELOAD = -1
+
+#: What the last full command turnaround cost, in seconds -- the load AND
+#: everything the command did with it. `status` re-runs a dry-run per partition,
+#: which on one 607-node cluster made a rebuild take ~20s against a 3.3s load,
+#: so pacing an automatic refresh off the load alone would stall the view under
+#: the reader's hands.
+#:
+#: **Measured up to the first frame, not to the end of the command.** `main`
+#: used to time the whole dispatch, and for an interactive command that includes
+#: however long the reader sat looking at it -- so the first idle refresh after
+#: five seconds concluded that a rebuild costs five seconds and switched the
+#: refresh off for good. One re-read in a hundred idle seconds, where the point
+#: was a paced series of them. Invisible until the access cache made the refresh
+#: happen at all, and found by counting query bursts against a live session.
+_TURNAROUND: list[float] = []
+
+#: When the current command started, so a browse can stamp `_TURNAROUND` the
+#: moment it has something on screen. Emptied by whoever stamps it, so `main`
+#: knows a printout still needs timing end to end -- there the whole command
+#: *is* the turnaround.
+_STARTED: list[float] = []
+
+#: How many refreshes in a row nobody has touched, and whether the last reload
+#: was one of them. Module state because it has to survive the reload it causes.
+#:
+#: A browse re-reads by itself when a re-read is cheap, and the access cache made
+#: it cheap on a cluster where it never used to be -- so an idle terminal that
+#: used to sit still now re-read every 6.6s, forever, six queries at a time. Fine
+#: for one reader; fifty terminals left open is 45 queries a second against a
+#: controller that has jobs to schedule. So the interval doubles each time the
+#: refresh finds nobody there, up to :data:`_IDLE_CAP`, and any keypress puts it
+#: back. A terminal in use stays as current as it was; one nobody is watching
+#: settles at one re-read every five minutes.
+_IDLE_BACKOFF: list[int] = [0]
+_IDLE_FIRED: list[bool] = [False]
+
+#: The longest an untouched browse will wait before re-reading. Five minutes:
+#: long enough to stop mattering, short enough that a reader coming back to a
+#: terminal is looking at something from this five minutes and the age line says
+#: which.
+_IDLE_CAP = 300.0
+
+#: Where a browse was when it asked for the reload, so the rebuilt view opens on
+#: the same row rather than at the top. Module state because it outlives the
+#: command that set it, by exactly one iteration of `main`'s loop -- and typed
+#: precisely rather than as a bag of `object`, since both halves are read back
+#: as a stack and a cursor map.
+_RESUME_STACK: list[tuple[str, str]] = []
+_RESUME_CURSORS: dict[tuple[str, str], int] = {}
+
+
+def _print_json(payload: object) -> None:
+    """The one place `--json` is written, and the reason `json` is not imported.
+
+    Every command's machine-readable form used to call `json.dumps` directly,
+    which meant the module was imported by `import nodetop.cli` -- so `status`,
+    `nodes`, a browse, `--help`, every run that never emits JSON paid for
+    `json`, `json.decoder`, `json.encoder` and `json.scanner`. Measured, two
+    trees differing only in this import, 21 alternating pairs: **-1.9 ms** on
+    `--version` and -1.8 ms on `--help` locally, and *nothing* on the NFS home
+    (-3.6 ms by minimum, +3.8 ms by median -- noise either way). The ~19 ms
+    per-module NFS figure that motivated this applies to THIS package's files on
+    a cold cache; the standard library's are read by every Python process on the
+    machine and are already cached.
+
+    `indent=2, default=str` in one place rather than eleven, too. Those had
+    drifted: **two** of the eleven passed `default=str` and nine did not, so
+    whether a datetime in a payload serialised or raised `TypeError` depended on
+    which command was asked. No payload happens to carry one today -- every
+    command's output is byte-identical after this change -- which is exactly the
+    kind of latent difference that surfaces the day a field is added.
+    """
+    import json
+
+    print(json.dumps(payload, indent=2, default=str))
+
+
+class _Recheck:
+    """Re-ask the control plane in the background; say whether the answer moved.
+
+    The half of :mod:`nodetop.core.access` that keeps a remembered answer
+    honest. A browse that opened on the last run's verdicts starts one of these
+    immediately; about 1.6s later -- the same wait the reader used to sit
+    through before seeing anything -- it has the fresh answer. If it matches,
+    nothing happens at all: no repaint, no flicker, and the reader never learns
+    there was a check. If it does not, the browse reloads itself, which is
+    exactly what `r` does and lands the cursor back on the same row.
+
+    So the screen is at most a couple of seconds behind the control plane rather
+    than as old as the cache, and the fast start costs a correction that is
+    almost never needed and always visible when it is.
+
+    The thread is a daemon with no output of its own: it must not write a
+    progress line while the browse owns the terminal.
+    """
+
+    #: The recheck currently running, if any. One at a time, cluster-wide:
+    #: `r` held down would otherwise start a dry-run pass per keypress, and
+    #: three of those at once is nine concurrent probes against a controller
+    #: this tool is careful to ask for three.
+    live: ClassVar[_Recheck | None] = None
+    #: When the last one finished and what it cost, so the next is paced off its
+    #: own price -- the same "twenty times what it costs" rule the idle refresh
+    #: uses, and for the same reason.
+    last_finished: ClassVar[float] = 0.0
+    last_cost: ClassVar[float] = 0.0
+
+    @classmethod
+    def start(cls, ask, key: str, shown: dict[str, str]) -> _Recheck | None:
+        """Begin one, or ``None`` if it is too soon to ask again.
+
+        Two ways it is too soon. One is already running -- see :attr:`live`.
+        Or one finished recently: **making the frame cheap made the browse
+        refresh itself**, because the idle interval is paced off what the last
+        pass cost and the dry-runs no longer count towards that. Measured, and
+        it is exactly the wrong outcome: an idle terminal re-read every 7s and
+        dragged nineteen dry-runs along each time. A recheck costs ~1.6s of
+        somebody else's controller, so the next one waits twenty times that --
+        ~32s here, ~6s on a four-partition cluster, self-pacing either way.
+        """
+        running = cls.live
+        if running is not None and not running.done.is_set():
+            return None
+        if (cls.last_finished
+                and time.monotonic() - cls.last_finished < 20 * cls.last_cost):
+            return None
+        cls.live = cls(ask, key, shown)
+        return cls.live
+
+    def __init__(self, ask, key: str, shown: dict[str, str]):
+        self.shown = dict(shown)
+        self.fresh: dict[str, str] | None = None
+        self.done = threading.Event()
+
+        def run() -> None:
+            started = time.monotonic()
+            try:
+                got = ask()
+            except Exception:  # pragma: no cover - a failed recheck is a no-op
+                # A recheck that cannot complete leaves the remembered answer
+                # alone: it was good enough to open on, and the next run asks
+                # again. Never a traceback into a live browse.
+                _Recheck.last_finished = time.monotonic()
+                _Recheck.last_cost = time.monotonic() - started
+                self.done.set()
+                return
+            self.fresh = got
+            access.save(key, got)
+            _Recheck.last_cost = time.monotonic() - started
+            _Recheck.last_finished = time.monotonic()
+            self.done.set()
+
+        self.thread = threading.Thread(target=run, daemon=True,
+                                       name="nodetop-access-recheck")
+        self.thread.start()
+
+    def moved(self) -> bool:
+        """True once the fresh answer is in and differs from what is on screen."""
+        if not self.done.is_set() or self.fresh is None:
+            return False
+        # Only the partitions that were on screen: the recheck asks about the
+        # same candidates, but a comparison across a wider set would reload for
+        # a partition nobody could see.
+        return any(self.fresh.get(k) != v for k, v in self.shown.items())
+
+
+class _Ticker:
+    """A one-line count on stderr while the dry-runs are running.
+
+    The dry-runs are the slowest thing the tool does and there is nothing to be
+    done about that -- they are somebody else's controller, 90 ms on an idle one
+    and 3.3s on a busy one. Measured on a 607-node cluster: `status` takes
+    1.93s, of which **1.60s is probing** and 0.33s is everything else. For that
+    1.60s the terminal used to show nothing at all, which is indistinguishable
+    from a hang, and the honest fix -- painting the partition list before the
+    verdicts land -- is the one thing this view must not do: the declared list
+    is 19 partitions where the dry-run accepts 8, so a first frame built from it
+    would over-report by eleven and then silently take them away.
+
+    So the wait stays, and says what it is waiting for. On stderr, so a pipe or
+    a `--json` reader is untouched, and only when stderr is a terminal, so a log
+    file does not collect carriage returns.
+    """
+
+    #: A terminal, or a file? `isatty` is asked once, here, because the answer
+    #: cannot change mid-command and because a missing/replaced stderr (pytest,
+    #: a daemon, `python -c` under some launchers) must not raise.
+    def __init__(self, st: Style, label: str) -> None:
+        self.st, self.label = st, label
+        self.width = 0
+        # Called from the probe pool's worker threads, so the write is guarded.
+        self.lock = threading.Lock()
+        try:
+            self.on = bool(sys.stderr and sys.stderr.isatty())
+        except (AttributeError, ValueError):  # pragma: no cover - closed stderr
+            self.on = False
+
+    def __call__(self, done: int, total: int) -> None:
+        """Report one settled queue. Called from whichever thread settled it."""
+        if not self.on:
+            return
+        line = f"  {self.label} {self.st.dim(f'{done}/{total}')}"
+        with self.lock:
+            # `\r` and no newline: one line, rewritten. The visible width is
+            # tracked so `clear` can wipe exactly what was written -- padding to
+            # a fixed guess would either leave debris or scrub the line above.
+            self.width = max(self.width, width(line))
+            print(line, end="\r", file=sys.stderr, flush=True)
+
+    def clear(self) -> None:
+        """Wipe the line, whatever was on it, before anything else prints."""
+        if not self.on or not self.width:
+            return
+        print(" " * self.width, end="\r", file=sys.stderr, flush=True)
+
+
 def _node_rows(nodes: Sequence, st: Style) -> list[list[object]]:
     """One table row per node, ranked-heat included.
 
@@ -306,7 +560,19 @@ def _node_rows(nodes: Sequence, st: Style) -> list[list[object]]:
         elif n.idle:
             mark, state = st.ok(st.g.ok), n.state_raw
         else:
-            mark, state = st.info(st.g.partial), n.state_raw
+            # The alphabet stays four glyphs -- `●` free, `◐` in between, `○`
+            # out, `▲` degraded -- and the ratio rides in the COLOUR, on the
+            # ramp step the free-core count beside it already uses. So a column
+            # of marks can be scanned for room by hue, and the mark can never
+            # disagree with the number it sits next to, because they are handed
+            # the same step.
+            #
+            # A graded set of glyphs was tried first (`◔◑◕`) and put back: it
+            # needs a legend the table does not have, `◐` and `◑` are one
+            # scanned column away from being the same character, and the
+            # meaning of a shape would then differ between this table and the
+            # three where `●`/`○` is a plain yes/no.
+            mark, state = st.tint(st.g.partial, heat[n.name]), n.state_raw
 
         # A dash, not the `·` used everywhere else for an empty cell. This
         # column says how many accelerators are free, and a node with none
@@ -761,7 +1027,7 @@ def build_parser() -> argparse.ArgumentParser:
 def cmd_backends(cluster: Cluster | None, args: argparse.Namespace, st: Style) -> int:
     detected = set(backend_registry.available())
     if args.json:
-        print(json.dumps({
+        _print_json({
             "detected": sorted(detected),
             "backends": {
                 n: {
@@ -778,7 +1044,7 @@ def cmd_backends(cluster: Cluster | None, args: argparse.Namespace, st: Style) -
                 }
                 for n in backend_registry.names()
             },
-        }, indent=2))
+        })
         return 0
 
     rows = []
@@ -874,7 +1140,7 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         prints nothing there is worse than one that prints zeros: the caller
         cannot tell "no nodes" from "the command crashed".
         """
-        print(json.dumps({
+        _print_json({
             **summary,
             "yours": yours or {
                 "nodes": 0, "nodes_schedulable": 0, "accelerators_total": 0,
@@ -886,7 +1152,7 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             },
             "listed": list(listed),
             "excluded": [{"name": name, "reason": why} for name, why in excluded],
-        }, indent=2, default=str))
+        })
         return 0
 
     term = cluster.queue_term
@@ -1012,6 +1278,10 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # cheap queue and tries it first everywhere after.
     refused = 0
     unsettled = 0
+    #: Seconds since the access answer on screen was obtained, or None when it
+    #: was obtained just now. Shown in the frame; see :mod:`nodetop.core.access`.
+    access_age: float | None = None
+    recheck: _Recheck | None = None
     if not args.declared and not args.all and cluster.can_probe:
         # Pretest. A declared allowlist cannot answer this on a cluster whose
         # associations are templated -- the accounting database claims the same
@@ -1020,31 +1290,78 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         # each one. Read-only, and narrowed per queue to the accounts its own
         # allowlist admits, so this is a handful of calls rather than hundreds.
         accounts = list(cluster.identity.accounts) if cluster.identity else None
-        verdicts = {
-            p.queue: p for p in rank(
-                cluster, JobShape(nodes=1, cpus_per_task=1),
-                queues=[q.name for q in with_room],
-                use_probe=True, accounts=accounts, include_unusable=True,
-            )
-        }
-        # Dropped only on a DURABLE refusal. A verdict that could not settle
-        # the question -- control plane down, or every account we asked about
-        # refused while others went unasked -- keeps the partition on screen,
-        # because "we do not know" is not "no" and this view exists to stop
-        # exactly that conflation. Counted apart from the refusals so the
-        # funnel does not present a guess as a finding.
-        kept, refused_names, unsettled_names = [], [], []
-        for q in with_room:
-            p = verdicts.get(q.name)
-            v = p.verdict if p is not None else None
-            if p is not None and p.confirmed:
-                kept.append(q)
-            elif v is not None and not v.allowed and v.durable:
-                refused_names.append(q.name)
-            else:
-                kept.append(q)
-                unsettled_names.append(q.name)
-        with_room = kept
+        candidates = [q.name for q in with_room]
+
+        def ask(ticker=None, only=None) -> dict[str, str]:
+            """Dry-run every candidate; return a verdict per partition.
+
+            A partition is dropped only on a DURABLE refusal. A verdict that
+            could not settle the question -- control plane down, or every
+            account we asked about refused while others went unasked -- keeps it
+            on screen, because "we do not know" is not "no" and this view exists
+            to stop exactly that conflation. Kept apart from the refusals so the
+            funnel does not present a guess as a finding.
+            """
+            wanted = candidates if only is None else only
+            found = {
+                p.queue: p for p in rank(
+                    cluster, JobShape(nodes=1, cpus_per_task=1),
+                    queues=wanted, use_probe=True, accounts=accounts,
+                    include_unusable=True, on_progress=ticker,
+                )
+            }
+            out: dict[str, str] = {}
+            for name in wanted:
+                p = found.get(name)
+                v = p.verdict if p is not None else None
+                if p is not None and p.confirmed:
+                    out[name] = access.YES
+                elif v is not None and not v.allowed and v.durable:
+                    out[name] = access.NO
+                else:
+                    out[name] = access.MAYBE
+            return out
+
+        # A session may open on the previous answer and correct itself; a
+        # printout may not, because it gets one shot at being right.
+        cache_key = access.key(
+            backend=cluster.backend_name,
+            cluster="|".join(sorted(cluster.queues)),
+            user=cluster.identity.user if cluster.identity else "",
+            accounts=accounts or [],
+            shape="nodes=1,cpus=1",
+        )
+        remembered = None
+        if not args.json and not cluster.replayed and _interactive().supported():
+            remembered = access.load(cache_key)
+        known, remembered_age = remembered or ({}, None)
+        missing = [n for n in candidates if n not in known]
+        if remembered_age is not None and not missing:
+            verdict_of = {n: known[n] for n in candidates}
+            access_age = remembered_age
+        elif remembered_age is not None:
+            # A partition gained room since the last run, so only *it* is an
+            # open question. Asking about the gap alone is one dry-run rather
+            # than nineteen -- and the age line reports the older half, because
+            # that is the part a reader might want to distrust.
+            ticker = _Ticker(st, f"checking {len(missing)} more {term}s")
+            fresh = ask(ticker, only=missing)
+            ticker.clear()
+            access.save(cache_key, fresh)
+            verdict_of = {n: fresh.get(n, known.get(n, access.MAYBE))
+                          for n in candidates}
+            access_age = remembered_age
+        else:
+            ticker = _Ticker(st, f"checking which {term}s will take a job")
+            verdict_of = ask(ticker)
+            ticker.clear()
+            access.save(cache_key, verdict_of)
+        if remembered_age is not None:
+            recheck = _Recheck.start(ask, cache_key, dict(verdict_of))
+        refused_names = [n for n in candidates if verdict_of[n] == access.NO]
+        unsettled_names = [n for n in candidates if verdict_of[n] == access.MAYBE]
+        gone = set(refused_names)
+        with_room = [q for q in with_room if q.name not in gone]
         refused = len(refused_names)
         unsettled = len(unsettled_names)
         excluded += [(name, "refused") for name in refused_names]
@@ -1437,11 +1754,36 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
 
     title = ""
     if (not getattr(args, "static", False)
-            and selectable and interactive.supported()):
+            and selectable and _interactive().supported()):
         return _browse(cluster, args, st, body, selectable, excluded,
-                       shown_names, (funnel_at, render_funnel), title)
+                       shown_names, (funnel_at, render_funnel), title,
+                       access_age, recheck)
     print(panel(body, title, st))
     return 0
+
+
+def _touched(got: object, keyed: object) -> None:
+    """Note whether a person was there, for the idle backoff.
+
+    A reload can come from a keypress or from the timer, and `select` reports
+    both the same way -- so the timer says so on the way out (see
+    :data:`_IDLE_FIRED`) and anything else means a reader is present and the
+    interval goes back to its shortest.
+    """
+    if got == getattr(keyed, "RELOAD", object()) and _IDLE_FIRED[0]:
+        _IDLE_FIRED[0] = False      # the timer's own reload: keep backing off
+        return
+    _IDLE_FIRED[0] = False
+    _IDLE_BACKOFF[0] = 0
+
+
+def _reload(stack: list[tuple[str, str]],
+            cursors: dict[tuple[str, str], int]) -> int:
+    """Ask `main` for a fresh read, remembering where the reader was."""
+    _RESUME_STACK[:] = list(stack)
+    _RESUME_CURSORS.clear()
+    _RESUME_CURSORS.update(cursors)
+    return RELOAD
 
 
 def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
@@ -1449,7 +1791,9 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
             excluded: list[tuple[str, str]],
             shown: Sequence[str],
             funnel: tuple[int, Callable[[str | None], str]],
-            title: str) -> int:
+            title: str,
+            access_age: float | None = None,
+            recheck: _Recheck | None = None) -> int:
     """Move a highlight over the overview's rows and open the chosen one.
 
     **Nothing is re-rendered here.** The panel is the one `cmd_status` just
@@ -1569,9 +1913,44 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         the repaint destructive.
         """
         rows = term_height()
-        body = list(content)[: rows - 2]
-        body += [""] * (rows - 2 - len(body))
-        return panel(body, title, st, size=term_width(),
+        # The age of the reading, at the bottom of every level, once it is old
+        # enough to matter. This is the one line in the frame that is not part
+        # of the report: a browse renders a single snapshot for as long as it is
+        # open, and without saying so it invites the reader to act on numbers
+        # that stopped being true minutes ago. Rebuilt on every repaint, so any
+        # keypress refreshes the figure even when the data itself is untouched.
+        #
+        # Silent under five seconds, and silent on a replay -- there the header
+        # already dates the recording, and "read 6 days ago" twice on one screen
+        # is the sort of repetition this view keeps being trimmed for.
+        stamp: list[str] = []
+        if cluster.taken_at is not None and not cluster.replayed:
+            age = (datetime.now() - cluster.taken_at).total_seconds()
+            if age >= 5:
+                # Seconds below a minute, `format_age` above it. That helper
+                # bottoms out at "<1m", which is the whole interesting range
+                # here: a browse goes stale in seconds, not in hours.
+                label = f"{int(age)}s" if age < 60 else format_age(age)
+                stamp = [st.dim(f"read {label} ago"
+                                f"  {st.g.sep}  r re-reads")]
+        # And when the ACCESS answer is older than the reading, say that too.
+        #
+        # It is a different clock: the numbers came from the queries just now,
+        # but which partitions are listed at all came from the last run's
+        # dry-runs, because waiting 1.6s for them before drawing anything is the
+        # thing this trades away. A recheck is already running; this line says
+        # what is on screen meanwhile, and disappears the moment the recheck
+        # agrees or the browse reloads with a fresh answer.
+        if access_age is not None and access_age >= 5:
+            checked = (f"{int(access_age)}s" if access_age < 60
+                       else format_age(access_age))
+            note = "re-checking" if recheck is not None and not recheck.done.is_set() \
+                else "confirmed"
+            stamp = [*stamp, st.dim(f"access checked {checked} ago"
+                                    f"  {st.g.sep}  {note}")]
+        body = list(content)[: rows - 2 - len(stamp)]
+        body += [""] * (rows - 2 - len(stamp) - len(body))
+        return panel(body + stamp, title, st, size=term_width(),
                      shrink=False).splitlines()
 
     def partition_frame(index: int) -> list[str]:
@@ -1588,15 +1967,42 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
             highlight(rows, position)
         return framed(visible(rows, index))
 
+    #: Rendered node rows, per (partition, terminal width), for the life of this
+    #: browse. Moving the cursor cannot change them: the snapshot is fixed until
+    #: a reload, and a reload re-enters this function with an empty cache.
+    #:
+    #: Without it every keypress rebuilt every row, and only about
+    #: twenty-five are on screen. Measured on a synthetic partition the size of
+    #: the largest one tested -- 10,624 nodes -- **344 ms per frame**, which is
+    #: what each arrow key cost there; 17.6 ms at 607 nodes and 6.6 ms at 190.
+    #:
+    #: Keyed on the width because `table` sizes its columns to the terminal, so
+    #: a window resize has to rebuild rather than stretch stale lines. Bounded,
+    #: because 10,624 rendered rows is about 1.3 MB and a reader can walk
+    #: through several partitions: four is more than the one being looked at and
+    #: the one stepped out of.
+    frames: dict[tuple[str, int], tuple[str, list[str], int]] = {}
+
     def node_frame(queue, nodes: list, index: int) -> list[str]:
-        rows = _node_rows(nodes, st)
-        lines = table(NODE_HEADS, rows, NODE_ALIGNS, st, indent="",
-                      limits=NODE_LIMITS, header_role="dim",
-                      underline=False).splitlines()
-        head, data = lines[0], lines[1:]
+        key = (queue.name if queue is not None else "", term_width())
+        built = frames.get(key)
+        if built is None:
+            rows = _node_rows(nodes, st)
+            lines = table(NODE_HEADS, rows, NODE_ALIGNS, st, indent="",
+                          limits=NODE_LIMITS, header_role="dim",
+                          underline=False).splitlines()
+            # `with_room` walks every node and each answer costs a memory
+            # check, so it is counted here with the rows rather than per frame.
+            built = (lines[0], lines[1:], sum(1 for n in nodes if n.has_room))
+            if len(frames) >= 4:
+                frames.pop(next(iter(frames)))
+            frames[key] = built
+        head, rendered, with_room = built
+        # A copy: `highlight` replaces a row in place, and the cached list has
+        # to come back clean for the next keypress.
+        data = list(rendered)
         highlight(data, index)
         shown = _window(data, index, st)
-        with_room = sum(1 for n in nodes if n.has_room)
         facts = [st.head(queue.name),
                  st.muted(f"{len(nodes)} nodes"),
                  st.muted(f"{with_room} with room")]
@@ -1853,6 +2259,7 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
     # single chain: the overview leads to partitions OR to the excluded list, and
     # both lead to nodes. Cursor positions are kept per stack entry, so stepping
     # out lands on the row you came from.
+    interactive = _interactive()
     keyed = interactive.Key
     with interactive.raw_session():
         # Stack entries are (kind, key) with a STRING key, and cursors are
@@ -1862,6 +2269,72 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         by_name = {n.name: n for n in cluster.nodes}
         stack: list[tuple[str, str]] = [("partitions", "")]
         cursors: dict[tuple[str, str], int] = {}
+        # Pick up where the pre-reload view was, so `r` and the idle refresh
+        # change the numbers and nothing else. A stack entry naming a partition
+        # or node that has since vanished is dropped rather than followed.
+        if _RESUME_STACK:
+            saved = [x for x in _RESUME_STACK
+                     if x[0] != "nodes" or x[1] in cluster.queues]
+            stack = [x for x in saved if x[0] != "jobs" or x[1] in by_name] or stack
+            cursors = dict(_RESUME_CURSORS)
+            _RESUME_STACK.clear()
+            _RESUME_CURSORS.clear()
+        # How long a re-read costs decides whether one happens by itself. A
+        # cluster that answers in 70 seconds -- measured, on a 10,624-node PBS
+        # site -- must never refresh under the reader's hands; one that answers
+        # in 70 milliseconds may as well stay current. `r` works either way.
+        # The measured turnaround if there is one -- this is the second pass
+        # through a reload -- and the load time as the opening estimate.
+        # The rebuild is over: everything from here is the reader's own time, so
+        # this is the moment the cost of a re-read is known.
+        if _STARTED:
+            _TURNAROUND[:] = [time.monotonic() - _STARTED[0]]
+            _STARTED.clear()
+        cost = max([cluster.load_seconds or 0.0] + _TURNAROUND[-1:])
+        idle = None if cluster.load_seconds is None or cost > 1.0 else max(5.0, cost * 20)
+        # A background access recheck turns the idle timeout into a poll: short
+        # enough that a changed answer reaches the screen in well under a
+        # second, and `on_idle` is what stops every expiry from becoming a
+        # re-read. The ordinary auto-refresh interval, if there is one, is kept
+        # by counting the quiet time instead of relying on the timeout itself.
+        # Doubling while nobody is there. See :data:`_IDLE_BACKOFF`.
+        step = (None if idle is None
+                else min(idle * (2 ** _IDLE_BACKOFF[0]), _IDLE_CAP))
+        poll = 0.3 if recheck is not None else step
+        quiet = 0.0
+
+        def time_to_reload() -> bool:
+            """Asked when the poll expires. **True means reload now.**
+
+            The polarity is the whole content of this function, and it was
+            wrong: written as "still waiting?" against a `select` that reloads
+            when this returns True, it reloaded 0.3s after the first frame and
+            then never again -- one spurious re-read followed by a browse frozen
+            on one reading. Caught by watching a live session draw its funnel
+            twice in twelve seconds, not by any test, which is why
+            `test_interactive.py` now drives `select` with this shape of
+            callback rather than checking that one was passed.
+            """
+            nonlocal quiet, access_age
+            if recheck is not None:
+                if recheck.moved():
+                    # The control plane no longer agrees with what is drawn.
+                    # A reload rebuilds from the answer the recheck just wrote,
+                    # and lands the cursor on the same row.
+                    return True
+                if recheck.done.is_set():
+                    # Confirmed. The listing is as current as the reading, so
+                    # the line saying otherwise goes away on the next repaint.
+                    access_age = None
+            quiet += poll or 0.0
+            if step is not None and quiet >= step:
+                quiet = 0.0
+                _IDLE_BACKOFF[0] += 1
+                _IDLE_FIRED[0] = True
+                return True
+            return False
+
+        waiting = time_to_reload if poll is not None else None
         while stack:
             where = stack[-1]
             kind, payload = where
@@ -1875,8 +2348,12 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                 # stray Left took the whole program down.
                 got = interactive.select(
                     partition_frame, len(selectable), raw=False,
-                    initial=cursors.get(where, 0),
+                    initial=cursors.get(where, 0), idle=poll or idle,
+                    on_idle=waiting,
                     rows=[pos for pos, _, _ in selectable], escapable=False)
+                _touched(got, keyed)
+                if got == keyed.RELOAD:
+                    return _reload(stack, cursors)
                 if not isinstance(got, int):
                     return 0            # only `q` reaches here
                 cursors[where] = got
@@ -1896,7 +2373,11 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                     stack.append(("nodes", name))
             elif kind == "all":
                 got = interactive.select(every_frame, len(all_queues), raw=False,
-                                         initial=cursors.get(where, 0))
+                                         initial=cursors.get(where, 0), idle=poll or idle,
+                                         on_idle=waiting)
+                _touched(got, keyed)
+                if got == keyed.RELOAD:
+                    return _reload(stack, cursors)
                 if got == keyed.QUIT:
                     return 0
                 if not isinstance(got, int):
@@ -1911,7 +2392,11 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                     return excluded_frame(i, only)
 
                 got = interactive.select(draw_excluded, len(subset), raw=False,
-                                         initial=cursors.get(where, 0))
+                                         initial=cursors.get(where, 0), idle=poll or idle,
+                                         on_idle=waiting)
+                _touched(got, keyed)
+                if got == keyed.RELOAD:
+                    return _reload(stack, cursors)
                 if got == keyed.QUIT:
                     return 0
                 if not isinstance(got, int):
@@ -1920,6 +2405,11 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                 cursors[where] = got
                 stack.append(("nodes", subset[got][0]))
             elif kind == "nodes":
+                # Opening a node listing is the signal that a job list is next,
+                # and that frame waits on two whole-cluster queries. Start them
+                # now, while the reader is choosing a row, rather than when they
+                # press Right.
+                cluster.prefetch_job_view()
                 queue = cluster.queues.get(payload)
                 nodes = sorted(
                     queue.nodes if queue else [],
@@ -1931,7 +2421,11 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                     return node_frame(q, ns, i)
 
                 got = interactive.select(draw_nodes, len(nodes), raw=False,
-                                        initial=cursors.get(where, 0))
+                                        initial=cursors.get(where, 0), idle=poll or idle,
+                                         on_idle=waiting)
+                _touched(got, keyed)
+                if got == keyed.RELOAD:
+                    return _reload(stack, cursors)
                 if got == keyed.QUIT:
                     return 0
                 if not isinstance(got, int):
@@ -1947,9 +2441,15 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                               js: list = jobs) -> list[str]:
                     return job_frame(nd, js, i)
 
+                # Same rule one level up when the node is running nothing: the
+                # single row is a placeholder, not something to open.
                 got = interactive.select(draw_jobs, max(1, len(jobs)),
-                                        raw=False,
+                                        raw=False, openable=bool(jobs),
+                                        idle=poll or idle, on_idle=waiting,
                                         initial=cursors.get(where, 0))
+                _touched(got, keyed)
+                if got == keyed.RELOAD:
+                    return _reload(stack, cursors)
                 if got == keyed.QUIT:
                     return 0
                 if isinstance(got, int) and got < len(jobs):
@@ -1969,9 +2469,16 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                 def draw_job(_i: int, n: object = nd, j: object = job) -> list[str]:
                     return job_detail_frame(n, j, 0)
 
-                # One entry: there is nothing here to choose between, so any
-                # key that is not `q` steps back out.
-                got = interactive.select(draw_job, 1, raw=False)
+                # The leaf: nothing to choose between and nothing deeper, so
+                # `openable=False` makes Right and Enter no-ops and leaves Left,
+                # Escape and `q` as the only ways out. Without it Right returned
+                # an index, which this caller could only read as "step back", so
+                # the key that means "deeper" everywhere else jumped up a level.
+                got = interactive.select(draw_job, 1, raw=False, openable=False,
+                                        idle=poll or idle, on_idle=waiting)
+                _touched(got, keyed)
+                if got == keyed.RELOAD:
+                    return _reload(stack, cursors)
                 if got == keyed.QUIT:
                     return 0
                 stack.pop()
@@ -2005,7 +2512,7 @@ def cmd_queues(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         not q.usable, -q.effective_free_cpus if q.usable else 0, q.name))
 
     if args.json:
-        print(json.dumps([{
+        _print_json([{
             "name": q.name,
             "state": q.state_raw,
             "enabled": q.enabled,
@@ -2035,7 +2542,7 @@ def cmd_queues(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             "max_walltime_effective": format_duration(
                 cluster.effective_max_walltime(q.name)
             ),
-        } for q in queues], indent=2))
+        } for q in queues])
         return 0
 
     # A block per queue is right for one queue and unreadable for eighty-seven:
@@ -2254,7 +2761,7 @@ def cmd_zoom(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     out_of_service = [n for n in nodes if not n.schedulable]
 
     if args.json:
-        print(json.dumps({
+        _print_json({
             cluster.queue_term: [q.name for q in queues],
             "nodes": len(nodes),
             "wholly_idle": len(wholly_idle),
@@ -2285,7 +2792,7 @@ def cmd_zoom(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                 "accelerator_model": n.accelerator.model if n.accelerator else None,
                 "reason": n.reason,
             } for n in nodes],
-        }, indent=2))
+        })
         return 0
 
     _queues_detail(cluster, queues, st)
@@ -2380,7 +2887,7 @@ def cmd_nodes(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                                          -n.effective_free_cpus, n.name))
 
     if args.json:
-        print(json.dumps([{
+        _print_json([{
             "name": n.name,
             "state": n.state_raw,
             "conditions": sorted(n.conditions),
@@ -2399,7 +2906,7 @@ def cmd_nodes(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             ),
             "taints": list(n.taints),
             "reason": n.reason,
-        } for n in nodes], indent=2))
+        } for n in nodes])
         return 0
 
     rows = _node_rows(nodes, st)
@@ -2445,7 +2952,7 @@ def cmd_health(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     degraded = cluster.degraded_nodes
     down = cluster.unschedulable_nodes
     if args.json:
-        print(json.dumps({
+        _print_json({
             # `reason` is verbatim; `reason_text` / `reason_set_by` /
             # `reason_set_at` are the same string parsed, so a consumer can
             # group by cause without reimplementing the [who@when] split -- and
@@ -2461,7 +2968,7 @@ def cmd_health(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                                **_reason_fields(n.reason)}
                               for n in down],
             "unschedulable_nodelist": cluster.format_nodelist([n.name for n in down]),
-        }, indent=2))
+        })
         return 0
 
     total = len(cluster.nodes)
@@ -2837,10 +3344,13 @@ def cmd_where(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # dry-run accepted one. Three of the four rows were the strongest claim the
     # tool can make, about places that refuse this account.
     probe = not args.declared and cluster.can_probe
+    ticker = _Ticker(st, "asking the scheduler about each " + cluster.queue_term)
     places = rank(
         cluster, shape, queues=wanted, use_probe=probe,
+        on_progress=ticker if probe else None,
         accounts=accounts or None, include_unusable=args.all,
     )
+    ticker.clear()
     turned_away = 0
     if probe and not args.all:
         before = len(places)
@@ -2874,7 +3384,7 @@ def cmd_where(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     exit_ok = any(p.reachable and not p.hardware_incompatible for p in places)
 
     if args.json:
-        print(json.dumps([{
+        _print_json([{
             "queue": p.queue,
             # Two different facts, and they disagree often enough to be worth
             # both: `runnable_now` is "nodes of this shape are free", while
@@ -2906,7 +3416,7 @@ def cmd_where(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             },
             "caveats": p.caveats,
             "submit_flags": cluster.submit_flags(p.queue, shape),
-        } for p in places], indent=2, default=str))
+        } for p in places])
         return 0 if exit_ok else 1
 
     if not places:
@@ -2969,7 +3479,7 @@ def cmd_check(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             f"read from declared ACLs -- use 'nodetop where' for that."
         )
         if args.json:
-            print(json.dumps({"can_probe": False, "reason": msg}, indent=2))
+            _print_json({"can_probe": False, "reason": msg})
         else:
             print(f"{st.warn(st.g.warn)} {st.warn(msg)}")
         return 2
@@ -3000,11 +3510,24 @@ def cmd_check(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     queues = sorted(queues, key=lambda n: (
         len(probe_accounts(cluster.queues[n], accounts, shape))
         if n in cluster.queues else 0, n))
-    for name in queues:
+    # Concurrently, for the reason `rank` does it: each of these is one round
+    # trip to the control plane and they do not depend on each other. `check -q`
+    # over eighty partitions was eighty waits in a row.
+    def ask(name: str):
         best, tried, of = probe_queue(
             cluster, cluster.queues.get(name), name, shape, accounts, budget
         )
-        best = unsettled(best, tried, of)
+        return name, unsettled(best, tried, of)
+
+    if len(queues) > 1:
+        import concurrent.futures as _cf
+
+        with _cf.ThreadPoolExecutor(
+                max_workers=min(PROBE_WORKERS, len(queues))) as pool:
+            answered = list(pool.map(ask, queues))
+    else:
+        answered = [ask(n) for n in queues]
+    for name, best in answered:
         if best is not None:
             results[name] = best
 
@@ -3030,7 +3553,7 @@ def cmd_check(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     ]
 
     if args.json:
-        print(json.dumps({
+        _print_json({
             "accepted": accepted,
             "unanswered": unanswered,
             "asked": len(results),
@@ -3044,7 +3567,7 @@ def cmd_check(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                     v.predicted_start.isoformat() if v.predicted_start else None),
                 "predicted_nodes": list(v.predicted_nodes),
             } for k, v in results.items()},
-        }, indent=2))
+        })
         return status
 
     caps = cluster.capabilities
@@ -3141,8 +3664,8 @@ def cmd_exclude(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         return 2
     nodelist = cluster.format_nodelist(sorted(picked))
     if args.json:
-        print(json.dumps({"count": len(picked), "nodelist": nodelist,
-                          "nodes": sorted(picked)}, indent=2))
+        _print_json({"count": len(picked), "nodelist": nodelist,
+                          "nodes": sorted(picked)})
         return 0
     if not nodelist:
         print(st.dim("(no matching nodes)"))
@@ -3227,7 +3750,7 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
     unknown = sum(n.gpus_total for n in nodes if n.accelerator is None)
 
     if args.json:
-        print(json.dumps({
+        _print_json({
             "accelerators_installed": installed,
             "accelerators_unidentifiable": unknown,
             "models": {
@@ -3257,7 +3780,7 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
             "capability_reach": {
                 c: {"installed": i, "free": f} for c, (i, f) in reach.items()
             },
-        }, indent=2))
+        })
         return 0
 
     vendors = {
@@ -3416,10 +3939,14 @@ def cmd_snapshot(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             for key, (rc, out, err) in sorted(runner.captured.items())
         },
     }
+    import json
+
     text = json.dumps(payload, indent=1)
     if args.output == "-":
         print(text)
         return 0
+
+    import pathlib
 
     pathlib.Path(args.output).write_text(text)
     queries = len(payload["commands"])
@@ -3445,6 +3972,9 @@ def _load_replay(path: str) -> tuple[Backend, str, datetime | None]:
     have to come back out, though -- the snapshot writes ``captured_at`` and it
     was being ignored, so a replay dated itself to the moment it was read.
     """
+    import json
+    import pathlib
+
     from .runner import RecordedRunner
 
     data = json.loads(pathlib.Path(path).read_text())
@@ -3617,12 +4147,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         cluster.capture = capture
         return cmd_snapshot(cluster, args, st)
 
-    cluster = Cluster.load(backend, with_free_times=command in {"where", "fit", "status"})
-    if bad := _reject_broken_snapshot(cluster, command):
-        return bad
-    if bad := _reject_unknown_queues(cluster, args, st):
-        return bad
-    return _COMMANDS[command](cluster, args, st)
+    # A loop, for exactly one reason: an interactive browse renders a single
+    # read for as long as it is open, and a cluster changes every second. `r` or
+    # an idle interval returns RELOAD, and the answer is to take the whole
+    # reading again and rebuild from it -- not to patch fresher numbers into an
+    # older frame, which is how one report comes to describe two instants. The
+    # browse remembers which row it was on, so the only thing that changes on
+    # screen is the data.
+    while True:
+        # Ctrl-C is an answer, not a crash.
+        #
+        # `select` has always caught it -- an interrupt while browsing quits --
+        # but an interrupt *before* the browse opens had nowhere to land, and
+        # that is the window a reader is most likely to use it in: the dry-runs
+        # take 1.6s of a 1.93s `status`, and the interrupt arrived inside the
+        # probe pool's shutdown join, so Ctrl-C printed twenty lines of
+        # `threading.py ... waiter.acquire()` traceback. 130 is the shell's
+        # convention for SIGINT, and the newline closes whatever partial line
+        # the progress ticker had written so the prompt does not land in it.
+        try:
+            cluster = Cluster.load(
+                backend, with_free_times=command in {"where", "fit", "status"})
+            if bad := _reject_broken_snapshot(cluster, command):
+                return bad
+            if bad := _reject_unknown_queues(cluster, args, st):
+                return bad
+            started = time.monotonic()
+            _STARTED[:] = [started]
+            rc = _COMMANDS[command](cluster, args, st)
+            if _STARTED:
+                # No browse opened, so the whole command was the rebuild.
+                _TURNAROUND[:] = [time.monotonic() - started]
+                _STARTED.clear()
+        except KeyboardInterrupt:
+            print(file=sys.stderr)
+            return 130
+        if rc != RELOAD:
+            return rc
 
 
 if __name__ == "__main__":  # pragma: no cover
