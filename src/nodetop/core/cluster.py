@@ -9,7 +9,8 @@ dozen independent queries.
 
 from __future__ import annotations
 
-import json
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -47,6 +48,11 @@ class Cluster:
     capabilities: BackendCapabilities | None = None
     node_free_times: dict[str, datetime] = field(default_factory=dict, repr=False)
     taken_at: datetime | None = None
+    #: Seconds the queries behind this snapshot took, or ``None`` for a replay.
+    #: Read by the interactive browse to decide whether re-reading by itself is
+    #: affordable: 0.07s on one cluster, 70s on another, and the same fixed
+    #: interval would be either wasteful or ruinous.
+    load_seconds: float | None = None
     #: Queries that failed, so a partial snapshot is visibly partial.
     errors: dict[str, str] = field(default_factory=dict)
     #: True when rebuilt from a recorded snapshot rather than a live control
@@ -66,6 +72,10 @@ class Cluster:
     _jobs: list[Job] | None = field(default=None, repr=False, compare=False)
     _allocations: dict[tuple[str, str], Allocation] | None = field(
         default=None, repr=False, compare=False)
+    _allocations_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False)
+    _jobs_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False)
 
     # -- construction -------------------------------------------------------
     @classmethod
@@ -90,22 +100,61 @@ class Cluster:
         absolute instants compared against the clock: a node recorded as free in
         three hours reads as "overdue" once the snapshot ages past that.
         """
+        started = time.time()
         if backend is None:
             from .. import backends
 
             backend = backends.detect()
 
         errors: dict[str, str] = {}
+        failed = threading.Lock()
 
         def _try(label, fn, default):
             try:
                 return fn()
             except Exception as exc:
-                errors[label] = f"{type(exc).__name__}: {exc}"
+                with failed:
+                    errors[label] = f"{type(exc).__name__}: {exc}"
                 return default
 
-        nodes = _try("nodes", backend.load_nodes, [])
-        queues = _try("queues", backend.load_queues, [])
+        # The queries behind one snapshot are independent READS, and they used
+        # to wait for each other in a row. Measured on a 607-node cluster, five
+        # interleaved rounds: **0.57s sequential against 0.23s together**, and
+        # the whole of `nodetop` was 10.26s of which 3.53s was this.
+        #
+        # Nothing races on the control plane's side -- these commands only look
+        # -- and the readings land CLOSER together in time, which is the
+        # property this class exists to provide rather than one it gives up.
+        # Each backend's own caches are locked for it (a PBS `load_queues`
+        # needs the nodes; a Slurm `load_identity` and `load_nodes` both read
+        # the config), so a shared answer is still fetched exactly once.
+        # Imported here rather than at the top of the module: `concurrent`
+        # pulls `logging` behind it, 4.6 ms of a 83 ms start, and the only
+        # caller is this method. `--version`, `--help` and `backends` never
+        # load a cluster and were paying for the pool that loads one.
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            # First, and with the rest rather than behind them: whatever a
+            # loader would otherwise fetch from inside its own work. On Slurm
+            # that is `scontrol show config`, which used to leave ~70 ms after
+            # the others because `load_nodes` asked for it mid-parse. See
+            # `Backend.warm` for what the measurement does and does not show.
+            f_warm = pool.submit(_try, "warm", getattr(backend, "warm", lambda: None), None)
+            f_nodes = pool.submit(_try, "nodes", backend.load_nodes, [])
+            f_queues = pool.submit(_try, "queues", backend.load_queues, [])
+            f_limits = pool.submit(_try, "limits", backend.load_limits, {})
+            f_identity = pool.submit(_try, "identity", backend.load_identity, None)
+            f_free = (
+                pool.submit(_try, "free_times", backend.load_node_free_times, {})
+                if with_free_times else None
+            )
+            nodes = f_nodes.result()
+            queues = f_queues.result()
+            limits = f_limits.result()
+            identity = f_identity.result()
+            free_times = f_free.result() if f_free is not None else {}
+            f_warm.result()      # already done; surfaces its error if it had one
         # One record per node. A duplicate -- from a re-read, a merged capture,
         # or a control plane listing a node twice -- would otherwise inflate
         # every count and every gauge in the report.
@@ -121,15 +170,12 @@ class Cluster:
             queue_term=backend.queue_term,
             nodes=nodes,
             queues={q.name: q for q in queues},
-            limits=_try("limits", backend.load_limits, {}),
-            identity=_try("identity", backend.load_identity, None),
+            limits=limits,
+            identity=identity,
             capabilities=backend.capabilities(),
-            node_free_times=(
-                _try("free_times", backend.load_node_free_times, {})
-                if with_free_times
-                else {}
-            ),
+            node_free_times=free_times,
             taken_at=taken_at or datetime.now(),
+            load_seconds=None if replayed else time.time() - started,
             errors=errors,
             replayed=replayed,
             _backend=backend,
@@ -210,18 +256,19 @@ class Cluster:
         Cached after the first call so one browsing session does not re-query
         per node, which would be both slow and inconsistent between rows.
         """
-        if self._jobs is None:
-            if self._backend is None:
-                self._jobs = []
-            else:
-                try:
-                    self._jobs = list(self._backend.load_jobs())
-                except Exception as exc:
-                    # Recorded, not raised: the jobs view is an extra, and
-                    # losing it must not take down the report it hangs off.
-                    self.errors["jobs"] = f"{type(exc).__name__}: {exc}"
+        with self._jobs_lock:
+            if self._jobs is None:
+                if self._backend is None:
                     self._jobs = []
-        return self._jobs
+                else:
+                    try:
+                        self._jobs = list(self._backend.load_jobs())
+                    except Exception as exc:
+                        # Recorded, not raised: the jobs view is an extra, and
+                        # losing it must not take down the report it hangs off.
+                        self.errors["jobs"] = f"{type(exc).__name__}: {exc}"
+                        self._jobs = []
+            return self._jobs
 
     def allocations(self) -> dict[tuple[str, str], Allocation]:
         """``(job id, node) -> that job's share of that node``, fetched once.
@@ -231,18 +278,60 @@ class Cluster:
         every later one. A backend with no answer returns nothing and the caller
         says so, rather than showing a total in a column that means a share.
         """
-        if self._allocations is None:
-            got: list[Allocation] = []
-            loader = getattr(self._backend, "load_allocations", None)
-            if loader is not None:
-                try:
-                    got = list(loader())
-                except Exception as exc:
-                    # Recorded, not raised: this refines a view that works
-                    # without it.
-                    self.errors["allocations"] = f"{type(exc).__name__}: {exc}"
-            self._allocations = {(a.job, a.node): a for a in got}
-        return self._allocations
+        # Locked so a prefetch and the view that needs it cannot both fetch:
+        # this is one whole-cluster query, 9 MB and ~0.6s on a 2,116-job
+        # cluster, and doing it twice would be the most expensive duplicate in
+        # the tool. See `prefetch_allocations`.
+        with self._allocations_lock:
+            if self._allocations is None:
+                got: list[Allocation] = []
+                loader = getattr(self._backend, "load_allocations", None)
+                if loader is not None:
+                    try:
+                        got = list(loader())
+                    except Exception as exc:
+                        # Recorded, not raised: this refines a view that works
+                        # without it.
+                        self.errors["allocations"] = f"{type(exc).__name__}: {exc}"
+                self._allocations = {(a.job, a.node): a for a in got}
+            return self._allocations
+
+    def prefetch_job_view(self) -> None:
+        """Start fetching what a node's job list needs, in the background.
+
+        That frame waits on **two** lazy queries, and measured cold on a
+        2,116-job cluster they are 175 ms (`jobs`, from `squeue`) and 1042 ms
+        (`allocations`, a 9 MB `scontrol show job -d` plus ~92 ms of parsing).
+        Until both are in, the frame does not appear. Stepping INTO a partition's
+        node list is the signal they are about to be needed -- nobody opens a
+        node listing to look at the borders -- so the wait happens while the
+        reader is choosing a row.
+
+        In that order, and in one thread rather than two: `jobs` is what the
+        frame reads first and it is six times cheaper, so it lands first, and a
+        single worker means at most one extra query in flight against somebody
+        else's controller.
+
+        Deliberately not started when the browse opens: most readers look at the
+        overview and leave, and firing a whole-cluster query for a view nobody
+        asked for is a worse trade than the hitch it would hide.
+
+        Returns immediately. A failure is not raised here for the same reason it
+        is not raised in :meth:`jobs` or :meth:`allocations` -- it will be
+        recorded there, when the view asks.
+        """
+        if self._backend is None:
+            return
+        if self._jobs is not None and self._allocations is not None:
+            return
+
+        def warm() -> None:
+            self.jobs()
+            self.allocations()
+
+        # Daemon: a reader who quits mid-fetch should not wait for a query whose
+        # answer nobody is going to look at.
+        threading.Thread(target=warm, daemon=True).start()
 
     def share_of(self, job: Job, node: str) -> Allocation | None:
         """What ``job`` holds on ``node``, or ``None`` if nothing can say.
@@ -407,4 +496,8 @@ class Cluster:
         }
 
     def to_json(self, indent: int = 2) -> str:
+        # Local, so `json` is not on the startup path for the commands that
+        # never serialise anything. See `_print_json` in the CLI.
+        import json
+
         return json.dumps(self.summary(), indent=indent, default=str)

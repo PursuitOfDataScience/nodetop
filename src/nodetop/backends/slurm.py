@@ -23,10 +23,12 @@ Two Slurm-specific hazards are handled here rather than in the core:
 from __future__ import annotations
 
 import dataclasses
+import functools
 import getpass
 import grp
 import os
 import re
+import threading
 from collections.abc import Iterable
 from datetime import datetime
 from typing import TypedDict
@@ -113,6 +115,73 @@ _BASE_TO_CONDITION = {
 }
 
 
+#: Whitespace that is a field separator but is not a plain space.
+#:
+#: `_FIELDS_FAST` cannot see these, so their presence sends the record back to
+#: the regex. A `Reason` carrying a tab is rare and a tab-delimited record is
+#: rarer still, but the failure mode if one slipped past would be the worst one
+#: available: the whole record read as a single field, so a node with no state,
+#: which :func:`parse_nodes` then reports as UNKNOWN.
+_ODD_SPACE = re.compile(r"[\t\n\r\f\v]")
+
+#: Identifier shapes for the two record types, anchored at the end so a token
+#: like `a=b` inside a value cannot be mistaken for a key.
+_IDENT = {
+    "node": re.compile(r"[A-Za-z_][A-Za-z0-9_/]*\Z"),
+    "part": re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z"),
+}
+
+
+@functools.lru_cache(maxsize=512)
+def _is_key(kind: str, head: str) -> bool:
+    """Whether ``head`` is a field name rather than part of a value.
+
+    Cached because `scontrol`'s vocabulary is fixed and tiny while the tokens
+    are many: 607 nodes asked this 217,383 times about **37 distinct** strings.
+    That turned the regex from the second-hottest line in parsing into 37 calls
+    -- 13.1 ms to 10.1 ms over those nodes.
+
+    Bounded rather than a plain dict, which was faster still (8.7 ms) and
+    unbounded: an operator `Reason` full of `ticket=12345`-shaped words would
+    add an entry per node, and this process can outlive one parse by hours when
+    somebody leaves the browse open.
+    """
+    return _IDENT[kind].match(head) is not None
+
+
+def _fields_fast(kind: str, record: str) -> dict[str, str]:
+    r""":func:`_fields` without the backtracking, for the ordinary record.
+
+    The pattern `_fields` uses ends each value with a lazy match plus a
+    lookahead -- `(?P<val>.*?)(?=\s+Ident=|$)` -- which re-evaluates the
+    lookahead at every character of every value. Profiling `parse_nodes` over
+    607 nodes put `_fields` at **35% of the total** with 460,680 calls to
+    `re.Match.group` behind it.
+
+    Splitting on spaces cannot backtrack: a token that is `Ident=` starts a
+    field and everything else belongs to the value being collected. Same
+    first-wins rule, same `strip`, same output -- verified field by field
+    against the regex on every record of two live clusters (607 nodes and 87
+    partitions) and on a set of adversarial records: values containing `=`, a
+    key-shaped token mid-value, doubled spaces, empty values, leading and
+    trailing space. 22.2 ms -> 12.9 ms for 607 records.
+    """
+    out: dict[str, str] = {}
+    key: str | None = None
+    parts: list[str] = []
+    for token in record.split(" "):
+        head, sep, rest = token.partition("=")
+        if sep and _is_key(kind, head):
+            if key is not None:
+                out.setdefault(key, " ".join(parts).strip())
+            key, parts = head, [rest]
+        elif key is not None:
+            parts.append(token)
+    if key is not None:
+        out.setdefault(key, " ".join(parts).strip())
+    return out
+
+
 def _fields(pattern: re.Pattern[str], record: str) -> dict[str, str]:
     """``key=value`` pairs from one record, **first occurrence wins**.
 
@@ -125,6 +194,8 @@ def _fields(pattern: re.Pattern[str], record: str) -> dict[str, str]:
     which is what makes first-wins the safe rule rather than merely a different
     one.
     """
+    if not _ODD_SPACE.search(record):
+        return _fields_fast("node" if pattern is _NODE_FIELD else "part", record)
     out: dict[str, str] = {}
     for m in pattern.finditer(record):
         out.setdefault(m.group("key"), m.group("val").strip())
@@ -348,6 +419,7 @@ class SlurmBackend:
     def __init__(self, runner: Runner | None = None) -> None:
         self.runner = runner or SubprocessRunner()
         self._config_cache: str | None = None
+        self._config_lock = threading.Lock()
 
     @classmethod
     def detect(cls) -> bool:
@@ -433,6 +505,25 @@ class SlurmBackend:
             )
         return nodes
 
+    def default_memory_per_cpu_mb(self) -> int:
+        """``DefMemPerCPU``: what one core of a job that names no ``--mem`` costs.
+
+        The floor a node's free memory has to clear before anything can be
+        placed there, and 0 where the site sets none -- Slurm then defaults a
+        job to the whole node, which is a shortage this cannot quantify, so it
+        claims nothing rather than erasing most of a cluster. Read from the
+        config query :meth:`memory_is_consumable` already makes.
+
+        A partition may override the cluster value; that is not modelled, so a
+        partition with a *higher* floor is under-detected. The cluster default
+        is what every partition inherits unless told otherwise.
+        """
+        for line in (self._config() or "").splitlines():
+            if line.strip().startswith("DefMemPerCPU"):
+                value = line.partition("=")[2].strip()
+                return int(value) if value.isdigit() else 0
+        return 0
+
     def load_nodes(self) -> list[Node]:
         nodes = self.parse_nodes(
             # `--all`, to match the partition query. Without it Slurm applies
@@ -445,9 +536,26 @@ class SlurmBackend:
             # capacity at all. `scontrol show node <name>` hides it too, so
             # there is no per-node way to recover it afterwards.
             self.runner.run(["scontrol", "show", "node", "--all", "--oneliner"]))
+        floor = self.default_memory_per_cpu_mb()
         if self.memory_is_consumable():
-            return nodes
+            if not floor:
+                return nodes
+            return [dataclasses.replace(n, memory_floor_mb=floor) for n in nodes]
+        # The floor is irrelevant where memory is not consumable: `AllocMem`
+        # there is a record of requests, not a ceiling, so there is nothing to
+        # compare it against.
         return [dataclasses.replace(n, memory_consumable=False) for n in nodes]
+
+    def warm(self) -> None:
+        """Fetch `scontrol show config` now, with the first wave.
+
+        See :meth:`Backend.warm`. `load_nodes` and `load_identity` both need
+        this file, and asking for it from inside `load_nodes` -- after the node
+        query has already returned -- sent it ~70 ms behind the rest. It is
+        cached and locked, so warming it here means the loaders find it waiting
+        rather than fetching it themselves, and nothing is asked for twice.
+        """
+        self._config()
 
     def _config(self) -> str | None:
         """``scontrol show config``, fetched at most once, ``None`` if it failed.
@@ -458,12 +566,18 @@ class SlurmBackend:
         The failure is cached too, so a controller that cannot answer is asked
         once rather than once per consumer.
         """
-        if self._config_cache is None:
-            try:
-                self._config_cache = self.runner.run(["scontrol", "show", "config"])
-            except Exception:
-                self._config_cache = ""
-        return self._config_cache or None
+        # Locked, because `load_nodes` and `load_identity` both reach for this
+        # and now run together: without it they would each fetch, which is two
+        # readings of one file in one report and a query the discipline tests
+        # forbid.
+        with self._config_lock:
+            if self._config_cache is None:
+                try:
+                    self._config_cache = self.runner.run(
+                        ["scontrol", "show", "config"])
+                except Exception:
+                    self._config_cache = ""
+            return self._config_cache or None
 
     def memory_is_consumable(self) -> bool:
         """Whether this cluster accounts for memory when it places work.

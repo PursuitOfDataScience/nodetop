@@ -100,6 +100,26 @@ class Backend(Protocol):
         """What this backend can establish; see :class:`BackendCapabilities`."""
         ...
 
+    def warm(self) -> None:
+        """Fetch anything the loaders will ask for *inside* their own work.
+
+        Optional, and empty for most backends. It exists because a query issued
+        from within another query's handler goes out later than it needs to. On
+        Slurm, `load_nodes` reached for `scontrol show config` partway through
+        its own parse, so that query left ~70 ms after the other four -- and
+        during one bad spell on a live controller it took **2.0s on two runs in
+        five** while the four first-wave queries stayed normal. Asked on its own
+        that query is 17 ms, twenty times out of twenty.
+
+        Honest about what that proves: the stalls stopped when this changed, but
+        an interleaved A/B of both versions a while later found **no stalls in
+        either**, so the controller had calmed down and the 12-for-12 clean runs
+        after the change are not proof it caused them. What stands without the
+        measurement is the staging: one wave of queries rather than one wave and
+        a straggler, for the same queries at the same instant.
+        """
+        ...
+
     def load_nodes(self) -> list[Node]:
         ...
 

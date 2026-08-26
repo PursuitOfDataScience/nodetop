@@ -27,6 +27,57 @@ from nodetop.core.model import JobShape
 BACKENDS = backends.names()
 
 
+class TestNothingIsAskedForInTheSecondWave:
+    """A query issued from inside another query's handler arrives late.
+
+    `Cluster.load` fires its queries together, but `scontrol show config` was
+    not one of them: `load_nodes` reached for it partway through its own parse,
+    so it left ~70 ms after the first wave. During one bad spell on a live
+    controller that straggler took **2.0s on two runs in five** while the four
+    first-wave queries stayed normal; asked on its own it is 17 ms, twenty out
+    of twenty.
+
+    The honest limit of that: an interleaved A/B of both versions later found no
+    stalls in either, so the controller had calmed and the clean runs after the
+    change do not prove it caused them. What this test pins is the staging
+    itself, which is right either way -- one wave rather than one wave and a
+    straggler -- and that warming costs no extra query.
+    """
+
+    def test_the_load_warms_every_backend(self, monkeypatch):
+        called = []
+
+        class Warms(Recorder):
+            pass
+
+        for name in BACKENDS:
+            backend = backends.get(name, runner=Recorder())
+            monkeypatch.setattr(type(backend), "warm",
+                                lambda _self, n=name: called.append(n),
+                                raising=False)
+            with contextlib.suppress(Exception):
+                Cluster.load(backend)
+        assert sorted(called) == sorted(BACKENDS), called
+
+    def test_slurm_asks_for_its_config_exactly_once(self, slurm_backend):
+        # Warming it and then parsing nodes must not be two readings of one
+        # file: the cache is what makes `warm` a scheduling change rather than
+        # an extra query.
+        slurm_backend.warm()
+        before = sum(1 for c in slurm_backend.runner.calls
+                     if "config" in " ".join(c))
+        slurm_backend.load_nodes()
+        slurm_backend.load_identity()
+        after = sum(1 for c in slurm_backend.runner.calls
+                    if "config" in " ".join(c))
+        assert before == 1 and after == 1, slurm_backend.runner.calls
+
+    def test_a_backend_without_one_is_not_a_problem(self):
+        # `warm` is optional; most backends have nothing that needs it.
+        backend = backends.get("lsf", runner=Recorder())
+        Cluster.load(backend)      # must not raise
+
+
 class Recorder:
     """A runner that answers nothing and remembers everything."""
 

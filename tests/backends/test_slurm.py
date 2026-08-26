@@ -80,6 +80,81 @@ class TestNodes:
         assert n.is_gpu_node is False
 
 
+class TestTheFastFieldSplitAgreesWithTheRegex:
+    """Parsing is on every run, and it was 35% one function.
+
+    `_fields` ended each value with a lazy match plus a lookahead, which
+    re-evaluates the lookahead at every character of every value: profiling
+    `parse_nodes` over 607 live nodes put it at a third of the total, with
+    460,680 `re.Match.group` calls under it. Splitting on spaces cannot
+    backtrack. 42.4 ms -> 32.9 ms for those nodes.
+
+    The whole value of the change rests on the two paths agreeing, so that is
+    what is pinned here -- including the case the fast path cannot do, where it
+    has to hand back to the regex.
+    """
+
+    #: Records chosen to break a naive splitter: a key-shaped token inside a
+    #: value (the first-wins case this file already documents), `=` inside a
+    #: value, doubled spaces, an empty value, leading and trailing space, and
+    #: the `#` and `:` that `OS=` and `Gres=` carry.
+    RECORDS = [
+        "NodeName=n1 CPUTot=8 State=IDLE",
+        "NodeName=n1 Reason=replacing NodeName=n2 per ticket State=DOWN",
+        "NodeName=n1 Reason=two  spaces inside State=IDLE",
+        "NodeName=n1 OS=Linux 5.14.0 #1 SMP Thu State=IDLE",
+        "NodeName=n1 Comment= State=IDLE",
+        "  NodeName=n1 State=IDLE",
+        "NodeName=n1 State=IDLE  ",
+        "NodeName=n1 Reason=a=b=c State=IDLE",
+        "NodeName=n1 Gres=gpu:a100:4(S:0-1) AllocTRES=cpu=28,gres/gpu=1 State=MIXED",
+        # Whitespace that is a separator but not a space: the fast path cannot
+        # see these, so the record must go back to the regex.
+        "NodeName=n1\tCPUTot=8\tState=IDLE",
+        "NodeName=n1 Reason=tab\there State=IDLE",
+    ]
+
+    @staticmethod
+    def _regex_only(pattern, record):
+        out: dict[str, str] = {}
+        for m in pattern.finditer(record):
+            out.setdefault(m.group("key"), m.group("val").strip())
+        return out
+
+    @pytest.mark.parametrize("record", RECORDS, ids=range(len(RECORDS)))
+    def test_both_paths_read_the_same_fields(self, record):
+        from nodetop.backends.slurm import _NODE_FIELD, _PART_FIELD, _fields
+
+        for pattern in (_NODE_FIELD, _PART_FIELD):
+            assert _fields(pattern, record) == self._regex_only(pattern, record)
+
+    def test_a_tab_separated_record_still_parses(self):
+        # The guard exists because the failure would be the worst available:
+        # the whole record read as one field, so a node with no state, which
+        # `parse_nodes` then reports as UNKNOWN and unschedulable.
+        n = SlurmBackend(RecordedRunner({
+            "scontrol show node": (
+                0, "NodeName=n1\tCPUTot=8\tState=IDLE\tPartitions=p\n", ""),
+        })).load_nodes()[0]
+        assert (n.name, n.cpus_total, n.state_raw) == ("n1", 8, "IDLE")
+        assert n.schedulable is True
+
+    def test_the_key_test_is_cached_and_bounded(self):
+        from nodetop.backends.slurm import _is_key
+
+        _is_key.cache_clear()
+        for _ in range(200):
+            _is_key("node", "NodeName")
+        info = _is_key.cache_info()
+        assert info.hits == 199 and info.misses == 1
+        assert info.maxsize == 512
+        # An operator `Reason` full of unique `word=` tokens must not grow it
+        # without limit -- this process can outlive a parse by hours.
+        for i in range(2000):
+            _is_key("node", f"ticket{i}")
+        assert _is_key.cache_info().currsize <= 512
+
+
 class TestPlannedIsAPlanNotAnOutage:
     """`PLANNED` is the backfill scheduler's intent, not a node's condition.
 
@@ -212,6 +287,66 @@ class TestMemoryIsAConsumableResourceOrItIsNot:
         backend.load_nodes()
         config_calls = [c for c in backend.runner.calls if "config" in c]
         assert len(config_calls) == 1
+
+
+class TestTheSitesMemoryFloorReachesTheNodes:
+    """`DefMemPerCPU` is what one core of a default job costs, so it is the floor.
+
+    Without it the exhaustion test compares against zero and misses the node it
+    exists to catch: 97 idle cores, 250 MB free, and a cluster that hands out
+    3810 MB per core. Measured on a 607-node cluster after wiring it through:
+    **3,461 phantom cores removed across 153 nodes** -- a quarter of the free
+    cores the tool had been reporting.
+    """
+
+    NODE = ("NodeName=n1 CPUTot=128 CPUAlloc=31 RealMemory=250000 "
+            "AllocMem=249750 State=MIXED Partitions=p\n")
+
+    def _nodes(self, config):
+        return SlurmBackend(RecordedRunner({
+            "scontrol show node": (0, self.NODE, ""),
+            "scontrol show config": (0, config, ""),
+        })).load_nodes()
+
+    CONSUMABLE = "SelectTypeParameters    = CR_CORE_MEMORY\n"
+
+    def test_the_floor_is_read_and_applied(self):
+        n = self._nodes(self.CONSUMABLE + "DefMemPerCPU             = 3810\n")[0]
+        assert n.memory_floor_mb == 3810
+        assert n.memory_exhausted is True
+        assert n.effective_free_cpus == 0
+
+    @pytest.mark.parametrize("line", [
+        "",                                        # field absent
+        "DefMemPerCPU             = UNLIMITED\n",  # no floor published
+        "DefMemPerCPU             = (null)\n",
+    ])
+    def test_no_published_floor_claims_none(self, line):
+        n = self._nodes(self.CONSUMABLE + line)[0]
+        assert n.memory_floor_mb == 0
+        assert n.memory_exhausted is False        # back to the zero test
+
+    def test_a_non_consumable_cluster_is_left_alone(self):
+        # `AllocMem` there is a record of requests, not a ceiling; there is
+        # nothing for a floor to be compared against.
+        n = self._nodes("SelectTypeParameters = CR_CORE\nDefMemPerCPU = 3810\n")[0]
+        assert n.memory_consumable is False
+        assert n.memory_exhausted is False
+
+    def test_the_config_is_still_asked_for_once(self):
+        # Three consumers now: memory-consumability, this floor, and whether
+        # associations are enforced.
+        backend = SlurmBackend(RecordedRunner({
+            "scontrol show node": (0, self.NODE, ""),
+            "scontrol show config": (
+                0, self.CONSUMABLE + "DefMemPerCPU = 3810\n"
+                   "AccountingStorageEnforce = associations\n", ""),
+            "sacctmgr": (0, "", ""),
+        }))
+        backend.load_nodes()
+        backend.load_identity()
+        asked = [c for c in backend.runner.calls if "config" in " ".join(c)]
+        assert len(asked) == 1, asked
 
 
 class TestGresCountsAreNotDeviceIndices:
