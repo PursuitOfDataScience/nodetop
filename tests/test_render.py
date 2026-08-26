@@ -7,6 +7,8 @@ import re
 import pytest
 
 from nodetop.render import (
+    _PALETTE,
+    _RAMP,
     MIN_WIDTH,
     RAMP_STEPS,
     Glyphs,
@@ -59,6 +61,289 @@ class TestWidth:
 
     def test_empty(self):
         assert width("") == 0
+
+
+class TestWidthIsMemoised:
+    """The same cell is measured many times, so the answer is kept.
+
+    A table sizes each column by its widest cell and then pads every cell to
+    it, and a listing repeats itself: `MIXED`, `64/64`, a meter, a dash.
+    Profiling `nodes --all` over 607 nodes put `width` at **19,600 calls per
+    render** and it, with `_strip_ansi` beneath it, at the top of the profile by
+    cumulative time -- 50.8 ms of rendering, of which the second measurement of
+    every cell was pure repetition. It matters most where it is least visible:
+    the interactive browse re-renders the whole frame on every keypress.
+    """
+
+    def test_the_cache_cannot_change_an_answer(self):
+        # Every case the uncached function was tested on above, asked twice.
+        cases = ["abc", "\033[31mabc\033[0m", "日本語", "é", "─│╭╮╰╯", "",
+                 "\033[38;2;1;2;3m█▊░\033[0m", "MIXED", "64/64"]
+        first = [width(c) for c in cases]
+        second = [width(c) for c in cases]
+        assert first == second
+        # And the same answers a fresh, cold function gives.
+        width.cache_clear()
+        assert [width(c) for c in cases] == first
+
+    def test_it_actually_hits(self):
+        width.cache_clear()
+        for _ in range(50):
+            width("MIXED")
+        info = width.cache_info()
+        assert info.hits == 49 and info.misses == 1
+
+    def test_it_is_bounded(self):
+        # Node names and job ids are unique, so an unbounded cache on a
+        # 10,000-node cluster would grow without limit.
+        assert width.cache_info().maxsize == 8192
+        width.cache_clear()
+        for i in range(9000):
+            width(f"midway3-{i:05d}")
+        assert width.cache_info().currsize <= 8192
+
+
+class TestTheFastPathsAgreeWithTheSlowOnes:
+    """Three shortcuts on the rendering hot path, each pinned against a reference.
+
+    Rendering a 10,624-row table -- the shape of a real PBS partition -- spent
+    its time in places that all had the same character: an answer rebuilt for
+    every cell of every row when the domain of answers is tiny. Profiled:
+    `_strip_ansi` 53,537 calls, `width` 42,907, `_sgr` **94,294**, one `bar` per
+    row, and 385,333 `unicodedata` lookups apiece for wide-character and
+    combining-mark tests. The frame went **365 ms -> 250 ms**.
+
+    Every one of these is only allowed if the output does not move, so that is
+    what these tests check -- against a reference computed the long way, not
+    against a recorded string. (Checked once by hand as well: 22 command
+    outputs, Unicode and ASCII, PBS and Slurm data, byte-identical.)
+    """
+
+    #: Deliberately awkward: wide CJK, a combining mark, box-drawing meters,
+    #: colour, a bare escape, and a *truncated* escape -- the case that got a
+    #: regex implementation of `_strip_ansi` rejected.
+    SAMPLES = [
+        "", "n1", "midway3-0296", "MIXED", "48/208", "1007/1007G",
+        "\u2588\u2588\u2588\u258c\u2591\u2591\u2591\u2591", "\u25cf", "\u25d0", "\u2192",
+        "\u30ce\u30fc\u30c9", "e\u0301clair", "\uff21\uff22\uff23",
+        "\033[38;5;111mtinted\033[0m", "\033[1m\033[38;2;1;2;3mbold rgb\033[0m",
+        "\033[38;5;", "plain\033[0m", "\033[7minverse\033[0m",
+    ]
+
+    @staticmethod
+    def _reference_width(text: str) -> int:
+        """`width` as it was before the ASCII shortcut: two lookups per char."""
+        import unicodedata
+
+        from nodetop.render import _strip_ansi
+
+        total = 0
+        for ch in _strip_ansi(text):
+            if unicodedata.combining(ch):
+                continue
+            total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        return total
+
+    @pytest.mark.parametrize("text", SAMPLES)
+    def test_the_ascii_shortcut_measures_what_the_loop_measures(self, text):
+        assert width(text) == self._reference_width(text)
+
+    def test_stripping_nothing_returns_the_same_string(self):
+        from nodetop.render import _strip_ansi
+
+        for text in self.SAMPLES:
+            got = _strip_ansi(text)
+            assert "\033" not in got
+            if "\033" not in text:
+                assert got is text or got == text
+
+    def test_two_styles_of_different_depth_do_not_share_escapes(self):
+        # The escape cache is per style because the escape depends on this
+        # style's colour depth; one dict shared between them would paint a
+        # 16-colour terminal with truecolour.
+        deep, shallow = Style(depth=24), Style(depth=8)
+        assert deep.ok("x") != shallow.ok("x")
+        assert deep.ok("x") == Style(depth=24).ok("x")
+        assert "38;2;" in deep.ok("x") and "38;5;" in shallow.ok("x")
+
+    def test_a_memoised_meter_is_the_meter_it_would_have_drawn(self):
+        # Swept rather than sampled: the key is the ROUNDED eighths and cells,
+        # so two nearby fractions must not collide onto one picture.
+        for glyphs in (Glyphs(), Glyphs.ascii()):
+            for depth in (0, 8, 24):
+                warm = Style(depth=depth, glyphs=glyphs)
+                for size in (1, 4, 8, 16):
+                    for i in range(0, 101):
+                        f = i / 100
+                        cold = Style(depth=depth, glyphs=glyphs)  # empty cache
+                        assert bar(f, size, warm) == bar(f, size, cold), (f, size)
+
+    def test_a_memoised_meter_respects_step_and_role(self):
+        warm = Style(depth=24)
+        for step in range(RAMP_STEPS):
+            assert bar(0.5, 8, warm, step=step) == bar(0.5, 8, Style(depth=24), step=step)
+        for role in ("ok", "bad", "warn"):
+            assert bar(0.5, 8, warm, role=role) == bar(0.5, 8, Style(depth=24), role=role)
+        # A role and a step are different pictures of the same fraction, so the
+        # cache must not hand one back for the other.
+        assert bar(0.5, 8, warm, role="bad") != bar(0.5, 8, warm, step=0)
+
+    def test_the_meter_cache_is_bounded(self):
+        st = Style(depth=24)
+        for size in range(1, 200):        # a caller varying size per row
+            bar(0.37, size, st)
+        assert len(st._bars) <= 4096
+
+
+class TestOpeningAPaintedRunIsRemembered:
+    """`paint` and `tint` were called 74,526 times for one frame.
+
+    Each rebuilt the same escape prefix from the same role or ramp step, and
+    each asked `Style.enabled` -- a property over a `depth` that cannot change
+    after construction -- for permission first. The prefix is memoised per style
+    and `enabled` is now an attribute. `_node_rows` on 10,624 nodes: 135 -> 121
+    ms; the whole frame 229 -> 216 ms.
+
+    Two caches share one dictionary, so the keys must not collide, and a step
+    outside the ramp must not grow it without bound. Both are checked here.
+    """
+
+    def test_the_prefix_is_the_prefix_it_would_have_built(self):
+        warm = Style(depth=24)
+        for role in ("ok", "bad", "warn", "dim", "muted", "accent"):
+            for bold in (False, True):
+                assert warm.paint(role, "x", bold) == Style(depth=24).paint(role, "x", bold)
+        for step in range(RAMP_STEPS):
+            for fill in (False, True):
+                for bold in (False, True):
+                    assert (warm.tint("x", step, fill, bold)
+                            == Style(depth=24).tint("x", step, fill, bold))
+
+    def test_a_role_and_a_ramp_step_cannot_collide(self):
+        # `paint` keys on (role, bold) and `tint` on (step, fill, bold) in the
+        # same dictionary. A role named like a number is the awkward case.
+        st = Style(depth=24)
+        by_role = st.paint("ok", "x")
+        by_step = st.tint("x", 0, False)
+        assert by_role != by_step or _PALETTE["ok"] == _RAMP[0]
+
+    def test_an_out_of_range_step_shares_the_colour_it_shares(self):
+        st = Style(depth=24)
+        assert st.tint("x", 999) == st.tint("x", RAMP_STEPS - 1)
+        assert st.tint("x", -5) == st.tint("x", 0)
+        # Clamped before it becomes a key, so the dictionary cannot grow past
+        # RAMP_STEPS x fill x bold however wild the caller's arithmetic is.
+        for step in range(-500, 500):
+            st.tint("x", step)
+        assert len(st._prefixes) <= RAMP_STEPS * 4
+
+    def test_colour_off_still_returns_the_text_untouched(self):
+        mono = Style(enabled=False)
+        assert mono.enabled is False
+        assert mono.paint("ok", "x") == "x"
+        assert mono.tint("x", 3) == "x"
+        assert mono._prefixes == {}
+
+    def test_enabled_still_tracks_the_depth_it_was_built_with(self):
+        assert Style(depth=0).enabled is False
+        assert Style(depth=8).enabled is True
+        assert Style(enabled=True).enabled is True
+        assert Style(enabled=False).enabled is False
+
+
+class TestEveryCellIsMeasuredOnce:
+    """The width array inside `table`, and the one way it can go wrong.
+
+    Sizing the columns, capping to `limits`, shrinking to the window and padding
+    each asked `width` for every cell: four measurements per cell, ~255,000 of
+    them on a 10,624-row listing, 86 ms of a 280 ms frame. Measured once and
+    carried now -- which means a cell that gets *rewritten* must have its
+    recorded width rewritten too, and a row whose recorded widths are stale
+    misaligns silently. So these tests check alignment, not timing.
+    """
+
+    @staticmethod
+    def _visible(line: str) -> int:
+        return width(line)
+
+    def test_rows_line_up_when_cells_are_capped_then_shrunk(self):
+        # Both rewriting passes on the same cells: `limits` caps the first
+        # column, then `fit` shrinks everything to a narrow window.
+        st = Style(depth=24)
+        rows = [[st.ok("a" * (5 + i)), st.bad("b" * (40 - i)), str(i)]
+                for i in range(12)]
+        out = table(["name", "detail", "n"], rows, ["left", "left", "right"],
+                    st, limits=[8, 0, 0], size=44).splitlines()
+        widths = {self._visible(ln) for ln in out if ln.strip()}
+        assert len(widths) == 1, sorted(widths)
+
+    def test_rows_line_up_when_a_blank_column_is_dropped(self):
+        # `drop_empty` deletes a column from every row, and the width array has
+        # to lose the same one -- otherwise every cell after it pads to the
+        # wrong number.
+        st = Style(depth=24)
+        # Columns 0 and 1 are the row's identity and are never dropped, so the
+        # blank ones have to sit at index >= `keep`. The last column is a
+        # fixed-width number because `table` rstrips each line, which would
+        # otherwise make a ragged final column look like a misalignment.
+        rows = [[f"n{i}", st.warn("x" * (3 + i % 4)), "", "", str(i)]
+                for i in range(9)]
+        out = table(["node", "state", "gap", "also", "n"], rows,
+                    ["left", "left", "left", "left", "right"], st,
+                    size=60).splitlines()
+        assert "gap" not in out[0] and "also" not in out[0]
+        widths = {self._visible(ln) for ln in out if ln.strip()}
+        assert len(widths) == 1, sorted(widths)
+
+    def test_a_wide_character_cell_still_aligns(self):
+        # The array holds *display* width, so a CJK cell must reserve two
+        # columns per character here exactly as it did when `pad` measured it.
+        st = Style(enabled=False)
+        rows = [["\u30ce\u30fc\u30c9", "1"], ["node", "2"], ["\uff21\uff22", "3"]]
+        out = table(["name", "n"], rows, ["left", "right"], st,
+                    size=40).splitlines()
+        widths = {self._visible(ln) for ln in out if ln.strip()}
+        assert len(widths) == 1, sorted(widths)
+
+    def test_a_cell_the_window_shrank_is_padded_to_the_new_width(self):
+        """The case that no other test here catches, so it is worth naming.
+
+        After the fit pass truncates a cell, its recorded width has to come down
+        with it. Usually `truncate` lands exactly on the limit, so a stale width
+        is invisible -- but a wide character cannot straddle the last column, so
+        cutting `\u30ce\u30fc\u30c9\u30ce\u30fc\u30c9` to six columns yields five, and the
+        cell then needs one space that a stale width would deny it. One column
+        of drift, in the one column nobody would look at.
+        """
+        st = Style(enabled=False)
+        # Swept, because whether the cut lands short depends on where the column
+        # boundary falls: at 22 columns it lands exactly and a stale width would
+        # be invisible; at 15, 16, 19, 20, 23 it is a column adrift.
+        for size in range(15, 46):   # below 15 a column is dropped, which
+            #                            appends a note line of its own width
+            rows = [["\u30ce\u30fc\u30c9\u30ce\u30fc\u30c9\u30ce\u30fc\u30c9",
+                     "keeps going and going and going", str(i)] for i in range(3)]
+            rows.append(["ok", "short", "9"])
+            out = table(["name", "detail", "n"], rows, ["left", "left", "right"],
+                        st, size=size).splitlines()
+            seen = {self._visible(ln) for ln in out
+                    if ln.strip() and "more column" not in ln}
+            assert len(seen) == 1, (size, sorted(seen))
+
+    def test_pad_agrees_with_itself_whether_or_not_it_is_told_the_width(self):
+        from nodetop.render import pad
+
+        for text in ("", "abc", "\033[38;5;9mred\033[0m", "\u30ce\u30fc\u30c9", "e\u0301"):
+            for align in ("left", "right", "center"):
+                assert pad(text, 12, align) == pad(text, 12, align, have=width(text))
+
+    def test_a_lie_about_the_width_is_what_this_prevents(self):
+        # Documenting the failure mode: `have` is trusted, so it must only ever
+        # come from `width` of the same string.
+        from nodetop.render import pad
+
+        assert pad("abc", 10, "left", have=99) == "abc"        # no padding at all
+        assert pad("abc", 10, "left") == "abc" + " " * 7
 
 
 class TestTruncate:

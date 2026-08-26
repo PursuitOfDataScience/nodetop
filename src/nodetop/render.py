@@ -20,6 +20,7 @@ are correctness rather than decoration:
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shutil
@@ -62,6 +63,13 @@ MAX_WIDTH = 100
 # width
 # ---------------------------------------------------------------------------
 def _strip_ansi(text: str) -> str:
+    # Nothing to strip, which is the common case: a node name, a count, a
+    # state. `in` on a string is a C-level scan, where the loop below is a
+    # Python one per character -- and this function was the single largest
+    # entry in a profile of rendering a 10,624-row table (53,537 calls,
+    # 200 ms of 819 ms under the profiler).
+    if "\033" not in text:
+        return text
     out: list[str] = []
     i = 0
     while i < len(text):
@@ -114,6 +122,20 @@ def sanitize(text: str) -> str:
     return _CONTROL.sub(" ", text) if text else text
 
 
+#: Measured cell widths, kept because the same string is measured many times.
+#:
+#: A table sizes each column by the widest cell and then pads every cell to it,
+#: so one render measures each cell at least twice -- and a listing repeats
+#: itself heavily: `MIXED`, `64/64`, a meter, a dash. Profiling `nodes --all` on
+#: a 607-node cluster: **`width` called 19,600 times per render**, and it plus
+#: `_strip_ansi` were the top two entries by cumulative time.
+#:
+#: It matters most where it is least visible: the interactive browse re-renders
+#: the whole frame on every keypress, so this is the cost of moving the cursor.
+#:
+#: Bounded, and small: cells are short strings, 8192 of them is a few hundred
+#: kilobytes, and a listing of 10,000 nodes reuses far more than it adds.
+@functools.lru_cache(maxsize=8192)
 def width(text: str) -> int:
     """Columns this string occupies in a terminal.
 
@@ -121,8 +143,21 @@ def width(text: str) -> int:
     two columns, and counts zero-width combining marks as none.  Using
     ``len()`` instead is what makes a coloured or non-Latin table drift.
     """
+    stripped = _strip_ansi(text)
+    # ASCII cannot be wide and cannot combine, so its display width IS its
+    # length -- and `str.isascii()` is a flag check on the string object rather
+    # than a scan. This is the path essentially every cell takes: names,
+    # counts, states, meters drawn from box-drawing... no, those are not ASCII,
+    # so they fall through to the loop, which is exactly right.
+    #
+    # It matters because the memo above cannot help at scale: 10,624 nodes
+    # produce far more than 8,192 distinct strings, so a large listing is
+    # mostly cache misses, and a miss used to mean two `unicodedata` lookups
+    # per character -- 385,333 of each in one render of that table.
+    if stripped.isascii():
+        return len(stripped)
     total = 0
-    for ch in _strip_ansi(text):
+    for ch in stripped:
         if unicodedata.combining(ch):
             continue
         total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
@@ -170,8 +205,14 @@ def truncate(text: str, limit: int, ellipsis: str = "\u2026") -> str:
     return "".join(out) + ellipsis + ("\033[0m" if styled else "")
 
 
-def pad(text: str, size: int, align: str = "left") -> str:
-    gap = max(0, size - width(text))
+def pad(text: str, size: int, align: str = "left", have: int | None = None) -> str:
+    """Pad to ``size`` display columns. ``have`` is the width, if already known.
+
+    A table measures every cell to size its columns and then pads every cell to
+    that size, so the width was already in hand and this used to ask for it
+    again: 85,000 redundant measurements on a 10,624-row listing.
+    """
+    gap = max(0, size - (width(text) if have is None else have))
     if align == "right":
         return " " * gap + text
     if align == "center":
@@ -490,20 +531,43 @@ class Style:
         if enabled is True and self.depth == 0:
             self.depth = 8
         self.g = glyphs or Glyphs.detect()
-
-    @property
-    def enabled(self) -> bool:
-        return self.depth > 0
+        #: Read on every painted string -- 74,526 times in one 10,624-row frame
+        #: -- and derived from a `depth` that cannot change after construction,
+        #: so it is computed here instead of on each read.
+        self.enabled = self.depth > 0
+        #: Tone -> escape, filled on demand. See :meth:`_sgr`.
+        self._escapes: dict[_Tone, str] = {}
+        #: (role, bold) and (step, fill, bold) -> the escape prefix that opens
+        #: a painted run. Same reasoning as `_escapes`, one level up: `paint`
+        #: and `tint` were called 74,526 times between them for one frame and
+        #: rebuilt the same few prefixes every time.
+        self._prefixes: dict[tuple[object, ...], str] = {}
+        #: Meter shape -> rendered bar, filled on demand. See :func:`bar`.
+        self._bars: dict[tuple[object, ...], str] = {}
 
     # -- primitives ---------------------------------------------------------
     def _sgr(self, tone: _Tone) -> str:
-        """One ``(rgb, 256, 16)`` tone as the escape this terminal can show."""
-        rgb, c256, c16 = tone
-        if self.depth >= 24:
-            return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
-        if self.depth >= 8:
-            return f"\033[38;5;{c256}m"
-        return f"\033[{c16}m"
+        """One ``(rgb, 256, 16)`` tone as the escape this terminal can show.
+
+        Memoised per style, because `depth` is fixed at construction and the
+        answer is otherwise rebuilt for every cell of every row: **94,294 calls
+        in one render** of a 10,624-row table, each formatting the same handful
+        of strings. The domain is the palette plus the ramp -- a few dozen tones
+        -- so the dictionary stays tiny and every entry is hit thousands of
+        times. Per instance rather than an `lru_cache`, since the escape depends
+        on this style's colour depth.
+        """
+        hit = self._escapes.get(tone)
+        if hit is None:
+            rgb, c256, c16 = tone
+            if self.depth >= 24:
+                hit = f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+            elif self.depth >= 8:
+                hit = f"\033[38;5;{c256}m"
+            else:
+                hit = f"\033[{c16}m"
+            self._escapes[tone] = hit
+        return hit
 
     def _fg(self, role: str) -> str:
         return self._sgr(_PALETTE[role])
@@ -511,7 +575,11 @@ class Style:
     def paint(self, role: str, text: str, bold: bool = False) -> str:
         if not self.enabled or not text:
             return text
-        prefix = ("\033[1m" if bold else "") + self._fg(role)
+        key = (role, bold)
+        prefix = self._prefixes.get(key)
+        if prefix is None:
+            prefix = ("\033[1m" if bold else "") + self._fg(role)
+            self._prefixes[key] = prefix
         return f"{prefix}{text}\033[0m"
 
     def tint(self, text: str, step: int, fill: bool = False, bold: bool = False) -> str:
@@ -523,9 +591,16 @@ class Style:
         """
         if not self.enabled or not text:
             return text
-        ramp = _WASH if fill else _RAMP
-        tone = ramp[max(0, min(RAMP_STEPS - 1, step))]
-        prefix = ("\033[1m" if bold else "") + self._sgr(tone)
+        # Clamped before it is used as a key, so an out-of-range step shares
+        # the entry it shares the colour with and the dictionary stays bounded
+        # at RAMP_STEPS x fill x bold.
+        step = max(0, min(RAMP_STEPS - 1, step))
+        key = (step, fill, bold)
+        prefix = self._prefixes.get(key)
+        if prefix is None:
+            prefix = (("\033[1m" if bold else "")
+                      + self._sgr((_WASH if fill else _RAMP)[step]))
+            self._prefixes[key] = prefix
         return f"{prefix}{text}\033[0m"
 
     def heat(self, text: str, fraction: float | None, bold: bool = False) -> str:
@@ -658,6 +733,17 @@ def bar(
     g = style.g
     fraction = max(0.0, min(1.0, fraction))
     tone = heat_step(fraction) if step is None else step
+    # A meter is one of very few pictures: `size` cells at eighth resolution,
+    # in one of nine ramp steps. A 10,624-row listing drew 10,624 of them and
+    # the drawing is not free -- 105 ms of that render, in `heat_step`, the
+    # block arithmetic and two `paint` calls per bar. Keyed on the *rounded*
+    # numbers the body actually uses, both of them, so a hit is the same string
+    # the miss would have built rather than one that merely looks like it.
+    key = (int(round(fraction * size * 8)), int(round(fraction * size)),
+           size, role, tone)
+    hit = style._bars.get(key)
+    if hit is not None:
+        return hit
 
     def painted(fill: str, trough: str) -> str:
         if role is not None:
@@ -666,14 +752,21 @@ def bar(
 
     if not g.unicode:
         filled = int(round(fraction * size))
-        return painted(g.blocks * filled, g.empty * (size - filled))
-
-    total_eighths = int(round(fraction * size * 8))
-    full, remainder = divmod(total_eighths, 8)
-    fill = g.blocks[-1] * full
-    if remainder:
-        fill += g.blocks[remainder - 1]
-    return painted(fill, g.empty * max(0, size - width(fill)))
+        drawn = painted(g.blocks * filled, g.empty * (size - filled))
+    else:
+        total_eighths = int(round(fraction * size * 8))
+        full, remainder = divmod(total_eighths, 8)
+        fill = g.blocks[-1] * full
+        if remainder:
+            fill += g.blocks[remainder - 1]
+        drawn = painted(fill, g.empty * max(0, size - width(fill)))
+    # Bounded: the domain is (eighths x size x role x step), and a listing
+    # reuses far more than it adds. The cap is a backstop against a caller that
+    # varies `size` per row rather than per column.
+    if len(style._bars) >= 4096:
+        style._bars.clear()
+    style._bars[key] = drawn
+    return drawn
 
 
 def gauge(
@@ -1067,6 +1160,15 @@ def table(
     body = [[("" if c is None else str(c)) for c in row] for row in rows]
     if not body:
         return indent + style.dim("(nothing to show)")
+    # Every cell's display width, measured ONCE and carried through.
+    #
+    # The three passes below -- cap to `limits`, size the columns, shrink to the
+    # window -- each used to ask `width` for every cell again, and so did `pad`
+    # at the end: four measurements per cell. On a 10,624-row listing that was
+    # ~255,000 calls costing 86 ms of a 280 ms frame, for 85,000 distinct
+    # answers. The array is updated wherever a cell is rewritten, which is the
+    # only way it can go stale.
+    wide = [[width(c) for c in r] for r in body]
 
     headers = list(headers)
     ncol = len(headers)
@@ -1074,10 +1176,11 @@ def table(
     aligns += ["left"] * (ncol - len(aligns))
 
     if limits:
-        for r in body:
+        for r, w in zip(body, wide, strict=True):
             for i, cap in enumerate(limits[:ncol]):
-                if cap and i < len(r):
+                if cap and i < len(r) and w[i] > cap:
                     r[i] = truncate(r[i], cap, style.g.ellipsis)
+                    w[i] = width(r[i])
 
     if drop_empty and body:
         # A column blank on every row. Never drop the leading `keep`: those
@@ -1090,15 +1193,17 @@ def table(
         for i in reversed(blank):
             del headers[i]
             del aligns[i]
-            for r in body:
+            for r, w in zip(body, wide, strict=True):
                 if i < len(r):
                     del r[i]
+                    del w[i]
         ncol -= len(blank)
 
     sizes = [width(h) for h in headers]
-    for r in body:
-        for i in range(min(ncol, len(r))):
-            sizes[i] = max(sizes[i], width(r[i]))
+    for w in wide:
+        for i in range(min(ncol, len(w))):
+            if w[i] > sizes[i]:
+                sizes[i] = w[i]
 
     # Shrink to the terminal rather than overflowing it. A table wider than the
     # window wraps, and a wrapped row destroys the column alignment that makes
@@ -1120,6 +1225,7 @@ def table(
         sizes = sizes[:ncol]
         floors = floors[:ncol]
         body = [r[:ncol] for r in body]
+        wide = [w[:ncol] for w in wide]
         available = window - len(indent) - 2 * (ncol - 1)
         guard = 0
         while sum(sizes) > available and guard < 4096:
@@ -1128,10 +1234,11 @@ def table(
                 break
             sizes[slack.index(max(slack))] -= 1
             guard += 1
-        for r in body:
+        for r, w in zip(body, wide, strict=True):
             for i in range(min(ncol, len(r))):
-                if width(r[i]) > sizes[i]:
+                if w[i] > sizes[i]:
                     r[i] = truncate(r[i], sizes[i], style.g.ellipsis)
+                    w[i] = width(r[i])
         # Headers shrink with their columns too. Truncating only the data
         # leaves the header row wider than every row beneath it, which is the
         # one line guaranteed to overflow.
@@ -1169,9 +1276,11 @@ def table(
             lines.append(
                 indent + "  ".join(style.dim(style.g.h * sizes[i])
                                    for i in range(ncol)))
-    for r in body:
+    for r, w in zip(body, wide, strict=True):
         cells = [
-            pad(r[i] if i < len(r) else "", sizes[i], aligns[i]) for i in range(ncol)
+            pad(r[i] if i < len(r) else "", sizes[i], aligns[i],
+                have=w[i] if i < len(w) else 0)
+            for i in range(ncol)
         ]
         lines.append((indent + "  ".join(cells)).rstrip())
     if dropped:

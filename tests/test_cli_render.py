@@ -280,6 +280,62 @@ class TestContent:
         assert " " not in out
 
 
+class TestTheMarkCarriesTheRatioInColour:
+    """`◐` says "in between"; its hue says how far in.
+
+    The alphabet stays four glyphs -- `●` free, `◐` in between, `○` out, `▲`
+    degraded -- because `●`/`○` is a plain yes/no in three other tables and a
+    shape that means "62% free" here and "permitted" there is the mistake `sep`
+    was split out to stop. The ratio rides in the colour instead, on the ramp
+    step the free-core count beside it already uses, so the two cannot
+    disagree about one node.
+    """
+
+    def _rows(self, nodes):
+        from nodetop.cli import _node_rows
+
+        return _node_rows(nodes, MODES["truecolor"])
+
+    def _mark_and_count(self, row):
+        import re
+
+        def hue(cell):
+            return re.match(r"\x1b\[38;2;([\d;]+)m", str(cell))
+
+        return hue(row[1]), hue(row[4])
+
+    def _node(self, name, free, total=128):
+        from nodetop.core.model import Node
+
+        return Node(name=name, state_raw="MIXED", cpus_total=total,
+                    cpus_alloc=total - free, memory_mb=1000, memory_alloc_mb=1)
+
+    def test_the_mark_and_the_number_share_one_hue(self):
+        rows = self._rows([self._node("n1", 120), self._node("n2", 60),
+                           self._node("n3", 2)])
+        for row in rows:
+            mark, count = self._mark_and_count(row)
+            assert mark and count, row
+            assert mark.group(1) == count.group(1), row
+
+    def test_a_roomier_node_is_not_the_same_colour_as_a_full_one(self):
+        rows = self._rows([self._node("roomy", 120), self._node("tight", 2)])
+        hues = [self._mark_and_count(r)[0].group(1) for r in rows]
+        assert hues[0] != hues[1]
+
+    def test_the_glyph_is_the_same_one_throughout(self):
+        # The gradation is the colour, not the shape: a reader piping this to a
+        # file must still get exactly the four marks the legend elsewhere uses.
+        rows = self._rows([self._node("a", 120), self._node("b", 2)])
+        assert all(Glyphs().partial in str(r[1]) for r in rows)
+
+    def test_with_colour_off_it_is_the_plain_mark(self):
+        from nodetop.cli import _node_rows
+
+        rows = _node_rows([self._node("a", 120)], MODES["plain"])
+        assert str(rows[0][1]) == Glyphs().partial
+
+
 class TestFitsTheTerminal:
     """No rendered line may exceed the window width.
 
