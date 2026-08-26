@@ -56,6 +56,15 @@ Every system has this. PBS spells it `enabled=True, started=False`. LSF spells i
 `Open:Inact` and reports 140 jobs pending against it. Kubernetes spells it
 `Ready,SchedulingDisabled` with every capacity number intact.
 
+PBS's two words do not *fit*, though, and that turned out to matter. The state column is
+twelve characters -- sized for Slurm's `UP` -- so `enabled=True started=True` rendered as
+`enabled=Tru…`: cut off exactly at the answer, and the same eleven characters whether the
+queue was open or shut. Seen on a live 2026.1.0 cluster listing ten queues, two of them
+closed, all of them indistinguishable. The switches are independent, so each of the four
+combinations now gets its own word -- `UP`, `STOPPED` (accepts, never runs), `DISABLED`
+(runs, accepts nothing), `DOWN` (neither) -- while `enabled` and `started` stay on the
+queue as booleans, because they are what every decision reads.
+
 ### 1a. And a dashboard that answered a question nobody asked
 
 The overview used to open with that finding, and then rank every partition together by
@@ -573,6 +582,50 @@ Two things make this safe to apply rather than a new way to be wrong:
   `SlurmBackend.memory_is_consumable()` asks, once, and stamps the answer onto every node.
   Unreadable config claims *less* capacity, which is the bias everywhere else here.
 
+### 3a-i. Zero was the wrong floor
+
+`3a` above stopped counting cores on a node whose memory was *entirely*
+allocated. A fifth cluster showed the same defect one resolution finer, and it
+took a reader noticing a row that looked wrong to find it:
+
+```
+◐  midway3-0512  MIXED    97/128  ██████░░   0/244G
+```
+
+97 idle cores, a three-quarters-full meter, and `0/244G` beside it. The node has
+`RealMemory=250000` and `AllocMem=249750` — **250 MB free**, which rounds down to
+0 GiB in the column and sat 250 MB above a test written as `free <= 0`. That
+cluster's `DefMemPerCPU` is 3810, so a single core of a job that names no
+`--mem` needs fifteen times what is left: nothing can start there, and the row
+sorted to the top of the listing as the roomiest thing on screen.
+
+The floor is now the scheduler's own — `DefMemPerCPU`, read from the config
+query already being made — so the comparison is against what Slurm will actually
+hand out rather than against zero. What it recovered on that cluster:
+
+| | free cores reported |
+|---|---|
+| before | 14,352 |
+| after | **10,891** |
+
+**3,461 phantom cores across 153 nodes**, a quarter of the total the tool had
+been publishing. And it is targeted rather than blunt: on two other Slurm
+clusters, whose floors are 16384 and 2048 MB, not one node sat in the gap and
+the numbers did not move at all.
+
+Two limits stated rather than papered over. A job naming a small `--mem`
+explicitly can still land on such a node, so this is the same "claims less
+capacity" bias as everywhere else here and not a hard impossibility — the
+claimed counts stay in the column beside the meter. And a *partition* may
+override the cluster's `DefMemPerCPU`; that is not modelled, so a partition with
+a higher floor is under-detected.
+
+The node's state string is left exactly as the scheduler wrote it. Slurm derives
+`MIXED` and `ALLOCATED` from CPU allocation alone and never folds memory in, so
+a memory-full node reads `MIXED` there; rewriting the scheduler's own word would
+be a different kind of lie. The mark, the meter and the ordering are nodetop's
+to get right, and those are what changed.
+
 ### 3b. Free nodes are not a start time
 
 `sbatch --test-only` will tell you when the scheduler expects to start your job. nodetop
@@ -988,6 +1041,20 @@ A single-node job needs no lookup at all: its totals *are* its share, which is m
 and the whole answer on a backend that models a job as living on one machine. A multi-node
 job whose share cannot be established prints `?` rather than substituting a total.
 
+### 1i-a. Right means deeper, and at the bottom deeper is nowhere
+
+At the job detail, Right went back to the job list. `select` returns the index
+when Right is pressed at the end of a row -- "nothing further right: open it" --
+and a caller with nothing deeper to open could only read that as "step back", so
+the key for going in came out. "pressing right arrow will go into the same
+interface ... this is very confusing."
+
+`openable=False` is the mirror of `escapable=False` at the root, and for the
+same reason: at an edge, the key that moves that way does nothing rather than
+something surprising. Right and Enter are ignored at the leaf, Left and Escape
+leave, `q` quits. A node running no jobs is a leaf too -- its single row is a
+placeholder, not something to open.
+
 ### 1i. Everything is a level, including the leaf
 
 Two dead ends, both found by using the thing:
@@ -1243,6 +1310,69 @@ Two smaller lessons, same root:
   `Job N to start at T using P processors on nodes L` lost `P` and `L` the moment 25.11 put
   a stray token after `T`. Three patterns against that one line cannot fail that way.
 
+### 6a. The mark says which; the colour says how much
+
+`◐` meant "somewhere between free and full", and that is all it meant, on a row
+whose numbers ranged from 3 idle cores to 114. Asked to carry the ratio, the
+first attempt graded the *shape* — `◔ ◑ ◕` between `○` and `●` — and it was put
+back after one look at a real column:
+
+* `●` and `○` are a plain yes/no in three other tables (a backend usable here, a
+  queue on your allowlist, a dry-run accepted). A shape that means "62% free"
+  in this table and "permitted" in the next is exactly the collision `·` was
+  split out to stop.
+* `◐` and `◑` are one scanned column away from being the same character, and
+  they would have meant opposite things — "nothing free" against "half free".
+* Five levels need a legend, and this table has none; the marks are currently
+  inferable without one.
+* ASCII has no quarter circles, and the four characters close enough to imply a
+  ramp are already spoken for.
+
+So the alphabet stays four glyphs and the ratio rides in the **colour**, on the
+ramp step the free-core count beside it already uses — `st.tint(g.partial,
+heat[node])`, handed the same step as the number, so the two cannot disagree
+about one node. A column of marks can then be scanned by hue: bright green at
+114 of 128 cores, cool blue where nothing is free.
+
+The trade-off, stated: with `--no-color`, under `NO_COLOR`, or in a pipe, the
+gradation is gone and the mark is exactly what it was before. That is acceptable
+here and would not be for a *status* distinction — colour is the only channel
+this view has left, and the number and the meter beside it still carry the
+quantity in text.
+
+### 1l. One snapshot is right for a printout and wrong for a session
+
+Every command takes exactly one reading and every number in its output describes
+that instant -- a guarantee with a test behind it, and the reason a report never
+says "607 nodes, 549 up" above a table that adds to 606. For a printout that is
+the whole answer: you ran it, you read it, it was true.
+
+A browse is not a printout. It renders that one reading for as long as it is
+open, and a cluster changes every second: jobs start and end, nodes drain and
+come back. Sitting in the browser for ten minutes meant reading ten-minute-old
+figures with nothing on screen saying so -- and the frame is deliberately built
+once and never re-rendered in place, so there was no way for it to say so.
+
+Three things, in the order they matter:
+
+* **The frame carries its own age.** `read 12s ago  ·  r re-reads`, at the foot
+  of every level, silent under five seconds and silent on a replay (where the
+  header already dates the recording). Rebuilt on every repaint, so any keypress
+  updates it.
+* **`r` takes the reading again**, and `main` loops rather than the browse
+  patching itself: the whole snapshot is replaced and the view rebuilt from it,
+  which is the only way a refresh cannot leave two instants on one screen. The
+  browse remembers its stack and cursor, so the level and the row survive and
+  only the data changes.
+* **A timer, but only where a re-read is cheap.** Paced by what the last full
+  turnaround actually cost -- not by the load alone, because `status` re-runs a
+  dry-run per partition and one 607-node cluster took ~20s to rebuild against a
+  3.3s load. Under a second, refresh at twenty times the cost and no faster than
+  every five; over a second, no timer at all and `r` is the only way. Measured:
+  0.06s on two clusters (every 5s), 0.82s on a PBS site (every 16s), 3.3s and
+  70s on the two big ones (manual only). A view that stalls for twenty seconds
+  under the reader's hands would be a worse answer than a stale one.
+
 ### 1k. One window, whatever is in it
 
 The frame sized itself to its content, which is right for a printout and wrong for a
@@ -1289,6 +1419,737 @@ bare numbers still mean GiB so nothing that worked before changes meaning, and
 suffixes are binary multiples like `sbatch`'s, so there is no second convention
 to guess between. `Gi` is in there because this tool speaks Kubernetes too, and
 that is how Kubernetes writes it.
+
+## Speed, where it turned out to be
+
+A bare `nodetop` on a 607-node cluster took **10.26s** at its worst and ~3.0s
+typically. Profiled rather than guessed at, and the answer was almost entirely
+*waiting*: 3.53s of scheduler queries, 6.40s of dry-run probes, 0.09s of Python
+imports and 0.05s of arithmetic. So the wins are in how the waiting is
+organised, not in the code that runs between the waits.
+
+**The snapshot's queries are independent reads, so they overlap now.** Six
+commands -- nodes, partitions, config, associations, QOS, free times -- used to
+be issued one after another. Measured five interleaved rounds: **0.57s
+sequential against 0.23s together**, and on a congested controller the
+sequential form drifted to 3.97s while the concurrent form stayed at 0.23s.
+Lower variance is most of what "feels fast" means. Nothing races on the control
+plane's side, these commands only look -- and the readings land *closer*
+together in time, so the one-instant guarantee gets tighter rather than looser.
+Each backend's caches are locked for it, so a shared answer is still fetched
+exactly once: verified on PBS, where `load_queues` needs the nodes and a second
+fetch would be 14 MB.
+
+**The dry-runs overlap too, three at a time.** Ten probes against a live
+controller, five interleaved rounds, medians: 0.91s sequential, 0.73s at three
+concurrent, 0.73s at six. It saturates at three because the controller takes a
+lock for the submit path, so all concurrency can overlap is the process spawn
+and the RPC. Three is therefore the cap -- going wider buys nothing measurable
+and asks more of somebody else's controller.
+
+**Measuring a cell's width is now remembered.** A table sizes each column by
+its widest cell and then pads every cell to it, so one render measures each cell
+at least twice, and a listing repeats itself: `MIXED`, `64/64`, a meter, a dash.
+`nodes --all` over 607 nodes called `width` **19,600 times per render**. An
+8192-entry cache took the first render from 50.8 ms to 26.4 ms and a *repaint*
+to 13.1 ms -- and the repaint is the number that matters, because the
+interactive browse re-renders the whole frame on every keypress.
+
+End to end on that cluster, same interpreter, medians of seven:
+
+| | before | after |
+|---|---|---|
+| `nodetop` (status, with probes) | 3.02s | **2.00s** |
+| `nodetop nodes --all` | 0.72s | **0.37s** |
+| `nodetop queues` | 0.80s | **0.38s** |
+
+### The one remaining stall was a wait, so it moved off the keypress
+
+Opening a node's job list was the least smooth thing left, and the first time it
+had been measured: per-node shares are one whole-cluster `scontrol show job -d`
+-- 9 MB, ~92 ms of parsing, **1165 ms end to end** on a 2,116-job cluster -- and
+all of it was paid on the keypress, with no frame until it finished.
+
+It cannot be made cheaper (see below), so it is no longer paid at that moment.
+Stepping *into* a partition's node listing starts the fetch in the background:
+nobody opens a node listing to admire the borders, so by the time a row is
+chosen the answer is usually in hand.
+
+**And it is two queries, not one** -- which the first attempt at this missed,
+fixing half the stall. The frame reads `jobs` (`squeue`, 175 ms cold) before it
+reads the shares (1042 ms), so with only the shares warmed the keypress still
+cost 126 ms. Both are warmed now, in that order and in one worker: the cheaper
+one the frame needs first lands first, and at most one extra query is in flight
+against somebody else's controller. Measured:
+
+| the reader spends this long choosing a node | job list appears in | shares in |
+|---|---|---|
+| nothing (straight through) | 128 ms | 1042 ms |
+| 0.5s | **0.3 ms** | 643 ms |
+| 1.5s | **0.3 ms** | **0 ms** |
+
+Deliberately *not* started when the browse opens. Most readers look at the
+overview and leave, and firing a whole-cluster query at somebody else's
+controller for a view nobody asked for is a worse trade than the hitch it would
+hide. The lazy accessor is locked so the prefetch and the view cannot both
+fetch -- one whole-cluster query is the most expensive duplicate available --
+and a failure is still recorded rather than raised, because the view works
+without it.
+
+Two attempts to make the parse itself cheaper, one kept:
+
+* **Kept.** `expand` walked every character of a nodelist in Python to find the
+  commas outside brackets. With no bracket in the string -- which is every
+  `Partitions=` field and every single-node job -- there are none to find, so it
+  splits. 8.92 ms against 1.67 ms over a realistic mix, checked against the
+  general path on 417 inputs including 400 generated ones and the degenerate
+  `a],b`, `[`, `a[1-2` and empty-segment cases.
+* **Rejected.** Replacing the per-line scan of `scontrol show job -d` with one
+  `finditer` over the whole 9 MB: the interesting lines are 8,000 of 200,000, so
+  skipping the rest in C sounds obviously right. It is 25% **slower** -- 115.5 ms
+  against 92.4 ms -- because `splitlines` plus two `startswith` is already C, and
+  a line-anchored regex over 9 MB is not free. Identical output, worse time,
+  reverted.
+
+### Parsing was a third one function, and the function was backtracking
+
+The fourth pass profiled the one stage that had not been looked at: turning
+`scontrol`'s text into the model. On 607 live nodes that took **42.4 ms**, and a
+third of it was `_fields`.
+
+The reason is in the pattern. Each value ends with a lazy match and a lookahead
+-- `(?P<val>.*?)(?=\s+Ident=|$)` -- so for every character of every value the
+engine evaluates "does an identifier followed by `=` start here?". 607 nodes at
+~36 fields each came to 460,680 calls to `re.Match.group` and a great deal of
+backtracking under them.
+
+Splitting on spaces cannot backtrack: a token shaped `Ident=` starts a field,
+anything else belongs to the value being collected. Same first-wins rule, same
+`strip`, same output. Two things make that safe rather than merely fast:
+
+* **It is checked against the regex, not assumed equal to it.** Field by field
+  over every record of two live clusters -- 607 nodes and 87 partitions -- and
+  over adversarial records: a key-shaped token mid-value (the `Reason=replacing
+  NodeName=n2` case documented above), `=` inside a value, doubled spaces, an
+  empty value, leading and trailing space.
+* **It hands back where it cannot see.** The regex splits on any whitespace;
+  splitting on spaces does not see a tab. A one-pass search for exotic
+  whitespace sends such a record to the regex, because the failure otherwise
+  would be the worst available -- the whole record read as one field, so a node
+  with no state, reported as UNKNOWN and unschedulable.
+
+Then the key test itself became the hot line, and it asks the same question over
+and over: `scontrol`'s vocabulary is fixed and small. 607 nodes asked 217,383
+times about **37 distinct** strings. A bounded cache took it to 37 regex calls.
+Bounded rather than a plain dict -- which was faster still and unbounded -- since
+a `Reason` full of `ticket=12345`-shaped words would add an entry per node, and
+this process can outlive one parse by hours when somebody leaves the browse
+open.
+
+`parse_nodes`: **42.4 ms -> 32.9 ms** over those 607 nodes, 22%.
+
+What that is worth end to end is worth stating plainly, because it is not much
+where the numbers above were measured: a live run on that cluster is
+I/O-dominated and 9.5 ms sits inside its run-to-run noise. It shows up where the
+network does not: **4% on a replayed snapshot**, and it scales with the node
+count -- a 10,000-node cluster spends about 150 ms less per run in the parser.
+
+### Startup is a file-count problem, and on NFS it is the whole problem
+
+The second pass went after the fixed cost, and the first measurement moved the
+target. On the login node the numbers are unremarkable -- a 31 ms interpreter
+floor, 95 ms to `import nodetop`, 160 ms for `nodetop --version`. On a cluster
+whose home is NFS they are not:
+
+| | login node | NFS home |
+|---|---|---|
+| `python -c pass` | 31 ms | 64 ms |
+| `import nodetop` | 95 ms | **443 ms** |
+
+That is not CPU. It is ~24 module files, each an open and a read across the
+network -- roughly **19 ms per module**. Which makes the lever obvious and
+unusual: *import fewer files*, and the wins scale with the filesystem rather
+than with the code.
+
+**The six backends are now imported one at a time, stopping at the first that
+detects.** Asking for the names -- which `build_parser` does, before argparse
+has looked at a single argument -- used to import all six, and `subprocess`,
+`termios`, `getpass` and `grp` behind them.
+
+| | eager | lazy |
+|---|---|---|
+| `--version`, login node | 95.0 ms | 87.2 ms |
+| `--version`, NFS home | 456.3 ms | **376.5 ms** |
+| `nodetop backends` (must ask all six) | 95.8 ms | 94.9 ms |
+
+**And the keyboard layer is imported only when something is going to browse.**
+`--version`, `--help`, `--json`, `nodes`, `queues`, `health`, `accelerators`,
+`where` and `check` never touch it now; a non-`--json` `status` still does,
+because it has to ask whether this is a terminal.
+
+This pass, end to end on the NFS home, thirteen runs each, medians: `--version`
+428 -> 361 ms, `--help` 450 -> 364 ms, `queues` 458 -> 417 ms, `nodes --all` 458
+-> 431 ms.
+
+A note for whoever reads this next: an earlier attempt at the lazy registry was
+**reverted on a bad measurement** -- "3 ms, and one command slower". That
+comparison was against a `git archive` of an older commit, which differed in a
+dozen other files. Two trees, identical but for the one file, said 8 ms locally
+and 80 ms on NFS. If a performance change looks like noise, check that the two
+things being compared differ only in the thing being measured.
+
+### The docstrings are 61% of the bytecode, and that is a packaging problem
+
+The zipapp idea recorded here last time turned out to be the largest remaining
+win by a distance, so it was measured properly and built. Two facts came out of
+the measurement, and the second was a surprise:
+
+* One zip on `sys.path` is **one** open where the installed layout is two dozen.
+* This codebase's **docstrings are 61% of its compiled size** -- 1,303,123 bytes
+  of `.pyc` against 501,758 with `-OO` -- and every start reads them off the
+  network in order to discard them.
+
+That second number is the direct cost of the thing that makes this repository
+worth reading: every fix carries its measurement and its reasoning in the
+docstring beside it. The answer is emphatically *not* to write fewer of them. It
+is to leave them in the repository and out of the artifact.
+
+`tools/build_pyz.py` builds that artifact. Measured on a cluster whose home is
+NFS, thirteen runs each, medians:
+
+| | installed files | pyz (sources) | pyz `--fast` |
+|---|---|---|---|
+| `--version` | 406.5 ms | 351.2 ms | **222.5 ms** |
+| `queues` | 474.9 ms | 337.6 ms | **239.6 ms** |
+| `nodes --all` | 603.7 ms | 402.1 ms | **240.6 ms** |
+
+45 to 60 per cent, on the environment where starting the tool actually hurts.
+`--fast` ships this interpreter's stripped bytecode and is therefore locked to
+its Python version -- bytecode carries a magic number and `zipimport` refuses a
+mismatch -- so it is built where it will run. The default build ships sources,
+runs anywhere, and is still well ahead of two dozen files. The installed package
+and its console scripts are untouched by either.
+
+It is tested, because an artifact nobody exercises is the one that turns out to
+be broken during an outage, which is exactly when somebody reaches for the
+fast-starting copy. That was not a hypothetical: taking it to the other clusters
+found **two defects in it**, both of the kind that report success.
+
+* **The shebang did not name an interpreter that could run the archive.** A
+  `--fast` build made under 3.12 carried `#!/usr/bin/env python3`, and on a
+  cluster whose system `python3` is 3.9 *every* command failed with a `runpy`
+  traceback -- unloadable bytecode fails before `main` can say "nodetop needs
+  Python 3.10". The version-locked build now names the interpreter that built
+  it. The portable build keeps `python3`, because its sources do reach `main`
+  and the caller gets the floor in one line.
+* **The archive swallowed every exit status.** `zipapp`'s generated shim is
+  `import nodetop.cli; nodetop.cli.main()` -- the return value dropped -- so the
+  pyz exited 0 whatever happened. `queues -q nope` exits 2 from the installed
+  package and exited **0** from the archive, and `nodetop check && sbatch ...`
+  would have waved a caller through a refusal. The archive now carries
+  `raise SystemExit(main())`, which is what `nodetop/__main__.py` has always
+  done for `python -m nodetop`.
+
+Both were invisible to the builder's own check, because it ran the archive with
+an explicit interpreter and ignored the status -- so it now runs it through the
+shebang as well, and the tests compare the archive's exit codes against the
+installed package's. Verified on three clusters afterwards: two Slurm (one with
+a 3.9 system Python) and one PBS, every command matching the installed status,
+including `check` returning 1 where nothing is accepted and 2 where the system
+has no dry-run at all.
+
+Two more ideas were measured and rejected in the same pass, which is worth as
+much as the ones that worked:
+
+* **A lazy package `__init__`.** Deferring the public API re-exports behind PEP
+  562 sounds like it should shed files from a CLI start. It sheds none: `cli`
+  imports those modules directly anyway, so the module count for a real run is
+  15 either way, and on NFS it measured 29 ms *slower*.
+* **Replacing the ANSI stripper's character loop with a regex.** 6.5x faster in
+  isolation (3.84 us against 0.59 us per call) and identical output on every
+  case tried -- but once `width` is memoised the stripper no longer appears in a
+  repaint profile at all, and the regex and the loop disagree on *truncated*
+  escape sequences. A faster function that is never hot, bought with a
+  behavioural difference on malformed input, is not a bargain.
+
+**A dry-run is not spent on a queue that accepts nothing from anybody.**
+Disabled, never-starts, empty allowlist, every node down: `reachable` is already
+False whatever the control plane would answer, so the round trip could not
+change what is printed. Access blockers are deliberately *not* in that set -- a
+declared ACL disagreeing with the control plane is the thing this tool exists to
+catch -- nor are soft blockers, where the entitlement answer beside "your job is
+too big" is still worth having. The honest figure is small: **3 of 89 probes on
+`where --all`**, and none on the default views, where the entitlement filter has
+already dropped those partitions before ranking sees them.
+
+What is left is the control plane's own latency: a probe took 90 ms on an idle
+controller and 3.3s on a busy one, and 21 of them is most of what remains. That
+is not ours to optimise; it is why `r` and the age line exist instead.
+
+### The 1.6s wait, spent differently rather than saved
+
+Everything above shaved the fixed cost until the fixed cost stopped mattering:
+`status` on the 607-node cluster is 1.93s and **1.60s of it is dry-runs**. Where
+that goes, measured:
+
+| | |
+|---|---|
+| `sbatch --help` (the client, no RPC) | 14.8 ms |
+| `scontrol ping` (client + a round trip) | 15.8 ms |
+| `sbatch --test-only` | **98 ms** |
+
+So ~82 ms of each probe happens inside the controller, running the site's submit
+plugin, serialised against every real submission. Concurrency does not help (per
+probe latency rises linearly, wall time is flat past three workers) and the
+partitions cannot be batched into one request (the plugin refuses a list if any
+member is inadmissible). That time is not ours to make smaller.
+
+**So a session spends it differently.** It opens on what the last run was told,
+re-asks in the background, and reloads itself if the answer moved. Measured
+through a pty against the live cluster, three consecutive starts: **329, 340 and
+327 ms** to the first frame, against 1.9s -- and on the loaded controller that
+produced the 7s cold start above, the warm start was still 329 ms.
+
+What makes that honest rather than merely fast:
+
+* **A printout never does it.** `nodetop status | grep` gets one shot at being
+  right, so it probes and waits exactly as before; so does `--json`, and so does
+  a `--replay`, which cannot dry-run at all. Only a session -- which can correct
+  itself on screen and can say how old its answer is -- reads the file. This is
+  the same split §1l already draws between a printout and a session.
+* **The recheck always runs.** The screen is at most a second or two behind the
+  control plane, not as old as the cache. If the fresh answer matches, nothing
+  happens at all: no repaint, no flicker, and the reader never learns there was a
+  check. If it differs, the browse reloads itself -- the same thing `r` does,
+  landing the cursor on the same row.
+* **It says so.** Once the remembered answer is more than five seconds old the
+  frame carries `access checked 7m ago · re-checking`, on its own line under the
+  reading's age, and the line disappears the moment the recheck confirms.
+* **Only settled verdicts are written down.** "The control plane did not answer"
+  is not a finding; the next run asks again.
+* **One recheck at a time.** `r` held down would otherwise start a dry-run pass
+  per keypress, and three at once is nine concurrent probes against a controller
+  this tool is careful to ask three of.
+* **The file is a convenience, never a dependency.** No HOME, a read-only cache
+  directory, half a document, a schema from another version: every one of them
+  ends in "ask the cluster". `NODETOP_ACCESS_TTL=0` switches it off entirely;
+  the default bound is 15 minutes, which only limits how stale a *first frame*
+  can be, since the recheck lands seconds later.
+
+Three shape mistakes are worth recording, because each one worked well enough to
+look finished and was found only by measuring the thing again.
+
+**Keying on the question's candidates.** The first version keyed the remembered
+answer on the set of partitions it had asked about. That set is "the ones with
+room right now", so a partition filling up between two runs changed the key --
+**2.3s instead of 0.33s**, a miss every time the cluster moved. Verdicts are
+stored per partition now, merged across runs.
+
+**All-or-nothing coverage.** With per-partition verdicts the key was stable, but
+a partition that gained room since the last run had no verdict, and a missing
+verdict threw the whole answer away: five consecutive starts measured 328, 2151,
+328, ... The verdicts are independent questions, so the gap is probed on its own
+-- **one dry-run instead of nineteen** -- and the frame reports the age of the
+older half, because that is the part a reader might want to distrust. Five starts
+after the fix: 327, 337, 326, 326, 325 ms.
+
+**A refresh that never came back, and one that came 0.3s in.** Two bugs in the
+polling itself, both mine, both found by watching a live session rather than by a
+test -- which is why the tests that now cover them drive `select` with a real
+callback instead of checking that one was passed.
+
+The first was polarity. `select` reloads when its `on_idle` says True; the
+callback was written as *"still waiting?"*, which returns True while it wants to
+wait. So a browse re-read 0.3s after its first frame and then never again --
+`continue` forever, frozen on one reading. Two funnels in twelve seconds is what
+gave it away.
+
+The second was the clock it paced off. `_TURNAROUND` was measured by `main`
+around the whole dispatch, and for an interactive command that includes however
+long the reader sits looking at the screen. So the first idle refresh, five
+seconds in, concluded that a rebuild costs five seconds -- over the 1.0s
+threshold -- and switched refreshing off for good: **one re-read in a hundred
+idle seconds**, where the point was a paced series. The browse now stamps the
+cost at the moment it has something on screen, which is also better information
+than the previous command's timing, and a printout is still timed end to end
+because there the whole command *is* the rebuild.
+
+Instrumented afterwards, one line per pass, and this is the intended shape:
+
+    cost=0.23 idle=5.0 step= 5.0 backoff=0 recheck=True
+    cost=0.22 idle=5.0 step=10.0 backoff=1 recheck=False
+    cost=0.22 idle=5.0 step=20.0 backoff=2 recheck=False
+    cost=0.22 idle=5.0 step=40.0 backoff=3 recheck=False
+
+**And the refresh backs off while nobody is there.** Remembering the access
+answer made a re-read cheap on a cluster where it never used to be, so a browse
+that used to sit still started re-reading every few seconds forever, six queries
+at a time. Fine for one reader; fifty terminals left open is 45 queries a second
+against a controller that has jobs to schedule. The interval doubles each time
+the refresh finds nobody there, capped at five minutes, and any keypress puts it
+back -- so a terminal in use is as current as it ever was and one nobody is
+watching settles down. The dry-runs are paced separately, at twenty times their
+own cost.
+
+**And the remembered answer now lasts a day, not fifteen minutes.** Every session
+re-asks in the background within seconds of opening, so the TTL bounds nothing
+except how old a *first frame* may be -- the window in which anyone could act on
+a stale answer is those couple of seconds either way. What fifteen minutes did
+control was how often the 1.9s wait came back: coming back to the terminal after
+lunch paid it again, which is most of what this mechanism exists to avoid.
+
+**One document for every answer.** The remembered answers started life in a
+single JSON file, read-merged-rewritten on each save. A login node runs several
+of these at once -- a browse, a printout, a background recheck -- so the last
+rename wins and the others' entries vanish. Twelve concurrent writers on twelve
+different keys: **five of the twelve lost**, and losing a whole key costs a full
+dry-run pass rather than the one probe a lost verdict costs. One small file per
+question now: they cannot collide, they need no locking (which would be its own
+adventure on an NFS home), and they prune by when each was last written, so the
+answers a reader is actually using are the ones that survive.
+
+**Making the frame cheap turned the auto-refresh on.** The browse re-reads by
+itself when the last pass was cheap -- twenty times its cost -- and moving the
+dry-runs into the background took them out of that cost. So an idle terminal
+started re-reading every 7s and dragging nineteen dry-runs along each time,
+which is a worse citizen than the slow version it replaced. Counted with `ps`
+against a live session, which is the only reason it was noticed. A recheck now
+waits twenty times *its own* cost before the next one -- ~32s here, ~6s on a
+four-partition cluster -- so an idle session runs one dry-run pass per 40
+seconds instead of six. The first recheck of a new process is never paced: a
+fresh start always confirms what it opened on.
+
+### So the wait says what it is waiting for
+
+Put a number on "most of what remains", because it is worth knowing how lopsided
+this is: `nodetop status` on the 607-node cluster takes **1.93s, of which 1.60s
+is dry-runs** -- 83%. `--declared`, which skips them, is 0.33s. For that 1.60s
+the terminal showed nothing, which is indistinguishable from a hang, and the
+complaint that started this whole pass was "it takes a while to start".
+
+The obvious fix is not available. Painting the partition list first and
+correcting it when the verdicts land would show 19 partitions and then take
+eleven of them away -- the declared list is 19 where the dry-run accepts 8 --
+and over-reporting entitlement and then retracting it is the exact conflation
+this view exists to prevent. `--declared` already carries a banner for a reason.
+
+So the wait stays, and reports itself: one line, rewritten in place, counting
+settled partitions. `rank` takes an `on_progress(done, total)` and knows nothing
+about terminals; the CLI half writes to **stderr**, and only when stderr is a
+terminal, so a pipe, a `--json` reader and a redirected log are all untouched.
+It is called from the probe pool's workers, so the write is locked, and the line
+is wiped to its own measured width before anything else prints.
+
+Two details that were wrong first and are worth keeping written down: `pool.map`
+yields in *submission* order, so the slowest partition was reported as the last
+to *start* -- backwards for a progress count -- hence futures keyed by position
+and reassembled after; and a `sys.stderr` of `None`, which some launchers hand
+over, turned `isatty()` into an `AttributeError` in the middle of a command that
+was otherwise working.
+
+### A browse re-rendered every row of the partition on every keypress
+
+The rows of a listing are a function of the snapshot, and the snapshot does not
+change between reloads -- but the browse rebuilt them for every frame, which is
+to say for every arrow key. About twenty-five rows are on screen; the work was
+proportional to the *partition*.
+
+| partition size | per keypress, before | after |
+|---|---|---|
+| 190 nodes | 6.6 ms | — |
+| 607 nodes (this cluster's largest) | 17.6 ms | **0.75 ms** |
+| 10,624 nodes (a real PBS partition's shape) | 344.5 ms | **0.85 ms** |
+
+A third of a second of dead keyboard on the big one. The rows are now built once
+per partition and width, four cached at a time -- enough for the one being read
+and the ones stepped through to reach it -- and the first frame still pays the
+build (365 ms at 10,624 nodes, which is a wait *once* rather than per key).
+
+The correctness catch is worth naming, because a cache here is not free: the
+cursor is written *into* a row, in place, so handing the cached list out twice
+accumulates cursors -- two rows marked, and no way to tell which one `Enter`
+would open. The frame copies the list before marking it, and the test that
+matters asserts exactly one marked row per frame rather than asserting a timing.
+
+### Three imports that no command needed before reading its arguments
+
+With everything above done, `--version` is still ~80% imports. What was left
+was not the tool's own modules but the standard library modules it pulled in for
+paths it rarely takes: `pathlib` (8.5 ms) reached only by `snapshot` and
+`--replay`, `difflib` (1.1 ms) only by the did-you-mean hint on a misspelled
+queue, and `concurrent.futures` (4.6 ms, with `logging` behind it) only by
+`Cluster.load`. Four call sites, in a tool where every other command paid for
+all three.
+
+Two trees identical but for those imports, strictly alternating runs -- because
+the first attempt at this measured all of one tree and then all of the other,
+and NFS caching handed back a **+90 ms** result with the sign reversed:
+
+| | login node (warm bytecode) | NFS home |
+|---|---|---|
+| `--version` | 84.0 -> **77.2 ms** | 345.6 -> **327.8 ms** |
+| `--help` | 84.9 -> **79.2 ms** | — |
+| `import nodetop.cli` | — | 332.6 -> **292.8 ms** |
+
+An import inside a function is invisible as a *property*: nothing stops a later
+edit from hoisting it back, and nothing would fail. `tests/test_startup.py`
+therefore names the three modules and asserts they are absent from
+`sys.modules` after a real run -- checked against a bare interpreter's baseline,
+not against a no-argument run of ours, because a hoisted import would appear in
+that baseline and exempt itself.
+
+### Measuring and colouring the same handful of strings, ten thousand times
+
+Profiling a 10,624-row table -- the shape of a real PBS partition -- found the
+same pattern three times over: an answer rebuilt for every cell of every row,
+when the set of possible answers is tiny.
+
+* **`_strip_ansi`, 53,537 calls**, walking a Python loop per character to remove
+  escapes from strings that mostly have none. It now returns the string
+  unchanged when there is no `ESC` in it, which is a C-level scan.
+* **`width`, 42,907 calls and 385,333 `unicodedata` lookups each** for
+  wide-character and combining-mark tests. The memo above it cannot help at this
+  scale -- 10,624 nodes produce far more than 8,192 distinct strings, so a big
+  listing is mostly misses. ASCII cannot be wide and cannot combine, so an ASCII
+  string's width *is* its length, and `str.isascii()` is a flag on the string
+  object rather than a scan. Meters and marks are not ASCII and still take the
+  loop, which is exactly right.
+* **`_sgr`, 94,294 calls**, formatting one of a few dozen escape strings.
+  Memoised per `Style`, because the escape depends on that style's colour depth
+  -- one shared cache would paint a 16-colour terminal with truecolour.
+* **one `bar` per row**, when a meter is one of very few pictures: `size` cells
+  at eighth resolution in one of nine ramp steps. Memoised on the *rounded*
+  numbers the body actually uses -- both of them -- so a hit is the string the
+  miss would have built rather than one that merely looks like it.
+
+**And every cell was measured four times.** Sizing the columns, capping to
+`limits`, shrinking to the window and padding each asked `width` for every cell
+-- ~255,000 calls for 85,000 answers. The width is measured once now and carried
+in a parallel array, updated wherever a cell is rewritten. Phase timings on the
+10,624-row frame that motivated it: `_node_rows` 135 ms, pad+join 50 ms, measure
+41 ms, the two truncate passes 22 ms each.
+
+**And permission to paint was asked 74,526 times.** `paint` and `tint` rebuilt
+the same escape prefix from the same role or ramp step for every cell, and each
+first asked `Style.enabled` -- a property over a `depth` that cannot change
+after construction. The prefix is memoised per style (clamped before it becomes
+a key, so a wild ramp step shares the entry it shares the colour with) and
+`enabled` is an attribute.
+
+| first frame | before | after |
+|---|---|---|
+| 607 nodes | 19.0 ms | **12.7 ms** |
+| 10,624 nodes | 365 ms | **216 ms** |
+
+End to end against a recorded 607-node cluster, `nodes --all` is 5.5% faster and
+the commands whose cost is elsewhere are unchanged -- which is the honest shape
+of this: it is worth a third of the frame on the biggest listings and nothing at
+all on a `queues` that renders ten rows.
+
+The carried width is trusted, so a cell rewritten without its width rewritten
+misaligns the row -- and that is nearly invisible, because `truncate` usually
+lands exactly on the column and a stale width then costs nothing. It shows only
+where the cut lands *short*: a wide character cannot straddle the last column,
+so `ノードノードノード` cut to six columns yields five and the cell needs a space
+a stale width would deny it. The test therefore sweeps terminal widths 15..45
+rather than picking one -- at 22 columns the cut is exact and the bug is
+invisible; at 15, 16, 19, 20 and 23 it is a column adrift. Each of the three
+rewriting passes was broken on purpose to confirm a test notices.
+
+The whole change is only allowed if the output does not move, so that was
+checked rather than assumed: **22 command outputs byte-identical** -- Unicode and
+ASCII, PBS and Slurm data, colour on. The tests compare against a reference
+computed the long way rather than against a recorded string, and each shortcut
+was broken on purpose to confirm a test notices.
+
+### The same node, asked the same question, once per queue it is in
+
+A `Node` is a reading; a `Queue` holds a list of them; and a node belongs to
+several queues. So every aggregate -- the funnel, the heat ramp, `effective_free
+_cpus`, "with room" -- walks the same nodes again, and each walk recomputed the
+same arithmetic. Counted on a 607-node cluster with 84 partitions:
+**`memory_exhausted` called 4,830 times for 607 nodes**.
+
+Six answers on `Node` are memoised now (`schedulable`, `memory_free_mb`,
+`memory_exhausted`, `effective_free_cpus`, `effective_free_gpus`, `has_room`).
+Measured on the worst case -- every node in every queue -- and on the one path
+that visits each node exactly once:
+
+| | plain | 2 memoised | 6 memoised |
+|---|---|---|---|
+| aggregate capacity, 607 nodes x 84 queues | 53.9 ms | 25.7 ms | **13.1 ms** |
+| build a 10,624-row table (one visit each) | 363.5 ms | 371.1 ms | 368.5 ms |
+
+End to end on the live cluster, `status --declared`: our own compute went
+**56 ms -> 46 ms**. The single-visit path pays 1.4%, on a frame whose cost is
+string work either way, and it happens once per partition opened rather than
+once per command.
+
+This is only correct because a Node is written once, so two things enforce that.
+Grid Engine used to *patch* accelerator counts in place after parsing `qhost`
+-- exactly the shape that turns a memoised answer stale on one backend only --
+and now rebuilds with `dataclasses.replace`, which yields a fresh object with an
+empty cache. And a test walks the AST of every source file looking for an
+assignment to any Node field; it fails with the file and line if one appears.
+Queue-level aggregates are deliberately left uncached: `Queue.nodes` is wired up
+after construction and four backends patch `node_names` later still, so a cache
+there would be a cache of an unfinished object.
+
+### Two more things measured and left alone
+
+**Computing those six node answers eagerly instead of lazily.** `cached_property`
+costs one Python-level descriptor call per node per answer on first read, and a
+listing reads each exactly once -- so computing them in `__post_init__` and
+reading plain attributes is faster on *both* paths: **-7.7%** on the 10,624-row
+frame and -7.1% on the aggregate pass. Not taken. It means either six fields
+whose long explanations move to private methods, or six `init=False` dataclass
+fields, which changes what `dataclasses.fields` and `asdict` report about a
+Node. In this file the docstrings are the design record, and 16 ms of a 216 ms
+frame does not buy making them harder to find.
+
+**The QOS query's 220 ms is one TRES resolution, and it is already minimal.**
+`sacctmgr show qos format=Name,MaxWall` is 140 ms; adding *any* TRES column
+takes it to 220 ms, and adding a second is free -- slurmdbd resolves the TRES
+table once. So the ceilings cost 80 ms and there is no cheaper way to ask for
+them. Narrowing with `where name=...` is *slower* (260 ms), which is worth
+knowing before someone tries it: the filter costs more than the rows it saves.
+
+### Reading associations from the controller instead of the database: refused
+
+The load is 233 ms and it is exactly its slowest query -- the six run together,
+and the two accounting queries are the slow ones. `scontrol show assoc_mgr`
+serves the same data from the controller's memory instead of slurmdbd, and it is
+much faster:
+
+| | via slurmdbd | via the controller |
+|---|---|---|
+| associations | `sacctmgr show assoc` 203 ms | `scontrol show assoc_mgr flags=assoc` **66 ms** |
+| QOS ceilings | `sacctmgr show qos` 221 ms | `scontrol show assoc_mgr flags=qos` **23 ms** |
+
+Which would take the load from 233 ms to about 125 ms. It is still refused, for
+three reasons found while measuring it. The `users=youzhi` filter **is ignored**:
+the reply carried 1,296 association records of which 34 were this user's, just
+under a megabyte. That megabyte is serialised by the *controller*, under the
+assoc_mgr locks, on the path every real job submission uses -- so this trades
+230 ms of a database's time, which is what a database is for, for tens of
+milliseconds of the one process the whole cluster waits on. And the format is a
+third dialect to parse (`GrpTRES=cpu=N(14454),...`, usage counters, limits
+inline), version-fragile in exactly the way §7 is about. A tool that reads a
+cluster should not make the cluster slower to be quicker itself.
+
+### Ctrl-C during the wait printed a traceback
+
+Found by watching the progress line: interrupt a `status` while the dry-runs are
+running and the tool printed twenty lines ending in
+`threading.py ... waiter.acquire() KeyboardInterrupt`. The browse had always handled Ctrl-C --
+`select` catches it and quits -- but the 1.6s *before* the first frame had
+nothing to catch it, and that is the window a reader is most likely to use it in.
+It now exits **130** (128 + SIGINT, what a shell reports for Ctrl-C), after a
+newline that closes whatever partial line the ticker had written so the prompt
+does not land inside it. Measured against the real controller: 0.5-1.0s to exit,
+which is one in-flight `sbatch` finishing -- the probe pool joins its workers,
+and killing the children to shave that is more machinery than a quit is worth.
+
+### Three more measurements, two of them refusals
+
+**`json` came off the startup path and it was worth 1.9 ms, not the 40 ms
+predicted.** Eleven `--json` sites called `json.dumps` directly, so every run
+imported four modules to serialise nothing; they go through one helper now.
+Local, 21 alternating pairs: `--version` **-1.9 ms**, `--help` -1.8 ms. On the
+NFS home: nothing (-3.6 ms by minimum, +3.8 ms by median). Which corrects the
+rule of thumb recorded above -- **~19 ms per module file applies to *this*
+package's files on a cold cache, not to standard-library modules**, which every
+Python process on the machine reads and which are therefore already cached. The
+change earns its place on the other half of the deal anyway: `indent=2,
+default=str` in one place instead of eleven, where two sites passed
+`default=str` and nine did not.
+
+**Wider probe concurrency, re-measured, still refused.** The earlier note said
+the dry-runs saturate at three; that was ten probes on an idle controller, so it
+was worth re-testing at scale on a busy one. Twenty probes, two rounds in both
+orders:
+
+| workers | wall | per-probe median |
+|---|---|---|
+| 1 | 2.10s | 91 ms |
+| 3 | **1.54s** | 230 ms |
+| 6 | 1.58s | 473 ms |
+| 9 | 1.50s | 552 ms |
+
+Per-probe latency rises *linearly* with the worker count while wall time is flat
+from three onwards: the controller serialises the submit path, so extra workers
+queue inside it rather than beside it. Three stays. It also means `where`'s 9.5s
+over 86 partitions is the controller's throughput, not ours -- 26.8s of
+subprocess time compressed into 9.5s, and no arrangement of ours makes the
+serialised part smaller.
+
+**Asking about many partitions in one dry-run: refused by the scheduler, not by
+us.** If `sbatch --test-only --partition=a,b,c` named the partition it chose,
+the accepting set could be peeled off in one call each and a `status` pretest
+would cost as many probes as it has *acceptances* -- eight instead of nineteen
+here. It does not. Measured on this cluster: `--partition=bigmem` is accepted,
+`--partition=ssd` is refused, and `--partition=ssd,bigmem` is **refused as a
+unit** -- the site's job_submit plugin validates the whole list, so one
+inadmissible member sinks a request that would otherwise succeed. A per-list
+answer would also lose the per-partition reason that the `blocked by` column
+prints. Dead end, and cheap to establish.
+
+### One wave of queries, and a straggler nobody had noticed
+
+A sweep across every command looking for outliers found one: `nodetop health`,
+median 320 ms, **worst 2171 ms**, with three runs in twenty over 600 ms. Nothing
+else in the tool was doing that.
+
+A per-query timeline showed why, and it was a scheduling accident rather than a
+slow query. `Cluster.load` fires its queries together at t≈18 ms -- but
+`scontrol show config` was not one of them. `load_nodes` reached for it partway
+through its own parse, so it left at t≈90 ms, *after* the node query had already
+come back. On the slow runs that straggler took 2.0s while the four first-wave
+queries were entirely normal:
+
+        17 ->     59 ms  (   42)  scontrol show node --all --oneliner
+        18 ->     37 ms  (   19)  scontrol show partition --all
+        18 ->    239 ms  (  220)  sacctmgr show qos
+        19 ->    219 ms  (  200)  sacctmgr show assoc
+        90 ->   2046 ms  ( 1956)  scontrol show config      <-- alone, and late
+
+Asked on its own that query is 17 ms, twenty times out of twenty. So
+`Backend.warm` now exists -- an optional hook for anything a loader would
+otherwise fetch from inside its own work -- and the load submits it with the
+rest. Slurm implements it by warming the config cache the loaders already share,
+so it is one query either way, which the query-discipline tests enforce.
+
+**What the measurement does and does not show.** Immediately after the change,
+twelve consecutive runs were clean: 240-256 ms total, config 17-27 ms every
+time. But an interleaved A/B of both versions a while later found **no stalls in
+either** -- the controller had calmed down -- so those twelve clean runs are not
+proof the change caused them. One later stall, with the change in place, had
+*both* `scontrol` queries taking ~1s from the same start time, which is the
+controller pausing rather than anything about staging.
+
+So this is kept on the argument rather than the number: the same queries, at the
+same instant, in one wave instead of one wave and a straggler. The median is
+unchanged, and it is honest to say so -- the fast path always had the straggler
+finishing inside the load's own window.
+
+### The measurement trap: no `.pyc` cache means recompiling on every run
+
+Worth writing down because it silently inflated every absolute number taken on
+this machine. The development environment sets `PYTHONDONTWRITEBYTECODE=1`, so
+no `__pycache__` is ever written, so **every run recompiled the package from
+source**: 15 calls to `builtins.compile`, 50 ms of a 100 ms import, invisible in
+any wall-clock reading and obvious the moment the import is profiled.
+
+| `nodetop --version` | |
+|---|---|
+| bytecode cached (what an installed user gets) | **83 ms** |
+| recompiling every run | 130 ms |
+
+A/B comparisons taken in that regime are still sound -- both sides paid it --
+but an absolute claim is not. `pip install` compiles at install time, so the
+83 ms row is the honest one, and it is also why the `--fast` pyz (which ships
+bytecode) wins as much as it does.
+
 
 ## The terminal UI
 

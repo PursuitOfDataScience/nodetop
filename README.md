@@ -24,6 +24,67 @@ nodetop        # or: nt
 Zero runtime dependencies, Python 3.10+. You reach for this when a cluster is
 misbehaving, so it runs on a login node with nothing but the system Python.
 
+<details>
+<summary><b>Starting faster on an NFS home</b> (most clusters)</summary>
+
+Startup there is filesystem round trips, not CPU: two dozen module files at
+roughly 19 ms each. One zip on `sys.path` is one open, so build a single-file
+copy on the machine that will run it:
+
+```bash
+python tools/build_pyz.py --fast -o ~/bin/nt.pyz
+~/bin/nt.pyz status                # or: python ~/bin/nt.pyz status
+```
+
+Measured on a cluster whose home is NFS, thirteen runs each, medians:
+
+| | installed | `nt.pyz --fast` |
+|---|---|---|
+| `nodetop --version` | 406 ms | **222 ms** |
+| `nodetop queues` | 475 ms | **240 ms** |
+| `nodetop nodes --all` | 604 ms | **241 ms** |
+
+Keep it on your `PATH` if you like -- it is a single executable file:
+
+```bash
+cp ~/bin/nt.pyz ~/bin/nt        # then just: nt status
+```
+
+`--fast` ships this interpreter's bytecode with docstrings stripped, so it is
+locked to that Python version, and the archive's shebang names that interpreter
+-- build it where you run it. Drop the flag for an
+archive that runs on any supported Python and is still well ahead of the
+installed layout. The `pip`-installed `nodetop` and `nt` are untouched either
+way.
+
+</details>
+
+<details>
+<summary><b>Why the second <code>nt</code> opens instantly</b></summary>
+
+Most of a first start is dry-runs: `nodetop` asks the scheduler which partitions
+will actually accept a job from you, because a declared allowlist gets that wrong
+eleven times out of nineteen on the cluster this was built against. Each question
+costs ~98 ms inside the controller and they serialise, so nineteen of them is
+~1.6s of the ~1.9s start.
+
+An interactive session opens on the answer from your last run -- **~0.33s** --
+re-asks in the background, and reloads itself if anything changed. The frame says
+`access checked 7m ago` while that is in flight, and stops saying it once the
+check agrees.
+
+A **printout does not** do this: `nodetop status | grep`, `--json` and `--replay`
+all wait for the real answer, because they get one shot at being right.
+
+The answers live in `${XDG_CACHE_HOME:-~/.cache}/nodetop/access/` (one small
+file per cluster, mode 600, 15-minute bound). To switch it off:
+
+```bash
+export NODETOP_ACCESS_TTL=0     # always ask before drawing anything
+```
+
+</details>
+
 ## What you get
 
 <p align="center">
