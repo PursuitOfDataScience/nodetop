@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nodetop"
-version = "0.5.0"
+version = "0.5.1"
 description = "See what your cluster actually has free -- and why a queue that looks fine will not take your job. Slurm, PBS, LSF, Grid Engine, Kubernetes, or a bare pool of machines."
 readme = "README.md"
 license = "MIT"
@@ -70,9 +70,17 @@ target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4"]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4", "T20"]
 
 [tool.ruff.lint.per-file-ignores]
+# `T20` (flake8-print) is selected for one reason: to keep `print` OUT of the
+# library modules. Every one of this package's 111 prints is in `cli.py`, which is
+# where writing to a stream is the job -- so exempting that one file costs nothing
+# and the rule then fails the moment `core/`, `backends/` or `render.py` starts
+# printing instead of returning. Two sibling packages already carry exactly this
+# pairing; nodetop was the one selecting neither the rule nor the exemption, so a
+# stray print in a library module would have passed the gate.
+"src/nodetop/cli.py" = ["T201", "ARG001"]
 # Fixtures hold verbatim or format-faithful scheduler output; long lines are
 # the point.
 "tests/fixtures/*" = ["E501"]
@@ -83,7 +91,6 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4"]
 # uniform.
 "src/nodetop/runner.py" = ["ARG002"]
 "src/nodetop/backends/*" = ["ARG002"]
-"src/nodetop/cli.py" = ["ARG001"]
 # Test doubles must match the real signatures they stand in for, and
 # parametrised ids are sometimes documentation rather than an input.
 "tests/*" = ["ARG002"]
@@ -99,6 +106,12 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
+# Two render modules import shared fixtures as `tests.test_cli_render`, which
+# needs the repo root importable. `python -m pytest` supplies that via the
+# implicit cwd entry; a bare `pytest` does not, so the suite collected only
+# under one of the two spellings. Pin it here instead of relying on how pytest
+# was launched.
+pythonpath = ["."]
 addopts = "-q --tb=short"
 # TOML has no implicit string concatenation, so this stays on one line.
 markers = [

@@ -29,7 +29,7 @@ import re
 from collections.abc import Iterable
 from datetime import datetime
 
-from ..core.hardware import identify_accelerator
+from ..core.hardware import identify_accelerator, name_accelerator
 from ..core.model import Identity, Job, JobShape, Limits, Node, Queue, Verdict
 from ..runner import Runner, SubprocessRunner
 from .base import BackendCapabilities
@@ -148,6 +148,7 @@ class SshPoolBackend:
             gpus_total=len(gpus),
             gpus_alloc=busy,
             accelerator=identify_accelerator(None, model) if model else None,
+            accelerator_label=(name_accelerator(None, model) or "") if model else "",
             labels=tuple(f"gpu{i}={g[0]}" for i, g in enumerate(gpus)),
             queues=("pool",),
             unreachable=not output.strip(),

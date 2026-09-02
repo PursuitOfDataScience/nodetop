@@ -94,6 +94,65 @@ class TestTheFileIsAConvenienceNeverADependency:
         assert access.load("k")[0] == {
             "a": access.YES, "b": access.NO, "c": access.MAYBE}
 
+    def test_a_carried_forward_verdict_ages_on_its_own_clock(self, tmp_path,
+                                                             monkeypatch):
+        """A refusal nobody re-asks about still has to expire.
+
+        `save` merges, because a run only asks about the partitions with room
+        right now. One timestamp for the whole document meant the merge
+        restamped the answers this run never re-asked: a partition that stops
+        having room stops being a candidate, is never probed again, and its
+        remembered `no` is renewed by every unrelated write. Running the tool
+        once a day is enough -- the `no` below is twelve days old and came back
+        as "checked 1s ago", the refusal-outliving-the-fix that `ttl()` rejects
+        `inf` to prevent, arriving through the merge instead of the knob.
+        """
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        window = access.DEFAULT_TTL
+        start = 1_700_000_000.0
+        access.save("k", {"gpu": access.NO, "amd": access.YES}, now=start)
+        # Every later run finds room only in `amd`, so `gpu` is never re-asked.
+        when = start
+        for day in range(1, 15):
+            when = start + day * 0.9 * window
+            access.save("k", {"amd": access.YES}, now=when)
+        known, age = access.load("k", now=when + 1)
+        assert known == {"amd": access.YES}
+        assert age < 5
+
+    def test_a_verdict_the_run_did_re_ask_about_keeps_its_place(self, tmp_path,
+                                                               monkeypatch):
+        # The control for the test above. Ageing each verdict separately must
+        # not throw away one the run *did* re-ask about: that would make every
+        # gap-probe a full nineteen-partition pass again. Same twelve days,
+        # `gpu` asked about at every step.
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        window = access.DEFAULT_TTL
+        start = 1_700_000_000.0
+        when = start
+        for day in range(15):
+            when = start + day * 0.9 * window
+            access.save("k", {"gpu": access.NO, "amd": access.YES}, now=when)
+        assert access.load("k", now=when + 1)[0] == {
+            "gpu": access.NO, "amd": access.YES}
+
+    def test_a_file_from_before_the_per_verdict_clock_still_reads(
+            self, tmp_path, monkeypatch):
+        # The other control: the per-verdict times are additive, so there is no
+        # version bump, so a document an earlier release wrote has none of them
+        # and has to go on ageing as a whole -- fresh here, stale past the TTL.
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        start = 1_700_000_000.0
+        where = pathlib.Path(access.path("k"))
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text(json.dumps({
+            "version": access.VERSION,
+            "at": start,
+            "verdicts": {"gpu": access.NO},
+        }), encoding="utf-8")
+        assert access.load("k", now=start + 100)[0] == {"gpu": access.NO}
+        assert access.load("k", now=start + access.DEFAULT_TTL + 1) is None
+
     def test_a_fresh_verdict_wins_over_a_remembered_one(self, tmp_path,
                                                         monkeypatch):
         monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
@@ -421,3 +480,84 @@ class TestTheRecheckCorrectsTheScreen:
         r = cli._Recheck(angry, "k", {"a": "yes"})
         assert r.done.wait(5)
         assert r.moved() is False
+
+
+class TestAnUnusableTtlIsIgnoredAndSaidSo:
+    """Polish pass, 2026-08-28: one typo class, three different silent outcomes.
+
+        NODETOP_ACCESS_TTL=abc    -> the default (86400s)
+        NODETOP_ACCESS_TTL=-5     -> 0, i.e. caching DISABLED
+        NODETOP_ACCESS_TTL=1e999  -> inf, i.e. answers never expire
+        NODETOP_ACCESS_TTL=nan    -> 0, i.e. disabled (`max`'s NaN ordering)
+
+    Same kind of mistake, three different behaviours, nothing said. `inf` is the
+    one that could mislead: a remembered *refusal* would be reused for the life of
+    the cache file, long after the account was fixed.
+
+    Still not an error — this is a cache knob, and the sibling package errors only
+    for one that can hang a run (`SLURMPAST_TIMEOUT`). The rule is now single: an
+    unusable value means the variable is ignored, and the run says so.
+    """
+
+    BAD = ["abc", "-5", "1e999", "-inf", "nan", "", "   ", "1,5", "300s"]
+
+    @pytest.mark.parametrize("raw", BAD)
+    def test_it_falls_back_to_the_default(self, raw, monkeypatch, capsys):
+        from nodetop.core import access
+
+        access._TTL_COMPLAINED.clear()
+        monkeypatch.setenv("NODETOP_ACCESS_TTL", raw)
+        assert access.ttl() == access.DEFAULT_TTL, raw
+        err = capsys.readouterr().err
+        assert "ignoring NODETOP_ACCESS_TTL" in err, err
+        # It says what to set instead, not merely that this was wrong.
+        assert "number of seconds" in err and "0 to disable" in err
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("0", 0.0), ("300", 300.0), ("  600  ", 600.0), ("1.5", 1.5),
+    ])
+    def test_a_usable_value_is_honoured_silently(self, raw, expected, monkeypatch, capsys):
+        """The control, including `0`.
+
+        `0` is the documented way to disable the remembered answers, so it must
+        stay legal and stay quiet — folding it in with the negatives would remove
+        the only way to turn the cache off.
+        """
+        from nodetop.core import access
+
+        access._TTL_COMPLAINED.clear()
+        monkeypatch.setenv("NODETOP_ACCESS_TTL", raw)
+        assert access.ttl() == expected
+        assert capsys.readouterr().err == ""
+
+    def test_an_unset_variable_is_silent(self, monkeypatch, capsys):
+        from nodetop.core import access
+
+        access._TTL_COMPLAINED.clear()
+        monkeypatch.delenv("NODETOP_ACCESS_TTL", raising=False)
+        assert access.ttl() == access.DEFAULT_TTL
+        assert capsys.readouterr().err == ""
+
+    def test_the_note_is_said_once_not_per_call(self, monkeypatch, capsys):
+        """`ttl()` is consulted up to three times a run.
+
+        Three copies of the same advisory would be worse than one, and is the kind
+        of thing that gets a warning suppressed wholesale later.
+        """
+        from nodetop.core import access
+
+        access._TTL_COMPLAINED.clear()
+        monkeypatch.setenv("NODETOP_ACCESS_TTL", "abc")
+        for _ in range(4):
+            access.ttl()
+        assert capsys.readouterr().err.count("ignoring NODETOP_ACCESS_TTL") == 1
+
+    def test_inf_no_longer_means_forever(self, monkeypatch):
+        """The specific outcome worth naming: a refusal cached indefinitely."""
+        import math
+
+        from nodetop.core import access
+
+        access._TTL_COMPLAINED.clear()
+        monkeypatch.setenv("NODETOP_ACCESS_TTL", "1e999")
+        assert math.isfinite(access.ttl())

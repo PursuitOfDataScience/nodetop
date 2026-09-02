@@ -22,6 +22,7 @@ from .model import (
     Queue,
     Verdict,
     VerdictCategory,
+    category_label,
 )
 
 __all__ = [
@@ -41,6 +42,7 @@ __all__ = [
     "Verdict",
     "VerdictCategory",
     "assess_capacity",
+    "category_label",
     "evaluate",
     "format_duration",
     "format_wait",

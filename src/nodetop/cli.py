@@ -23,6 +23,7 @@ from . import backends as backend_registry
 from ._version import VERSION
 from .backends.base import Backend
 from .core import access
+from .core.capacity import EXCLUDED_REASON
 from .core.cluster import Cluster
 from .core.duration import (
     format_age,
@@ -40,7 +41,13 @@ from .core.fit import (
     unsettled,
 )
 from .core.hardware import supports
-from .core.model import Allocation, JobShape, Queue, split_reason
+from .core.model import (
+    Allocation,
+    JobShape,
+    Queue,
+    category_label,
+    split_reason,
+)
 from .exceptions import NoBackendError
 from .hostlist import expand
 from .render import (
@@ -209,18 +216,48 @@ def _reject_broken_snapshot(cluster: Cluster, command: str) -> int:
     A *partial* failure still returns 0: the report is usable, and the missing
     query is named on stderr so stdout stays pipeable.
     """
-    if not cluster.errors:
+    # No nodes, or no queues -- either one makes every view a confidently
+    # shaped nothing.
+    #
+    # The nodes half alone was not enough. Forcing `--backend pbs` on a Slurm
+    # cluster, `pbsnodes` is Slurm's own shim and answers with all 1,614 nodes,
+    # so `cluster.nodes` was full and this returned 0 while `qstat -Qf` had
+    # failed twice and the report read `0 queues - 0 open to you - 0 up`. The
+    # inverse of the contract: a backend whose client is genuinely absent exits
+    # 3, and a backend that is MISDETECTED and yields a zeroed survey exited 0.
+    fatal = not cluster.nodes or (not cluster.queues and "queues" in cluster.errors)
+    # Decided BEFORE the "did anything report an error" shortcut, which used to
+    # come first and return 0. A scheduler that exits 0 and answers with output
+    # this backend cannot parse records no error at all -- and that is exactly
+    # what version skew and the misdetected shim above produce. Measured against
+    # a client answering `onefield`, extra columns, non-numeric CPUs, negative
+    # counts and a header with no rows: `nodes=0 queues=0 errors=[]` every time,
+    # so the shortcut fired and `status` printed "no nodes -- wrong backend, or
+    # the control plane is down" and exited **0**. A script reading `$?` saw
+    # success from the one sentence that says the tool cannot see the cluster.
+    if not cluster.errors and not fatal:
         return 0
-    fatal = not cluster.nodes
     # `status` renders these in its own panel, so printing them again here
     # would say the same thing twice on a terminal where both streams land.
     if fatal or command != "status":
         for name, why in cluster.errors.items():
             print(f"query failed: {name}: {truncate(why, 120)}", file=sys.stderr)
     if fatal:
+        # Two causes, and they send the reader to different places: every query
+        # failing is a control plane or a PATH problem, while queries that
+        # ANSWERED and could not be read is a wrong backend or a version this
+        # parser does not know. Saying "every query failed" for the second would
+        # be false.
+        why = (
+            "every query failed"
+            if cluster.errors
+            else "the queries answered, but nothing could be read from them "
+            "-- most likely the wrong backend for this cluster, or a scheduler "
+            "version this parser does not know (try `nodetop backends`)"
+        )
         print(
-            "no data: every query failed, so there is nothing to report -- this "
-            "is not an empty cluster",
+            f"no data: {why}, so there is nothing to report -- this is not an "
+            f"empty cluster",
             file=sys.stderr,
         )
         return 3
@@ -369,7 +406,14 @@ _RESUME_CURSORS: dict[tuple[str, str], int] = {}
 
 
 def _print_json(payload: object) -> None:
-    """The one place `--json` is written, and the reason `json` is not imported.
+    """The one place `--json` is printed, and the reason `json` is not imported.
+
+    "Printed" rather than "written": `snapshot` serialises its capture separately,
+    with ``indent=1``, because that output goes to a FILE whose size is the point
+    (a capture of a 10,000-node cluster is megabytes) and not to a stream a human
+    is reading. So this helper owns every `--json` view; it does not own every
+    `json.dumps` in the package, and saying so let the claim read as stronger than
+    it is.
 
     Every command's machine-readable form used to call `json.dumps` directly,
     which meant the module was imported by `import nodetop.cli` -- so `status`,
@@ -662,6 +706,72 @@ _MEMORY_SCALE = {"": 1.0, "K": 1 / 1024 / 1024, "M": 1 / 1024, "G": 1.0,
                  "T": 1024.0, "P": 1024.0 * 1024}
 
 
+class _AName(argparse.Action):
+    """An option that names one thing, refusing "".
+
+    An empty value came from somewhere, and almost always from `-q "$PART"` or
+    `-A "$ACCT"` in a script where the variable is unset. Each was accepted and
+    silently reinterpreted as "not given" -- `-q \'\'` reported the whole cluster
+    where one partition was asked for, and `-A \'\'` widened the probe from one
+    account to all of them. The answer was to a question the caller did not ask,
+    and nothing on screen said so. `-A nosuchacct` already yields nothing,
+    correctly; it was only the empty spelling that fell through, which is the one
+    a shell produces by accident.
+
+    An **Action** rather than a `type=`, which was the first attempt and broke
+    every run: argparse applies `type` to a *string* default too, so `-q`'s
+    `default=""` was converted and rejected whenever the flag was absent. An
+    action runs only when the option is actually supplied, which is the whole
+    question here.
+    """
+
+    #: What the option names, for the message. Set per option via `metavar`-like
+    #: keyword so one class serves all of them.
+    def __init__(self, option_strings, dest, noun="value", **kw):
+        self._noun = noun
+        super().__init__(option_strings, dest, **kw)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if not str(values).strip():
+            parser.error(
+                f"argument {option_string}: an empty {self._noun} is not a "
+                f'{self._noun} -- drop the flag to mean "any", or check the '
+                f"variable you passed"
+            )
+        setattr(namespace, self.dest, values)
+
+
+def _at_least(minimum: int, noun: str):
+    """An argparse type for a count that has a floor, with the floor explained.
+
+    Every one of these options was a bare ``type=int``, so `where -c -4 --mem 2`
+    was accepted and answered: the summary read `1 node, -4 CPU/node` and the
+    verdict `[RUN NOW] caslake`. A request for negative four CPUs fits everywhere,
+    so the tool considered 19 partitions instead of the 8 a real request reaches
+    and called the widest one usable -- a confident answer to a question nobody
+    can have meant. `--mem` already refused `-2` with an example of a good value;
+    the integer options had no such guard.
+    """
+
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"{text!r} is not a whole number of {noun}"
+            ) from None
+        if value < minimum:
+            floor = (
+                f"at least {minimum}" if minimum else "0 or more"
+            )
+            raise argparse.ArgumentTypeError(
+                f"{value} {noun} is not a job that can run -- give {floor}"
+            )
+        return value
+
+    return parse
+
+
 def memory_gb(text: str) -> float:
     """Parse a memory size to GiB, accepting the scheduler's own spellings.
 
@@ -729,6 +839,24 @@ def _note(text: str, st: Style, indent: str = "  ") -> str:
     return st.dim(wrap_indent(text, indent=indent))
 
 
+#: Help text for flags that more than one subcommand takes.
+#:
+#: One flag with one meaning should read the same wherever it is offered, and
+#: these were spelled out at each `add_argument` -- so rewording `--declared` on
+#: `status` and not on `where` would have described the same flag two ways with
+#: nothing to notice. Only the genuinely identical ones live here: `-A` is
+#: deliberately worded per subcommand ("submit as this account" on `where`,
+#: "ask as this account" on `check`), because there it names a different action.
+_HELP_DECLARED = (
+    "skip the dry-run and trust the declared allowlists "
+    "(faster, but they over-report on many clusters)"
+)
+_HELP_QOS = (
+    "name this QOS in the dry-run (default: the one your "
+    "association gives you on each queue)"
+)
+
+
 def _add_global_args(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
     """Register the global flags so they work on either side of the verb.
 
@@ -772,6 +900,7 @@ def _add_queue_selector(
     """
     parser.add_argument(
         "-q", "--queue", "-p", "--partition", default="", dest="queue",
+        action=_AName, noun="queue",
         metavar=term.upper(),
         help=f"{what} (comma-separated; -p/--partition also accepted)",
     )
@@ -787,13 +916,14 @@ def _add_shape_args(p: argparse.ArgumentParser, *, dry_run_only: bool = False) -
     does not happen.
     """
     g = p.add_argument_group("job shape")
-    g.add_argument("-N", "--nodes", type=int, default=1, metavar="N",
+    g.add_argument("-N", "--nodes", type=_at_least(1, "nodes"), default=1, metavar="N",
                    help="nodes the job needs (default: 1)")
-    g.add_argument("-g", "--gpus", type=int, default=0, metavar="N",
+    # 0 is the default and means "no accelerator", so this one floors at zero.
+    g.add_argument("-g", "--gpus", type=_at_least(0, "accelerators"), default=0, metavar="N",
                    help="accelerators per node")
-    g.add_argument("-c", "--cpus", type=int, default=1, metavar="N",
+    g.add_argument("-c", "--cpus", type=_at_least(1, "CPUs"), default=1, metavar="N",
                    help="CPUs per task")
-    g.add_argument("--tasks-per-node", type=int, default=1, metavar="N",
+    g.add_argument("--tasks-per-node", type=_at_least(1, "tasks"), default=1, metavar="N",
                    help="tasks per node (default: 1)")
     g.add_argument("--mem", type=memory_gb, default=0.0, metavar="SIZE",
                    help="host memory per node: 64, 64G, 64GB or 65536M")
@@ -838,6 +968,11 @@ def _shape_from_args(a: argparse.Namespace) -> JobShape:
         exclude=tuple(expand(a.exclude)),
         tolerates=tuple(x.strip() for x in a.tolerates.split(",") if x.strip()),
         account=getattr(a, "account", None),
+        # Left blank unless asked for: `Cluster.with_qos` then fills it per
+        # queue from the association, which is the only place the right answer
+        # lives -- one QOS for the whole run is wrong on any cluster whose
+        # partitions grant different ones.
+        qos=getattr(a, "qos", None),
     )
 
 
@@ -876,9 +1011,9 @@ EXAMPLES = """examples:
   nodetop                            where you can run something, right now
   nodetop where -g 4 --gpu-mem 40    rank the queues that fit this job
   nodetop nodes --gpu --free         GPU nodes with something free now
-  nodetop zoom gn               look inside one queue, node by node
-  nodetop queues -q test             every gate on one queue, in detail
-  nodetop check -q gpu -A myaccount  ask the control plane directly
+  nodetop zoom <queue>               look inside one queue, node by node
+  nodetop queues -q <queue>          every gate on one queue, in detail
+  nodetop check -q <queue> -A acct   ask the control plane directly
   nodetop health                     down, drained and silently degraded nodes
 
   A queue that looks fine is not a queue that will take your job. `where` and
@@ -889,24 +1024,33 @@ EXAMPLES = """examples:
 def build_parser() -> argparse.ArgumentParser:
     p = _Parser(
         prog="nodetop",
-        description="See what your cluster actually has free -- and why a queue "
-                    "that looks fine will not take your job. Works on Slurm, "
-                    "PBS, LSF, Grid Engine, Kubernetes, or a bare pool of "
-                    "machines.",
+        # Hand-wrapped, with real newlines. `RawDescriptionHelpFormatter` reflows
+        # nothing, so the four adjacent literals below used to concatenate into a
+        # single 177-column line that overflowed every terminal -- including the
+        # 80-column one the rest of this help block is laid out for. The comment
+        # here already said the description was "short enough to wrap by hand";
+        # it just had not been.
+        description=(
+            "See what your cluster actually has free -- and why a queue that\n"
+            "looks fine will not take your job. Works on Slurm, PBS, LSF, Grid\n"
+            "Engine, Kubernetes, or a bare pool of machines."
+        ),
         epilog=EXAMPLES,
-        # Raw, so the examples keep their columns. The description above is the
-        # only prose in the block and it is short enough to wrap by hand.
+        # Raw, so the examples keep their columns.
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_global_args(p, suppress=False)
     p.add_argument("--version", action="version", version=f"nodetop {VERSION}")
-    sub = p.add_subparsers(dest="command")
+    # `metavar`, so the usage line reads `nodetop <command> ...` instead of
+    # argparse's brace list of every verb AND every alias -- 134 columns of
+    # `{status,queues,partitions,zoom,in,nodes,...}` that argparse never wraps.
+    # The commands are still listed, with their help, in the block below it.
+    sub = p.add_subparsers(dest="command", metavar="<command>")
 
     s = sub.add_parser("status", help="cluster overview: what is usable right now")
     _add_global_args(s, suppress=True)
     s.add_argument("--declared", action="store_true",
-                   help="skip the dry-run and trust the declared allowlists "
-                        "(faster, but they over-report on many clusters)")
+                   help=_HELP_DECLARED)
     s.add_argument("--all", action="store_true",
                    help="show every queue, including those with no free capacity")
     # Interactive is the DEFAULT on a terminal, so the flag is the opt-out.
@@ -971,10 +1115,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_shape_args(w)
     _add_queue_selector(w, what="consider only these")
     w.add_argument("-A", "--account", default=None, metavar="NAME",
+                   action=_AName, noun="account",
                    help="submit as this account instead of trying yours")
+    w.add_argument("--qos", default=None, metavar="NAME", action=_AName, noun="QOS",
+                   help=_HELP_QOS)
     w.add_argument("--declared", action="store_true",
-                   help="skip the dry-run and trust the declared allowlists "
-                        "(faster, but they over-report on many clusters)")
+                   help=_HELP_DECLARED)
     w.add_argument("--accounts", default="", metavar="NAMES",
                    help="comma-separated accounts to try when checking "
                         "(default: all of yours)")
@@ -986,7 +1132,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_shape_args(c, dry_run_only=True)
     _add_queue_selector(c, what="ask about only these")
     c.add_argument("-A", "--account", default=None, metavar="NAME",
+                   action=_AName, noun="account",
                    help="ask as this account instead of trying yours")
+    c.add_argument("--qos", default=None, metavar="NAME", action=_AName, noun="QOS",
+                   help=_HELP_QOS)
     c.add_argument("--accounts", default="", metavar="NAMES",
                    help="comma-separated accounts to try (default: all of yours)")
 
@@ -1032,6 +1181,11 @@ def cmd_backends(cluster: Cluster | None, args: argparse.Namespace, st: Style) -
             "backends": {
                 n: {
                     "detected": n in detected,
+                    # Not the same as "the client is missing", and the
+                    # difference is actionable: `qstat` here may be Slurm's PBS
+                    # compatibility wrapper, in which case the remedy is
+                    # `--backend slurm` rather than installing anything.
+                    "client_is_wrapper_for": _wrapped_by(n),
                     # Two separate facts: what the batch system can do, and
                     # whether it can be done from this host.
                     "dry_run_supported": bool(
@@ -1048,9 +1202,12 @@ def cmd_backends(cluster: Cluster | None, args: argparse.Namespace, st: Style) -
         return 0
 
     rows = []
+    wrappers: dict[str, str] = {}
     for name in backend_registry.names():
         caps = _caps(name)
         here = name in detected
+        if not here and (other := _wrapped_by(name)):
+            wrappers[name] = other
         backend = backend_registry.get(name)
         # Column 4 is the *system's* capability; column 1 already says whether
         # it is usable here.  Reading the capability off `probe` made a Slurm
@@ -1062,7 +1219,9 @@ def cmd_backends(cluster: Cluster | None, args: argparse.Namespace, st: Style) -
         else:
             mechanism = st.warn("none")
         rows.append([
-            st.ok(st.g.ok) if here else st.dim(st.g.off),
+            st.ok(st.g.ok) if here
+            else st.warn(st.g.warn) if name in wrappers
+            else st.dim(st.g.off),
             st.head(name) if here else st.dim(name),
             backend.queue_term,
             mechanism,
@@ -1079,8 +1238,17 @@ def cmd_backends(cluster: Cluster | None, args: argparse.Namespace, st: Style) -
     print(flow([
         f"{st.g.ok} usable here",
         f"{st.g.off} client not installed",
+    ] + ([f"{st.g.warn} client is another scheduler's wrapper"] if wrappers else []) + [
         f"{st.warn('none')} {st.dim('= no dry-run exists')}",
     ], st))
+    for name, other in wrappers.items():
+        # Named rather than merely excluded. `qstat`, `qsub` and `pbsnodes`
+        # answer here, so "client not installed" would be visibly false to
+        # anyone who typed `which qstat` -- and it points at the wrong remedy.
+        print(_note(
+            f"the {name} clients on PATH are {other}'s compatibility wrappers "
+            f"(contribs/torque and equivalents), not a {name} installation; "
+            f"use --backend {other}", st))
     print(_note(
         "Where no dry-run exists, entitlement can only be read from a queue's "
         "declared ACL, and nodetop labels it unconfirmed rather than verified.",
@@ -1092,6 +1260,21 @@ def _caps(name: str):
     try:
         return backend_registry.get(name).capabilities()
     except Exception:
+        return None
+
+
+def _wrapped_by(name: str) -> str | None:
+    """The scheduler whose compatibility shims are standing in for ``name``.
+
+    Only PBS has this problem today (Slurm's ``contribs/torque`` wrappers), so
+    only PBS answers the question -- but it is asked through a duck-typed hook
+    rather than a name check, because the next backend to grow one should not
+    need this function edited.
+    """
+    try:
+        hook = getattr(backend_registry.get(name), "wrapped_by", None)
+        return hook() if callable(hook) else None
+    except Exception:  # pragma: no cover - a probe must not break the listing
         return None
 
 
@@ -1278,11 +1461,16 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # cheap queue and tries it first everywhere after.
     refused = 0
     unsettled = 0
+    #: Whether the entitlement pretest below actually ran.  Distinct from
+    #: ``unsettled == 0``, which is also what a pretest that confirmed
+    #: everything looks like.
+    asked = False
     #: Seconds since the access answer on screen was obtained, or None when it
     #: was obtained just now. Shown in the frame; see :mod:`nodetop.core.access`.
     access_age: float | None = None
     recheck: _Recheck | None = None
     if not args.declared and not args.all and cluster.can_probe:
+        asked = True
         # Pretest. A declared allowlist cannot answer this on a cluster whose
         # associations are templated -- the accounting database claims the same
         # entitlements for every account -- so the only way to show *only* the
@@ -1544,6 +1732,15 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # than to a term of their own -- an exclusion count for a partition that is
     # on screen would break the one property this line has, which is that its
     # terms sum to the total.
+    #
+    # Nothing asked means nothing settled, and the count has to say so.
+    # Otherwise a replay reads MORE confident than the live run it is a
+    # recording of: live `30 open to you (25 unconfirmed) - 21 refused`, replay
+    # `51 open to you` -- the same 51 partitions, with the hedge dropped and
+    # every measured refusal silently promoted. 30 + 21 = 51, and the
+    # arithmetic was on screen.
+    if not asked and not args.all:
+        unsettled = len(with_room)
     shown_note = f" ({unsettled} unconfirmed)" if unsettled else ""
     head_term = (f"{len(with_room)} open to you" if not args.all
                  else f"{len(with_room)} with nodes")
@@ -2033,10 +2230,13 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         facts.append(st.muted(f"{len(jobs)} running"))
         facts.append(st.muted(f"{node.cpus_free}/{node.cpus_total} cores free"))
         if node.gpus_total:
-            # "gpu" rather than a bare "?" when the model is unidentifiable:
-            # the question mark reads as a defect in the reader's own knowledge
-            # rather than a gap in the scheduler's inventory.
-            model = node.accelerator.model if node.accelerator else "gpu"
+            # The scheduler's own name for the card where the vocabulary has
+            # no entry, and "gpu" rather than a bare "?" where there is no name
+            # either: the question mark reads as a defect in the reader's own
+            # knowledge rather than a gap in the scheduler's inventory.
+            model = node.accelerator_label or "gpu"
+            if node.accelerator is not None:
+                model = node.accelerator.model
             facts.append(st.muted(
                 f"{node.gpus_free}/{node.gpus_total} {model} free"))
         out = [f"  {st.dim(st.g.sep)}  ".join(facts)]
@@ -2222,7 +2422,7 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         if share is not None:
             bits = [f"{share.cpus} cores"]
             if share.memory_mb:
-                bits.append(f"{share.memory_mb // 1024} GB")
+                bits.append(f"{share.memory_mb // 1024} GiB")
             if share.gpus:
                 bits.append(f"{share.gpus} gpu")
             pairs.append((f"on {node.name}",
@@ -2841,6 +3041,7 @@ def cmd_zoom(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                 "memory_gb": [n.memory_free_mb // 1024, n.memory_mb // 1024],
                 "accelerators": [n.gpus_free, n.gpus_total],
                 "accelerator_model": n.accelerator.model if n.accelerator else None,
+                "accelerator_label": n.accelerator_label or None,
                 "reason": n.reason,
             } for n in nodes],
         })
@@ -2949,6 +3150,7 @@ def cmd_nodes(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             "memory_gb": [n.memory_free_mb // 1024, n.memory_mb // 1024],
             "accelerators": [n.gpus_free, n.gpus_total],
             "accelerator_model": n.accelerator.model if n.accelerator else None,
+            "accelerator_label": n.accelerator_label or None,
             "accelerator_vendor": n.accelerator.vendor if n.accelerator else None,
             "accelerator_arch": n.accelerator.arch if n.accelerator else None,
             "accelerator_memory_gb": n.accelerator.memory_gb if n.accelerator else None,
@@ -3012,7 +3214,8 @@ def cmd_health(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                           **_reason_fields(n.reason),
                           "accelerators": n.gpus_total,
                           "accelerator_model": (
-                              n.accelerator.model if n.accelerator else None)}
+                              n.accelerator.model if n.accelerator else None),
+                          "accelerator_label": n.accelerator_label or None}
                          for n in degraded],
             "unschedulable": [{"name": n.name, "state": n.state_raw,
                                "conditions": sorted(n.conditions), "reason": n.reason,
@@ -3043,7 +3246,7 @@ def cmd_health(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         print(_grid(
             ["", "NODE", "STATE", "GPUS", "REASON"],
             [[st.warn(st.g.warn), n.name, n.state_raw,
-              f"{n.gpus_total}x{n.accelerator.model if n.accelerator else '?'}"
+              f"{n.gpus_total}x{n.accelerator_name}"
               if n.is_gpu_node else st.dim(st.g.dash),
               st.dim(n.reason)] for n in degraded],
             style=st, indent="  ", limits=[0, 24, 16, 0, 46],
@@ -3057,29 +3260,52 @@ def cmd_health(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         # Grouped on the reason TEXT, not the raw string: Slurm stamps each
         # reason with [who@when], so keying on the whole thing turns one
         # maintenance window into a row per second the operator spent typing.
-        # The stamp is not discarded -- the oldest becomes the group's age,
-        # which is the part worth knowing (out since July reads very
-        # differently from out since this morning).
+        # The stamps are not discarded -- they become the group's age.
         groups: dict[str, list[str]] = {}
-        oldest: dict[str, datetime] = {}
+        stamps: dict[str, list[datetime]] = {}
         for n in down:
             text, _who, when = split_reason(n.reason)
             key = text or f"state {n.state_raw}"
             groups.setdefault(key, []).append(n.name)
             stamp = parse_timestamp(when)
-            if stamp is not None and (key not in oldest or stamp < oldest[key]):
-                oldest[key] = stamp
+            if stamp is not None:
+                stamps.setdefault(key, []).append(stamp)
         now = cluster.taken_at or datetime.now()
         items = []
         for reason, names in sorted(groups.items(), key=lambda kv: -len(kv[1])):
             label = f"{st.bad(str(len(names)).rjust(3))}  {reason}"
-            if reason in oldest:
-                # An elapsed time, so format_age: a reason stamped ahead of the
-                # clock has no age, and format_wait would have called it
-                # "overdue".
-                elapsed = format_age((now - oldest[reason]).total_seconds())
-                if elapsed:
-                    label += st.dim(f"  for {elapsed}")
+            # An elapsed time, so format_age: a reason stamped ahead of the
+            # clock has no age, and format_wait would have called it "overdue".
+            # Not `when`: that name is already a `str` from `split_reason`
+            # above, and rebinding it to a list of datetimes made this block
+            # type-check only by accident.
+            stamped = stamps.get(reason, [])
+            elapsed = [(now - s).total_seconds() for s in stamped]
+            oldest = format_age(max(elapsed)) if elapsed else None
+            newest = format_age(min(elapsed)) if elapsed else None
+            if oldest and newest and oldest != newest:
+                # The NEWEST leads, and the spread is stated.
+                #
+                # This label used to be the group's oldest stamp alone, and the
+                # group it lies about is the biggest one on the cluster: 854
+                # nodes "Not responding", oldest 809 days, newest FOUR MINUTES
+                # -- a live compute node that had just failed, filed inside a
+                # graveyard and reported as down for 809 days. The other groups
+                # here have zero spread because they were bulk-drained in single
+                # administrative actions, which is why one summary number looked
+                # right everywhere it was checked.
+                #
+                # "for 809d" reads as decommissioned hardware to ignore; "4m"
+                # reads as an incident. They are not the same finding, and this
+                # view exists to surface the second one.
+                label += (st.warn(f"  newest {newest} ago")
+                          + st.dim(f", oldest {oldest}"))
+            elif oldest:
+                label += st.dim(f"  for {oldest}")
+            if stamped and len(stamped) < len(names):
+                # A group where only some nodes carry a stamp: the range above
+                # describes those, not the group, and saying so costs a clause.
+                label += st.dim(f" ({len(stamped)}/{len(names)} stamped)")
             items.append((label, cluster.format_nodelist(names)))
         print(tree(items, st))
     else:
@@ -3200,6 +3426,9 @@ def _render_placements(
     show_access = probed or any(p.queue in dedicated for p in places)
 
     rows = []
+    # `Capacity.hardware_nodes` holds NAMES and `Cluster.nodes` is a list, so
+    # build one map for the whole table rather than scanning per row.
+    _node_by_name = {n.name: n for n in cluster.nodes}
     for p in places:
         glyph, label = _verdict_marks(p, st)
         # A dash: there is no start time because nothing can start, which is a
@@ -3222,14 +3451,32 @@ def _render_placements(
                 # warn, not bad, when the answer never arrived: red on a
                 # control-plane outage reads as "you are denied".
                 paint = st.bad if p.verdict.durable else st.warn
-                access = paint(p.verdict.category)
+                # The DISPLAY form. Painting the category straight through put
+                # `ACCOUNTS_UNTRIED` and `UNKNOWN` in the same column as
+                # `confirmed` and `unchecked` -- the wire vocabulary leaking
+                # into a prose cell, on the two categories a reader most needs
+                # to act on.
+                access = paint(category_label(p.verdict.category))
         elif p.queue in dedicated:
             # Somebody's own hardware. Not a refusal -- we genuinely do not know
             # -- but presenting it beside a shared partition with no distinction
             # is what made three unreachable rows read as RUN NOW.
             access = st.warn("group-only")
-        elif p.entitlement_unconfirmed:
-            # The backend has no dry-run at all: nothing could be confirmed.
+        elif p.probes[1] and not p.probes[0]:
+            # Asked for, and not asked: the global dry-run budget was spent on
+            # earlier queues. "unchecked" is true of this and says nothing the
+            # reader can use; the budget is the actionable part.
+            access = st.warn("budget spent")
+        elif not cluster.can_probe:
+            # No dry-run to be had here at all -- the backend has none, its
+            # client is missing, or this is a replay: nothing could have been
+            # confirmed.
+            #
+            # Keyed on the CLUSTER, not on the placement's own
+            # `entitlement_unconfirmed`, which is now true whenever the control
+            # plane did not settle the question. These two cells answer
+            # different halves of that: "there was no dry-run to run" and "a
+            # dry-run exists and this queue's answer is not in".
             #
             # Checked AFTER group ownership, not before. Both are true, the
             # column has one slot, and "group-only" is the far more specific
@@ -3240,9 +3487,9 @@ def _render_placements(
             # probe to fall back on.
             access = st.dim("declared")
         else:
-            # A dry-run exists and was not run. "unchecked" is the honest word:
-            # a bare dash reads as "no information available" when in fact the
-            # information is one flag away.
+            # A dry-run exists and this queue has no answer from it. "unchecked"
+            # is the honest word: a bare dash reads as "no information
+            # available" when in fact the information is one flag away.
             access = st.dim("unchecked")
         cap = p.capacity
         # With a denominator: "1" next to reasons accounting for 10 other nodes
@@ -3258,9 +3505,34 @@ def _render_placements(
             # Set aside, not incapable: worth showing next to the count it is
             # missing from, so the number is not read as the whole story.
             capable += st.warn(f"+{len(cap.unverified_nodes)}?")
-        accel = ", ".join(
-            f"{k}x{v}" for k, v in list(p.accelerator_models.items())[:2]
-        ) or st.dim(st.g.dash)
+        # The models on nodes that actually FIT come first, and a truncation says
+        # so. `right hw` beside this column is counted from `cap.hardware_nodes`,
+        # and a blind `[:2]` over dict order let the two contradict each other.
+        # Measured on this cluster: partition `gpu` holds
+        # {V100: 5, RTX6000: 5, A100: 1}, `right hw` read `1/11` off the single
+        # A100, and this column printed `V100x5, RTX6000x5` -- naming the two
+        # cards that cannot do the job, hiding the one that can, and giving no
+        # hint anything was hidden. A reader asking "which card is the capable
+        # node?" was shown precisely the wrong answer.
+        models = p.accelerator_models
+        if cap:
+            # A name the snapshot no longer holds contributes no model rather than
+            # raising -- both readings come from the same snapshot, but this is
+            # cheap insurance.
+            fits = {
+                node.accelerator_name
+                for node in (_node_by_name.get(n) for n in cap.hardware_nodes)
+                if node is not None
+            }
+            order = sorted(models, key=lambda k: (k not in fits, -models[k], k))
+        else:
+            # No capacity reading to prioritise by; still deterministic, and still
+            # honest about what it left out.
+            order = sorted(models, key=lambda k: (-models[k], k))
+        accel = ", ".join(f"{k}x{models[k]}" for k in order[:2])
+        if len(order) > 2:
+            accel += st.dim(f" +{len(order) - 2}")
+        accel = accel or st.dim(st.g.dash)
         row = [
             glyph, label, p.queue,
             f"{p.nodes_available}" + st.muted(f"/{shape.nodes}"),
@@ -3353,9 +3625,17 @@ def _render_placements(
             tag = st.bad("checked") if durable else st.warn("unanswered")
             items.append((f"{tag} {st.dim(p.verdict.category)}", p.verdict.reason))
         if hw_note and p.capacity:
-            label = ("no node here has the right hardware"
-                     if p.hardware_incompatible
-                     else "the capable nodes are all down or drained")
+            # Exclusion is not a hardware limit, and saying so was the whole
+            # reason the histogram above had to stop coming out empty: with
+            # `--exclude` covering every node, this line asserted "no node here
+            # has the right hardware" about nodes whose hardware was fine, and
+            # the WRONG HW legend adds "go elsewhere; waiting will not help".
+            if set(p.capacity.hardware_reasons) == {EXCLUDED_REASON}:
+                label = "every node here is excluded by request, not by hardware"
+            elif p.hardware_incompatible:
+                label = "no node here has the right hardware"
+            else:
+                label = "the capable nodes are all down or drained"
             detail = "; ".join(
                 f"{plural(n, 'node')}: {r}"
                 for r, n in list(p.capacity.hardware_reasons.items())[:4]
@@ -3364,7 +3644,12 @@ def _render_placements(
         for c in own:
             items.append((st.dim("note"), c))
         print()
-        print(f"  {st.head(p.queue)}")
+        # Truncated like every other cell. This is the one place a queue name
+        # was printed raw, and a 200-character name -- legal, and what one
+        # cluster's per-PI partitions look like -- ran the heading 102 columns
+        # past the window. Latent until a queue with a note but no blocker
+        # reached this block.
+        print(f"  {truncate(st.head(p.queue), term_width() - 2, st.g.ellipsis)}")
         print(tree(items, st, indent="    "))
 
     if shared:
@@ -3447,6 +3732,21 @@ def cmd_where(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             "reachable": p.reachable,
             "confirmed": p.confirmed,
             "entitlement_unconfirmed": p.entitlement_unconfirmed,
+            # Why it is unconfirmed, so a consumer need not infer it from the
+            # absence of a verdict. `declared` is "there was no dry-run to run
+            # here at all" -- a replay, a backend without one, a missing client
+            # -- and `not asked` is "one exists and this queue has no answer
+            # from it". Only `confirmed`/`refused` are statements about access.
+            "entitlement_source": (
+                "confirmed" if p.confirmed
+                else "refused" if (p.verdict is not None
+                                   and not p.verdict.allowed
+                                   and p.verdict.durable)
+                else "no durable answer" if p.verdict is not None
+                else "probe budget spent" if (p.probes[1] and not p.probes[0])
+                else "declared" if not cluster.can_probe
+                else "not asked"
+            ),
             "hardware_incompatible": p.hardware_incompatible,
             "nodes_free": p.nodes_available,
             "nodes_capable": len(p.capacity.hardware_nodes) if p.capacity else 0,
@@ -3766,11 +4066,15 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
                          for n in cluster.queues[name].nodes}
             nodes = [n for n in nodes if n.name in reachable]
 
-    # Group by model, keeping "unidentifiable" as its own honest bucket rather
-    # than folding it into any capability claim.
+    # Group by what the card is CALLED -- the identified model where there is
+    # one, otherwise the scheduler's own label, and `UNKNOWN` only where there
+    # is neither. An unidentified group is still folded into no capability
+    # claim; it just stops being anonymous. One cluster had 232 of 384 GPUs in
+    # a single `UNKNOWN` row -- the largest group on it -- while `sinfo` named
+    # every one of them.
     groups: dict[str, list] = {}
     for n in nodes:
-        groups.setdefault(n.accelerator.model if n.accelerator else "UNKNOWN", []).append(n)
+        groups.setdefault(n.accelerator_name, []).append(n)
 
     # Free means reachable-and-free. A schedulable node whose only partition is
     # DOWN has no free accelerators, however idle it looks -- the same
@@ -3799,13 +4103,31 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
                 if n.schedulable and n.name in live),
         )
     unknown = sum(n.gpus_total for n in nodes if n.accelerator is None)
+    # The denominator for every capability row below.
+    #
+    # It used to be `installed`, and on a cluster where 232 of 384 GPUs could
+    # not be identified that made `bf16 0/384` read as a survey of 384 cards
+    # when it was a survey of 152. The answers happened to be right there --
+    # Fermi through Turing have none of these -- which is luck, not method:
+    # one A100 behind an unrecognised token makes `bf16 0/384` false and
+    # leaves it looking exactly the same. A fraction whose denominator
+    # includes the population it knows nothing about is not a measurement.
+    identified = installed - unknown
 
     if args.json:
         _print_json({
             "accelerators_installed": installed,
+            "accelerators_identified": identified,
             "accelerators_unidentifiable": unknown,
             "models": {
                 model: {
+                    # A non-magic discriminator. `model == "UNKNOWN"` used to be
+                    # the only way to tell an identified group from an
+                    # unidentified one, and now that an unidentified group is
+                    # named after the scheduler's own label there is no magic
+                    # key left to test.
+                    "identified": g[0].accelerator is not None,
+                    "scheduler_label": g[0].accelerator_label or None,
                     "vendor": g[0].accelerator.vendor if g[0].accelerator else None,
                     "arch": g[0].accelerator.arch if g[0].accelerator else None,
                     "memory_gb": g[0].accelerator.memory_gb if g[0].accelerator else None,
@@ -3829,7 +4151,9 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
                 for model, g in groups.items()
             },
             "capability_reach": {
-                c: {"installed": i, "free": f} for c, (i, f) in reach.items()
+                c: {"installed": i, "free": f, "of_identified": identified,
+                    "unidentified": unknown}
+                for c, (i, f) in reach.items()
             },
         })
         return 0
@@ -3861,7 +4185,20 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
         def holders(pick) -> list[str]:
             counted = [(sum(1 for n in q.nodes if n.name in held), q.name)
                        for q in cluster.queues.values() if pick(q)]
-            return [name for n, name in sorted(counted, reverse=True) if n]
+            # `reverse=True` on a (count, name) tuple reverses the NAME too, so
+            # partitions tied on node count came out in reverse-alphabetical order.
+            # Everywhere else in this file the count is negated instead
+            # (`key=lambda kv: -len(kv[1])`, `-totals(kv[1])[0]`) precisely so the
+            # secondary ordering is left alone. It shows because the caller prints
+            # only the first three and counts the rest as `+N`: on a cluster where a
+            # model sits in several equally-sized partitions, WHICH three the reader
+            # is shown was decided backwards, and two runs of the same command could
+            # not be compared against each other by eye.
+            return [
+                name
+                for n, name in sorted(counted, key=lambda cn: (-cn[0], cn[1]))
+                if n
+            ]
 
         named = holders(lambda q: q.usable and not q.is_dedicated)
         if named:
@@ -3939,29 +4276,35 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
         return 0
 
     print()
-    print(section("features", st, f"share of all {installed}"))
+    print(section("features", st, (
+        f"share of all {installed}" if not unknown
+        else f"share of the {identified} identified, of {installed}")))
     # The header says "installed", so the rows do not repeat it. The bar gives
     # ground first in a narrow window: the counts are the measurement, the bar
     # only shows their shape.
     labels = {}
     for cap in _CAPABILITIES:
         total, free = reach[cap]
-        labels[cap] = f"{total}/{installed}" + (f" {st.g.sep} {free} free" if total else "")
+        labels[cap] = f"{total}/{identified}" + (f" {st.g.sep} {free} free" if total else "")
     window = term_width()
     widest = max(width(v) for v in labels.values())
     bar_w = max(6, min(18, window - 2 - 6 - 2 - widest))
     for cap in _CAPABILITIES:
         total, _ = reach[cap]
-        share = (total / installed) if installed else 0.0
+        share = (total / identified) if identified else 0.0
         print(
             f"  {st.dim(cap.replace('_attention', '').ljust(6))} "
             f"{bar(share, bar_w, st)} {st.dim(labels[cap])}"
         )
     if unknown:
         print()
+        # `plural` interpolates the count itself, so passing it a second time
+        # printed "232 232 accelerators".
         print(st.warn(wrap_indent(
-            f"{st.g.warn} {unknown} {plural(unknown, 'accelerator')} could not be "
-            f"identified and are counted in NO capability row", indent="  ")))
+            f"{st.g.warn} {plural(unknown, 'accelerator')} could not be "
+            f"identified, so {'it is' if unknown == 1 else 'they are'} counted "
+            f"in NO capability row above and NOT in the {identified} those "
+            f"rows divide", indent="  ")))
     return 0
 
 
@@ -3973,11 +4316,14 @@ def cmd_snapshot(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     works against it unchanged.
     """
     runner = cluster.capture
+    # One guard, not two: this condition was tested twice in a row with two
+    # different messages, so the second could never run and nobody had ever seen
+    # its wording. `main()` sets `cluster.capture` before dispatch, which is why
+    # both were marked no-cover -- an unreachable branch is easy to duplicate
+    # precisely because no test exercises it.
     if runner is None:  # pragma: no cover - set by main() before dispatch
-        print("nothing was captured", file=sys.stderr)
-        return 2
-    if runner is None:  # pragma: no cover - main() always supplies one
-        print("snapshot needs a capturing runner", file=sys.stderr)
+        print("snapshot needs a capturing runner; nothing was captured",
+              file=sys.stderr)
         return 2
     payload = {
         "nodetop": VERSION,
@@ -3997,9 +4343,74 @@ def cmd_snapshot(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         print(text)
         return 0
 
+    # Written through a temporary file in the SAME directory and renamed into
+    # place, which is what `core.access` already does for the cache next door.
+    # `write_text` truncates first, so a failure part-way through destroyed the
+    # snapshot that was already there while producing nothing usable. Measured
+    # under `ulimit -f 100`: a good 629,968-byte capture became 102,400 bytes of
+    # unparseable JSON, and `--replay` had nothing to read.
+    #
+    # That matters more here than for most writers: a snapshot exists to be
+    # carried to another machine and replayed, so it is often the only copy of a
+    # cluster state that no longer exists.
+    #
+    # Same directory, because `os.replace` is only atomic within one filesystem.
+    # Local imports, as everywhere else in this file: `pathlib` in particular is
+    # deferred on purpose and `test_startup` asserts it is not a module global.
+    import contextlib
+    import os
     import pathlib
+    import tempfile
 
-    pathlib.Path(args.output).write_text(text)
+    # Resolved through any symlink FIRST, because `os.replace` would otherwise
+    # replace the link itself with a regular file while `write_text` -- what this
+    # used to be -- wrote through it and left the link alone. `-o
+    # ~/snapshots/latest.json` pointing at a dated capture is an ordinary way to
+    # keep a "current" name, and silently converting that link into a file is a
+    # change nobody asked for; the atomicity fix was not licence to alter what the
+    # path means.
+    #
+    # `os.path.realpath`, not `Path.resolve()`: a dangling link still names the
+    # file the user meant, and creating it there is what the old code did too.
+    target = pathlib.Path(os.path.realpath(args.output))
+    try:
+        handle, temporary = tempfile.mkstemp(
+            dir=str(target.parent or "."), prefix=target.name + ".", suffix=".tmp"
+        )
+        try:
+            # `mkstemp` creates 0600, and `os.replace` keeps the temporary's mode,
+            # so without this the snapshot came out 0600 where `write_text` gave
+            # 0664 under this umask. That is the wrong default HERE, whatever it is
+            # for the cache next door: the access cache is private state and is
+            # deliberately chmod'ed 0600, while a snapshot exists to be handed to
+            # somebody else and replayed, and the docs show exactly that. It also
+            # exposes nothing new -- the capture is `squeue`/`sinfo` output that
+            # anyone on the cluster can already run.
+            #
+            # Read and restore, which is the only way to ask; safe here because
+            # the parallel fetch is finished by the time a snapshot is written.
+            mask = os.umask(0o077)
+            os.umask(mask)
+            os.chmod(temporary, 0o666 & ~mask)
+            with os.fdopen(handle, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.replace(temporary, target)
+        except BaseException:
+            # Including KeyboardInterrupt: a half-written temporary file left in
+            # the user's directory is litter, and the one they already had is
+            # still intact either way.
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+            raise
+    except OSError as exc:
+        # A message, not a traceback. `ulimit -f`, a full filesystem and a
+        # read-only directory all arrive here, and the reader needs the path.
+        print(
+            f"nodetop: cannot write {args.output}: {exc.strerror or exc}"
+            f" (the previous snapshot, if any, is unchanged)",
+            file=sys.stderr,
+        )
+        return 2
     queries = len(payload["commands"])
     size = len(text) / 1024
     # To stderr, so `nodetop snapshot -o file` stays pipe-safe.
@@ -4029,7 +4440,35 @@ def _load_replay(path: str) -> tuple[Backend, str, datetime | None]:
     from .runner import RecordedRunner
 
     data = json.loads(pathlib.Path(path).read_text())
+    # Shape-checked before anything is read out of it. A snapshot exists to be
+    # CARRIED -- scp'd, attached to a ticket, committed next to a bug report -- so
+    # the file reaching this function is the one most likely to be truncated,
+    # hand-edited, or simply some other tool's JSON. Measured: eight kinds of
+    # damaged input already produced a clean `cannot replay ...` at rc=2, but a
+    # top-level LIST escaped as `AttributeError: 'list' object has no attribute
+    # 'get'` with a traceback, because the caller catches
+    # `(OSError, ValueError, KeyError)` and `.get` on a list raises neither.
+    #
+    # Raised as `ValueError` rather than adding `AttributeError` to that tuple: the
+    # reader needs to know the file is not a snapshot, and "no attribute 'get'"
+    # does not say that.
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"not a nodetop snapshot -- the top level is "
+            f"{type(data).__name__}, not an object"
+        )
     commands = data.get("commands") or {}
+    if not isinstance(commands, dict):
+        raise ValueError(
+            f"not a nodetop snapshot -- `commands` is "
+            f"{type(commands).__name__}, not an object"
+        )
+    bad = [key for key, entry in commands.items() if not isinstance(entry, dict)]
+    if bad:
+        raise ValueError(
+            f"not a nodetop snapshot -- {len(bad)} recorded command(s) are not "
+            f"objects, e.g. {bad[0]!r}"
+        )
     responses = {
         key: (entry.get("rc", 0), entry.get("stdout", ""), entry.get("stderr", ""))
         for key, entry in commands.items()
@@ -4068,9 +4507,20 @@ _MIN_PYTHON = (3, 10)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    # Said once, plainly, before anything else runs. `pip` enforces the floor at
-    # install time, but the way this tool actually arrives on a login node is a
-    # `git clone` and a `PYTHONPATH=src python3 -m nodetop` -- and there
+    # Said once, plainly, before anything else in `main` runs -- but NOT before
+    # the package imports, which is the limit of what this guard can cover. On an
+    # interpreter older than 3.7 it is unreachable: `python -m nodetop` imports
+    # `nodetop/__init__.py`, whose line 23 pulls in `backends`, whose first line
+    # is `from __future__ import annotations` -- itself a SyntaxError before 3.7.
+    # So EL8's system python3 (3.6.8) answers "future feature annotations is not
+    # defined" rather than the sentence below. Verified on a RHEL 8 login node.
+    # Reaching it there would mean making `__init__` lazy or raising from it, and
+    # 3.6 is four versions under the declared floor; the range this guard does
+    # cover, 3.7 through 3.9, is the one that imports cleanly and then misbehaves.
+    #
+    # `pip` enforces the floor at install time, but the way this tool actually
+    # arrives on a login node is a `git clone` and a
+    # `PYTHONPATH=src python3 -m nodetop` -- and there
     # `python3` is whatever the distribution ships, which on RHEL 9 is 3.9.
     # Nothing here fails to *import* on 3.9, so the tool ran, every query threw
     # `TypeError: zip() takes no keyword arguments`, and the report that came
@@ -4170,15 +4620,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             # better. But say so once, up front: otherwise a missing client
             # surfaces as five cryptic query failures further down.
             if not type(backend).detect():
-                print(
-                    f"warning: forced backend {args.backend!r} does not detect its "
-                    f"system here; queries will probably fail",
-                    file=sys.stderr,
-                )
+                other = _wrapped_by(args.backend)
+                if other:
+                    print(
+                        f"warning: the {args.backend} clients on PATH are "
+                        f"{other}'s compatibility wrappers, not a "
+                        f"{args.backend} installation -- they will answer, "
+                        f"with {other}'s data behind them; use "
+                        f"--backend {other}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"warning: forced backend {args.backend!r} does not detect its "
+                        f"system here; queries will probably fail",
+                        file=sys.stderr,
+                    )
         else:
             backend = backend_registry.detect()
     except KeyError as exc:
-        print(str(exc), file=sys.stderr)
+        # KeyError.__str__ is repr(args[0]), so str() wrapped the whole
+        # sentence in quotes -- `"unknown backend 'nosuch'; known: ..."`.
+        # The registry raises KeyError because that is the right type for a
+        # failed lookup; unwrap it here so the user reads a sentence.
+        print(exc.args[0] if exc.args else str(exc), file=sys.stderr)
         return 2
     except NoBackendError as exc:
         print(str(exc), file=sys.stderr)

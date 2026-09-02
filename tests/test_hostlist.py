@@ -28,6 +28,32 @@ class TestExpand:
         # node-[7-8] and node-[0007-0008] are different node names.
         assert expand("node-[0007-0009]") == ["node-0007", "node-0008", "node-0009"]
 
+    def test_an_unpadded_range_does_not_gain_padding(self):
+        """`n[1-10]` is n1..n10, not n01..n10 -- checked against
+        `scontrol show hostnames`, which answers `n1 n2 ... n10`.
+
+        The width comes from the LOW endpoint as written, which is Slurm's rule.
+        Padding to the *wider* endpoint instead invented names no cluster has, so
+        a hand-written `--exclude n[1-10]` excluded nothing: `n01` is a different
+        name from `n1`. It hid because Slurm's own output is always padded to one
+        consistent width (`midway3-[0001-0005]`), where both rules agree.
+        """
+        assert expand("n[1-10]") == [f"n{i}" for i in range(1, 11)]
+        assert expand("n[9-11]") == ["n9", "n10", "n11"]
+        assert expand("n[0-10]") == [f"n{i}" for i in range(0, 11)]
+
+    def test_the_control_a_padded_range_still_pads(self):
+        """The control: a rule that simply stopped padding would pass the test
+        above and break every real Slurm nodelist."""
+        assert expand("n[01-10]") == [f"n{i:02d}" for i in range(1, 11)]
+        assert expand("n[001-010]") == [f"n{i:03d}" for i in range(1, 11)]
+
+    def test_a_padded_run_crossing_a_digit_boundary_stays_one_run(self):
+        """`n[0999-1001]` is the case that rules out the obvious alternative fix.
+        Both endpoints are four wide, so grouping on the low endpoint's width
+        keeps them together -- as `scontrol show hostlist` also does."""
+        assert expand("n[0999-1001]") == ["n0999", "n1000", "n1001"]
+
     def test_mixed_ranges_and_singletons(self):
         assert expand("n-[1-2,5,7-8]") == ["n-1", "n-2", "n-5", "n-7", "n-8"]
 

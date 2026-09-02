@@ -286,3 +286,63 @@ class TestMemorySizesAcceptTheSchedulersOwnSpelling:
             build_parser().parse_args(["where", "--mem", "banana"])
         assert exc.value.code == 2
         assert "64G" in capsys.readouterr().err
+
+
+class TestAFlagReadsTheSameEverywhereItIsOffered:
+    """One flag, one meaning, one sentence — across every subcommand that takes it.
+
+    `--declared` is on `status` and `where`; `--qos` is on `where` and `check`. The
+    help text was written out at each `add_argument`, so rewording one and not the
+    other would have described the same flag two ways with nothing to notice.
+
+    Deliberately NOT a rule that every shared flag must match: `-A` is worded per
+    subcommand on purpose — "submit as this account" on `where`, "ask as this
+    account" on `check` — because there it names a different action. So this
+    compares the *help strings actually produced by the parser*, and only flags
+    whose meaning is identical are expected to agree.
+    """
+
+    #: flag -> the subcommands that must describe it identically.
+    SHARED = {
+        "--declared": ("status", "where"),
+        "--qos": ("where", "check"),
+    }
+
+    @staticmethod
+    def _help_for(command: str, flag: str) -> str:
+        import argparse
+
+        from nodetop.cli import build_parser
+
+        parser = build_parser()
+        sub = next(
+            a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+        )
+        target = sub.choices[command]
+        for action in target._actions:
+            if flag in action.option_strings:
+                return " ".join((action.help or "").split())
+        raise AssertionError(f"{command} has no {flag}")
+
+    @pytest.mark.parametrize("flag", sorted(SHARED))
+    def test_every_subcommand_describes_it_the_same_way(self, flag):
+        commands = self.SHARED[flag]
+        texts = {c: self._help_for(c, flag) for c in commands}
+        assert len(set(texts.values())) == 1, (
+            f"{flag} is described differently per subcommand: {texts}"
+        )
+        assert texts[commands[0]], f"{flag} has empty help"
+
+    def test_the_deliberately_different_one_stays_different(self):
+        """The control, and the reason this is not a blanket rule.
+
+        If `-A` ever starts matching across the two, either somebody collapsed a
+        distinction on purpose — in which case this test is the place to say so —
+        or the shared-constant idea was applied where it does not belong.
+        """
+        where = self._help_for("where", "-A")
+        check = self._help_for("check", "-A")
+        assert where != check, (
+            f"-A now reads identically on `where` and `check` ({where!r}); it "
+            f"names submitting in one and asking in the other"
+        )

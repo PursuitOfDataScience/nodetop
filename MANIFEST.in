@@ -3,5 +3,9 @@
 # take on trust. Wheels are unaffected -- setuptools takes only the package.
 include LICENSE README.md DESIGN.md
 recursive-include tests *.py *.txt *.json
+# `tests/test_pyz.py` runs `tools/build_pyz.py`, so a release that ships
+# the test and not the builder fails 7 tests for a reason unrelated to the
+# code -- which reads exactly like a portability break and is not one.
+recursive-include tools *.py
 recursive-include src/nodetop py.typed
 global-exclude __pycache__ *.py[cod]

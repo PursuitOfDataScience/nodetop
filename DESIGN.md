@@ -2494,7 +2494,7 @@ Four honesty rules are enforced in code rather than left to the reader:
 
 ```bash
 pip install -e ".[dev]"
-pytest          # 3140 tests, no batch system required
+pytest          # 4301 tests, no batch system required
 ruff check src tests
 ```
 

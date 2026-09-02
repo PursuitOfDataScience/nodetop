@@ -27,33 +27,48 @@ class TestKeyDecoding:
     sequence as three separate keys makes every arrow press quit.
     """
 
-    @pytest.mark.parametrize("chars,expected", [
-        (["\x1b", "[", "A"], Key.UP),
-        (["\x1b", "[", "B"], Key.DOWN),
-        (["\x1b", "[", "H"], Key.TOP),
-        (["\x1b", "[", "F"], Key.BOTTOM),
-        (["\r"], Key.ENTER),
-        (["\n"], Key.ENTER),
-        ([" "], Key.ENTER),
-        (["k"], Key.UP),
-        (["j"], Key.DOWN),
-        (["g"], Key.TOP),
-        (["G"], Key.BOTTOM),
-        (["q"], Key.QUIT),
-        (["\x03"], Key.QUIT),      # ctrl-c
-        (["\x04"], Key.QUIT),      # ctrl-d
-        # A lone Escape is its own key: it steps out of a nested view like
-        # Left, and leaves the program at the root where Left cannot.
-        (["\x1b"], Key.ESCAPE),
-        (["z"], Key.OTHER),
-        ([], Key.QUIT),            # EOF: the terminal went away
-    ])
+    @pytest.mark.parametrize(
+        "chars,expected",
+        [
+            (["\x1b", "[", "A"], Key.UP),
+            (["\x1b", "[", "B"], Key.DOWN),
+            (["\x1b", "[", "H"], Key.TOP),
+            (["\x1b", "[", "F"], Key.BOTTOM),
+            # SS3, not CSI: the same keys once the terminal is in application
+            # cursor mode (DECCKM). Accepting only "[" read every one of these
+            # as a bare Escape, so arrows dismissed the view instead of moving.
+            # nodetop never sets that mode, but a full-screen program that dies
+            # before restoring it leaves it set.
+            (["\x1b", "O", "A"], Key.UP),
+            (["\x1b", "O", "B"], Key.DOWN),
+            (["\x1b", "O", "H"], Key.TOP),
+            (["\x1b", "O", "F"], Key.BOTTOM),
+            (["\r"], Key.ENTER),
+            (["\n"], Key.ENTER),
+            ([" "], Key.ENTER),
+            (["k"], Key.UP),
+            (["j"], Key.DOWN),
+            (["g"], Key.TOP),
+            (["G"], Key.BOTTOM),
+            (["q"], Key.QUIT),
+            (["\x03"], Key.QUIT),  # ctrl-c
+            (["\x04"], Key.QUIT),  # ctrl-d
+            # A lone Escape is its own key: it steps out of a nested view like
+            # Left, and leaves the program at the root where Left cannot.
+            (["\x1b"], Key.ESCAPE),
+            (["z"], Key.OTHER),
+            ([], Key.QUIT),  # EOF: the terminal went away
+        ],
+    )
     def test_it_decodes(self, chars, expected):
         assert read_key(_reader(chars)) == expected
 
     def test_an_unknown_csi_sequence_is_ignored_not_quit(self):
         # A mouse report or a function key must not exit the UI.
         assert read_key(_reader(["\x1b", "[", "Z"])) == Key.OTHER
+
+    def test_an_unknown_ss3_sequence_is_ignored_not_quit(self):
+        assert read_key(_reader(["\x1b", "O", "Z"])) == Key.OTHER
 
     def test_an_escape_followed_by_a_letter_steps_out(self):
         # Alt-x arrives as ESC then 'x'. There is no binding for it, and
@@ -68,8 +83,11 @@ class TestTheMoveLoop:
         seq = iter(keys)
         chosen = select(
             lambda i: [f"row{j}" + (" <" if j == i else "") for j in range(count)],
-            count, keys=lambda: next(seq, Key.QUIT),
-            write=frames.append, raw=False)
+            count,
+            keys=lambda: next(seq, Key.QUIT),
+            write=frames.append,
+            raw=False,
+        )
         return chosen, frames
 
     def test_enter_returns_the_highlighted_index(self):
@@ -112,21 +130,25 @@ class TestTheMoveLoop:
         """
         _, frames = self._run([Key.DOWN, Key.DOWN, Key.ENTER])
         repaints = [f for f in frames if "row0" in f]
-        assert len(repaints) == 3          # one write per frame, no gap
+        assert len(repaints) == 3  # one write per frame, no gap
         for f in repaints:
-            assert "\x1b[J" not in f       # no clear-to-end-of-screen
-            assert "\x1b[K" in f           # cleared per line instead
+            assert "\x1b[J" not in f  # no clear-to-end-of-screen
+            assert "\x1b[K" in f  # cleared per line instead
 
     def test_a_block_that_shrinks_wipes_its_own_tail(self):
         # Row 0 draws five lines and row 1 draws two: without the wipe, three
         # lines of the old block stay on screen below the new one.
         seq = iter([Key.DOWN, Key.ENTER])
         frames: list[str] = []
-        select(lambda i: ["x"] * (5 if i == 0 else 2), 2,
-               keys=lambda: next(seq, Key.QUIT), write=frames.append,
-               raw=False)
+        select(
+            lambda i: ["x"] * (5 if i == 0 else 2),
+            2,
+            keys=lambda: next(seq, Key.QUIT),
+            write=frames.append,
+            raw=False,
+        )
         shrunk = frames[1]
-        assert shrunk.count("\x1b[K") == 5     # 2 content lines + 3 stale
+        assert shrunk.count("\x1b[K") == 5  # 2 content lines + 3 stale
         # And the cursor put back where the next repaint expects it.
         assert "\x1b[3F" in shrunk
 
@@ -138,14 +160,18 @@ class TestTheMoveLoop:
         seq = iter([Key.DOWN, Key.DOWN, Key.DOWN, Key.ENTER])
         queued = iter([True, True, False])
         frames: list[str] = []
-        chosen = select(lambda i: [f"row{i}"], 4,
-                        keys=lambda: next(seq, Key.QUIT),
-                        write=frames.append, raw=False,
-                        pending=lambda: next(queued, False))
-        assert chosen == 3                          # every key still counted
+        chosen = select(
+            lambda i: [f"row{i}"],
+            4,
+            keys=lambda: next(seq, Key.QUIT),
+            write=frames.append,
+            raw=False,
+            pending=lambda: next(queued, False),
+        )
+        assert chosen == 3  # every key still counted
         painted = [f for f in frames if "row" in f]
-        assert len(painted) == 2                    # initial, then one for the burst
-        assert "row3" in painted[-1]                # and it shows where we ended
+        assert len(painted) == 2  # initial, then one for the burst
+        assert "row3" in painted[-1]  # and it shows where we ended
 
     def test_an_endless_burst_still_gets_repainted(self):
         # A screen that never updates would be worse than one that updates too
@@ -155,20 +181,27 @@ class TestTheMoveLoop:
         keys = [Key.DOWN] * (_MAX_SKIPPED_FRAMES + 2) + [Key.ENTER]
         seq = iter(keys)
         frames: list[str] = []
-        select(lambda i: [f"row{i}"], 40, keys=lambda: next(seq, Key.QUIT),
-               write=frames.append, raw=False, pending=lambda: True)
+        select(
+            lambda i: [f"row{i}"],
+            40,
+            keys=lambda: next(seq, Key.QUIT),
+            write=frames.append,
+            raw=False,
+            pending=lambda: True,
+        )
         assert len([f for f in frames if "row" in f]) >= 2
 
     def test_an_empty_list_steps_out(self):
-        assert select(lambda _i: [], 0, keys=lambda: Key.ENTER,
-                      write=lambda _s: None, raw=False) == Key.BACK
+        assert (
+            select(lambda _i: [], 0, keys=lambda: Key.ENTER, write=lambda _s: None, raw=False)
+            == Key.BACK
+        )
 
     def test_a_keyboard_interrupt_is_a_quit_not_a_traceback(self):
         def boom():
             raise KeyboardInterrupt
 
-        assert select(lambda _i: ["x"], 2, keys=boom,
-                      write=lambda _s: None, raw=False) == Key.QUIT
+        assert select(lambda _i: ["x"], 2, keys=boom, write=lambda _s: None, raw=False) == Key.QUIT
 
 
 class TestItDegradesToThePrintout:
@@ -233,12 +266,12 @@ class TestItDegradesToThePrintout:
 
         monkeypatch.setattr("sys.stdin", Tty())
         monkeypatch.setattr(
-            shutil, "get_terminal_size",
-            lambda *_a, **_k: os.terminal_size((100, MIN_LINES - 1)))
+            shutil, "get_terminal_size", lambda *_a, **_k: os.terminal_size((100, MIN_LINES - 1))
+        )
         assert not supported(Tty())
         monkeypatch.setattr(
-            shutil, "get_terminal_size",
-            lambda *_a, **_k: os.terminal_size((100, MIN_LINES)))
+            shutil, "get_terminal_size", lambda *_a, **_k: os.terminal_size((100, MIN_LINES))
+        )
         assert supported(Tty())
 
 
@@ -273,15 +306,19 @@ class TestRawModeSpansTheWholeInteraction:
 
         monkeypatch.setattr("sys.stdin", NotATty())
         with raw_session():
-            pass          # must not raise, and must not touch termios
+            pass  # must not raise, and must not touch termios
 
     def test_select_can_skip_its_own_raw_mode(self):
         # `raw=False` is what lets the caller own the session instead.
         from nodetop.interactive import Key, select
 
         seq = iter([Key.DOWN, Key.ENTER])
-        assert select(lambda _i: ["a", "b"], 2, keys=lambda: next(seq),
-                      write=lambda _s: None, raw=False) == 1
+        assert (
+            select(
+                lambda _i: ["a", "b"], 2, keys=lambda: next(seq), write=lambda _s: None, raw=False
+            )
+            == 1
+        )
 
 
 class TestTheTerminalSurvivesASignal:
@@ -381,9 +418,65 @@ class TestTheTerminalSurvivesASignal:
         session.__exit__()
         assert len(calls) == 1
 
+    @staticmethod
+    def _suspendable(monkeypatch):
+        """A session mid-`with`, with Ctrl-Z's actual stop stubbed out.
+
+        `_suspend` ends in `os.kill(getpid(), SIGTSTP)` with the default
+        disposition installed, which really would stop the test run, so the
+        kill is the one thing replaced. Everything either side of it -- the
+        restore on the way out and the retake on the way back -- runs for real.
+        """
+        import os
+
+        from nodetop.interactive import raw_session
+
+        retaken = []
+        monkeypatch.setattr("termios.tcgetattr", lambda _fd: ["saved"])
+        monkeypatch.setattr("termios.tcsetattr", lambda *_a: None)
+        monkeypatch.setattr("tty.setcbreak", lambda _fd: retaken.append("cbreak"))
+        monkeypatch.setattr(os, "kill", lambda *_a: None)
+        TestTheTerminalSurvivesASignal._tty(monkeypatch)
+        return raw_session(), retaken
+
+    def test_the_fatal_signals_survive_a_ctrl_z_round_trip(self, monkeypatch):
+        # Ctrl-Z hands the terminal back by calling `__exit__`, which puts the
+        # ORIGINAL SIGTERM/SIGHUP dispositions back -- so resuming has to
+        # reinstall the handlers, not merely remember what they replaced.
+        # Without that, a browse that was suspended and resumed is exactly the
+        # process `_FATAL_SIGNALS` exists for: SIGHUP from a dropped ssh
+        # connection ends it with echo off and the cursor hidden.
+        import signal
+
+        session, _retaken = self._suspendable(monkeypatch)
+        with session:
+            session._suspend(signal.SIGTSTP, None)
+            for name in ("SIGTERM", "SIGHUP"):
+                sig = getattr(signal, name)
+                assert signal.getsignal(sig) == session._die, name
+
+    def test_a_ctrl_z_round_trip_retakes_the_terminal(self, monkeypatch):
+        # CONTROL: the other half of "resuming takes it back" -- cbreak and the
+        # hidden cursor -- and that leaving still hands the original handlers
+        # back. True both before and after the fix above; it is here so that
+        # test is not just a restatement of the change.
+        import signal
+
+        original = {
+            name: signal.getsignal(getattr(signal, name))
+            for name in ("SIGTERM", "SIGHUP", "SIGTSTP")
+        }
+        session, retaken = self._suspendable(monkeypatch)
+        with session:
+            session._suspend(signal.SIGTSTP, None)
+            assert retaken == ["cbreak", "cbreak"]
+            assert session._saved == ["saved"]
+        for name, handler in original.items():
+            assert signal.getsignal(getattr(signal, name)) is handler, name
+
 
 class TestNavigationHasThreeOutcomes:
-    """"Out of here" and "out of the program" are different keys.
+    """ "Out of here" and "out of the program" are different keys.
 
     With one level, `select` returning None for both was fine. With three, a key
     that leaves the program from the bottom of the stack is a key you press once
@@ -391,35 +484,42 @@ class TestNavigationHasThreeOutcomes:
     `q` and Ctrl-C unwind everything.
     """
 
-    @pytest.mark.parametrize("chars,expected", [
-        (["\x1b"], Key.ESCAPE),            # a lone Escape
-        (["\x7f"], Key.BACK),              # Backspace
-        (["h"], Key.BACK),
-        (["\x1b", "[", "D"], Key.BACK),    # Left
-        # Right is its own key now: inside a row it moves right, and only at
-        # the row's edge does it open. `select` turns it into a selection there.
-        (["\x1b", "[", "C"], Key.RIGHT),
-        (["q"], Key.QUIT),
-        (["\x03"], Key.QUIT),
-    ])
+    @pytest.mark.parametrize(
+        "chars,expected",
+        [
+            (["\x1b"], Key.ESCAPE),  # a lone Escape
+            (["\x7f"], Key.BACK),  # Backspace
+            (["h"], Key.BACK),
+            (["\x1b", "[", "D"], Key.BACK),  # Left
+            # Right is its own key now: inside a row it moves right, and only at
+            # the row's edge does it open. `select` turns it into a selection there.
+            (["\x1b", "[", "C"], Key.RIGHT),
+            (["q"], Key.QUIT),
+            (["\x03"], Key.QUIT),
+        ],
+    )
     def test_the_keys_are_distinguished(self, chars, expected):
         it = iter(chars)
         assert read_key(lambda _t=None: next(it, "")) == expected
 
     def test_select_reports_back_and_quit_separately(self):
         for key, expected in ((Key.BACK, Key.BACK), (Key.QUIT, Key.QUIT)):
-            got = select(lambda _i: ["a", "b"], 2, keys=lambda k=key: k,
-                         write=lambda _s: None, raw=False)
+            got = select(
+                lambda _i: ["a", "b"], 2, keys=lambda k=key: k, write=lambda _s: None, raw=False
+            )
             assert got == expected
 
     def test_an_empty_level_steps_out_rather_than_quitting(self):
         # A node with no jobs must not close the whole browser.
-        assert select(lambda _i: [], 0, keys=lambda: Key.ENTER,
-                      write=lambda _s: None, raw=False) == Key.BACK
+        assert (
+            select(lambda _i: [], 0, keys=lambda: Key.ENTER, write=lambda _s: None, raw=False)
+            == Key.BACK
+        )
 
     def test_escape_steps_out_of_a_nested_view(self):
-        got = select(lambda _i: ["a", "b"], 2, keys=lambda: Key.ESCAPE,
-                     write=lambda _s: None, raw=False)
+        got = select(
+            lambda _i: ["a", "b"], 2, keys=lambda: Key.ESCAPE, write=lambda _s: None, raw=False
+        )
         assert got == Key.BACK
 
     def test_escape_leaves_the_program_at_the_root(self):
@@ -430,8 +530,14 @@ class TestNavigationHasThreeOutcomes:
         the same treatment and should not have: it is the key a reader reaches
         for to get out, and doing nothing is indistinguishable from a hang.
         """
-        got = select(lambda _i: ["a", "b"], 2, keys=lambda: Key.ESCAPE,
-                     write=lambda _s: None, raw=False, escapable=False)
+        got = select(
+            lambda _i: ["a", "b"],
+            2,
+            keys=lambda: Key.ESCAPE,
+            write=lambda _s: None,
+            raw=False,
+            escapable=False,
+        )
         assert got == Key.QUIT
 
     def test_right_at_a_leaf_does_nothing(self):
@@ -446,58 +552,104 @@ class TestNavigationHasThreeOutcomes:
         """
         # Right three times, then Left. Only the Left may end it.
         seq = iter([Key.RIGHT, Key.RIGHT, Key.RIGHT, Key.BACK])
-        got = select(lambda _i: ["detail"], 1, keys=lambda: next(seq, Key.QUIT),
-                     write=lambda _s: None, raw=False, openable=False)
+        got = select(
+            lambda _i: ["detail"],
+            1,
+            keys=lambda: next(seq, Key.QUIT),
+            write=lambda _s: None,
+            raw=False,
+            openable=False,
+        )
         assert got == Key.BACK
 
     def test_enter_at_a_leaf_does_nothing_either(self):
         # Enter is "open the selected thing", and at a leaf there is no such
         # thing. It must not stand in for going back.
         seq = iter([Key.ENTER, Key.ENTER, Key.ESCAPE])
-        got = select(lambda _i: ["detail"], 1, keys=lambda: next(seq, Key.QUIT),
-                     write=lambda _s: None, raw=False, openable=False)
+        got = select(
+            lambda _i: ["detail"],
+            1,
+            keys=lambda: next(seq, Key.QUIT),
+            write=lambda _s: None,
+            raw=False,
+            openable=False,
+        )
         assert got == Key.BACK
 
     def test_quit_still_leaves_from_a_leaf(self):
-        assert select(lambda _i: ["detail"], 1, keys=lambda: Key.QUIT,
-                      write=lambda _s: None, raw=False, openable=False) == Key.QUIT
+        assert (
+            select(
+                lambda _i: ["detail"],
+                1,
+                keys=lambda: Key.QUIT,
+                write=lambda _s: None,
+                raw=False,
+                openable=False,
+            )
+            == Key.QUIT
+        )
 
     def test_a_normal_level_still_opens_on_right(self):
         # The flag is off by default: every level above the leaf keeps working.
-        got = select(lambda _i: ["a", "b"], 2, keys=lambda: Key.RIGHT,
-                     write=lambda _s: None, raw=False)
+        got = select(
+            lambda _i: ["a", "b"], 2, keys=lambda: Key.RIGHT, write=lambda _s: None, raw=False
+        )
         assert got == 0
 
     def test_left_at_the_root_still_does_nothing(self):
         seq = iter([Key.BACK, Key.BACK, Key.ENTER])
-        got = select(lambda _i: ["a", "b"], 2, keys=lambda: next(seq, Key.QUIT),
-                     write=lambda _s: None, raw=False, escapable=False)
+        got = select(
+            lambda _i: ["a", "b"],
+            2,
+            keys=lambda: next(seq, Key.QUIT),
+            write=lambda _s: None,
+            raw=False,
+            escapable=False,
+        )
         assert got == 0
 
     def test_the_cursor_starts_where_the_caller_left_it(self):
         # Stepping out of a nested view lands on the row you came from, not the
         # top of a list you have already read.
         seq = iter([Key.ENTER])
-        assert select(lambda _i: ["a", "b", "c"], 3, keys=lambda: next(seq),
-                      write=lambda _s: None, raw=False, initial=2) == 2
+        assert (
+            select(
+                lambda _i: ["a", "b", "c"],
+                3,
+                keys=lambda: next(seq),
+                write=lambda _s: None,
+                raw=False,
+                initial=2,
+            )
+            == 2
+        )
 
     def test_an_out_of_range_initial_is_clamped(self):
         seq = iter([Key.ENTER])
-        assert select(lambda _i: ["a"], 1, keys=lambda: next(seq),
-                      write=lambda _s: None, raw=False, initial=99) == 0
+        assert (
+            select(
+                lambda _i: ["a"],
+                1,
+                keys=lambda: next(seq),
+                write=lambda _s: None,
+                raw=False,
+                initial=99,
+            )
+            == 0
+        )
 
     def test_the_block_is_erased_on_the_way_out(self):
         # This is what makes each level replace the last instead of appending to
         # a transcript of screens.
         frames = []
-        select(lambda _i: ["a", "b"], 2, keys=lambda: Key.QUIT,
-               write=frames.append, raw=False)
+        select(lambda _i: ["a", "b"], 2, keys=lambda: Key.QUIT, write=frames.append, raw=False)
         assert "J" in frames[-1] and "F" in frames[-1]
 
     def test_erase_can_be_declined(self):
         frames = []
-        select(lambda _i: ["a"], 1, keys=lambda: Key.QUIT,
-               write=frames.append, raw=False, erase=False)
+        select(
+            lambda _i: ["a"], 1, keys=lambda: Key.QUIT, write=frames.append, raw=False, erase=False
+        )
         assert not any("J" in f and "F" in f for f in frames)
 
 
@@ -521,7 +673,7 @@ class TestTheHighlightSurvivesTheRowsOwnColours:
         while i < len(painted):
             if painted[i] == "\x1b":
                 j = painted.index("m", i)
-                code = painted[i:j + 1]
+                code = painted[i : j + 1]
                 if code == "\x1b[7m":
                     active = True
                 elif code == "\x1b[0m":
@@ -546,3 +698,125 @@ class TestTheHighlightSurvivesTheRowsOwnColours:
 
         assert Glyphs().cursor and Glyphs.ascii().cursor
         assert Glyphs.ascii().cursor.isascii()
+
+
+class TestTheTerminalIsReallyRestored:
+    """The end-to-end half of `_RawMode`'s promise, in a real pty.
+
+    The tests above verify the MECHANISM — that handlers are installed for
+    `_FATAL_SIGNALS` and removed afterwards — with `termios.tcgetattr`
+    monkeypatched. That is the right unit test and it would pass even if the
+    handler restored the wrong thing, or restored termios and left the cursor
+    hidden.
+
+    So this drives the real interactive browse in a real pty, signals it, and asks
+    the pty what state it was left in. Measured before the fix that
+    `_FATAL_SIGNALS` exists for: after SIGTERM, `echo=False canonical=False`.
+
+    Two sibling packages grew the same defect independently and were fixed the same
+    way; each now has a pty test like this one, and this was the package whose
+    correct behaviour nothing end-to-end actually checked.
+    """
+
+    @staticmethod
+    def _drive(signame, settle=25.0):
+        import contextlib
+        import os
+        import pathlib
+        import pty
+        import select
+        import signal
+        import sys
+        import termios
+        import time
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        pid, fd = pty.fork()
+        if pid == 0:  # pragma: no cover - the child execs immediately
+            os.environ.update(
+                {
+                    "PYTHONPATH": str(root / "src"),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "TERM": "xterm-256color",
+                    "COLUMNS": "120",
+                    "LINES": "40",
+                }
+            )
+            os.chdir(str(root))
+            os.execv(sys.executable, [sys.executable, "-m", "nodetop"])
+
+        seen = bytearray()
+
+        def pump(seconds):
+            end = time.time() + seconds
+            while time.time() < end:
+                ready, _, _ = select.select([fd], [], [], 0.2)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                seen.extend(chunk)
+
+        def lflags():
+            try:
+                bits = termios.tcgetattr(fd)[3]
+            except Exception:
+                return None
+            return (bool(bits & termios.ECHO), bool(bits & termios.ICANON))
+
+        # Wait until the pty actually reports raw mode rather than sleeping a
+        # fixed interval: whether the browse has taken the terminal by then
+        # depends on how long the cluster query takes, and a fixed sleep made the
+        # test skip itself for some signals and not others on the same machine.
+        deadline = time.time() + settle
+        during = lflags()
+        while time.time() < deadline and during != (False, False):
+            pump(0.3)
+            during = lflags()
+        os.kill(pid, getattr(signal, f"SIG{signame}"))
+
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            pump(0.4)
+            try:
+                done, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if done:
+                break
+        else:  # pragma: no cover - only on a hang
+            os.kill(pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+            pytest.fail(f"nodetop never exited after SIG{signame}")
+        text = seen.decode("utf-8", "replace")
+        return during, lflags(), text
+
+    @pytest.mark.parametrize("signame", ["TERM", "HUP", "INT"])
+    def test_echo_and_canonical_mode_come_back(self, signame):
+        during, after, text = self._drive(signame)
+        if during != (False, False):
+            pytest.skip(f"the browse never entered raw mode here (during={during})")
+        assert after == (True, True), (
+            f"SIG{signame} left the terminal raw: {after} — a shell with no echo, "
+            f"where even typing `reset` gives no feedback"
+        )
+        assert "Traceback" not in text, text[-300:]
+
+    @pytest.mark.parametrize("signame", ["TERM", "HUP", "INT"])
+    def test_the_cursor_is_shown_again(self, signame):
+        """`_RawMode` hides the cursor on entry, so it has to unhide it too.
+
+        Restoring termios and leaving the cursor invisible is the half-fix that a
+        mock-level test cannot see.
+        """
+        during, _after, text = self._drive(signame)
+        if during != (False, False):
+            pytest.skip("the browse never entered raw mode here")
+        assert text.count("\033[?25l") <= text.count("\033[?25h"), (
+            "the cursor was hidden more often than it was shown"
+        )

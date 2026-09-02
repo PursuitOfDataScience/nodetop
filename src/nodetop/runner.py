@@ -26,6 +26,7 @@ __all__ = [
     "RecordedRunner",
     "Runner",
     "SubprocessRunner",
+    "resolve",
     "which",
 ]
 
@@ -43,6 +44,46 @@ _FORCED_ENV = {
 def which(binary: str) -> bool:
     """Whether a client binary is on PATH."""
     return shutil.which(binary) is not None
+
+
+def resolve(binary: str) -> str | None:
+    """Where ``binary`` actually lives, following symlinks.
+
+    Needed because a client binary's *presence* does not identify the system
+    behind it: Slurm ships ``qstat``, ``qsub``, ``qdel`` and ``pbsnodes``
+    wrappers in ``contribs/torque``, installed by default at a great many
+    sites, and on such a host ``which("pbsnodes")`` is true on a cluster with
+    no PBS at all.  The resolved path says which package it came from.
+    """
+    found = shutil.which(binary)
+    if not found:
+        return None
+    try:
+        return os.path.realpath(found)
+    except OSError:  # pragma: no cover - realpath does not normally raise
+        return found
+
+
+def _failure(cmd: Sequence[str], rc: int, out: str, err: str) -> CommandError:
+    """The error to raise for a non-zero exit, with a reason that is not blank.
+
+    ``CommandError`` reports stderr, which is right for every client that puts
+    its diagnosis there -- and ``scontrol``, the one this tool leans on hardest,
+    does not.  Measured on live Slurm 20.11.8: ``scontrol show node nosuchnode``
+    and ``scontrol show partition nosuchpart`` both exit 1 with ``Node
+    nosuchnode not found`` on **stdout** and stderr EMPTY.  So the funnel raised
+    ``scontrol show node --all --oneliner exited 1: `` -- a reported failure
+    whose reason is the empty string -- and `Cluster.load` stored exactly that
+    under ``errors["nodes"]``, which is what the reader is shown when a query
+    dies.  The one thing a failure report has to carry is why, and stdout held
+    the only copy of it.
+
+    stderr still wins wherever it has anything at all: it is the documented
+    place for a diagnosis, a dry-run's verdict lands there, and appending stdout
+    to it would put a partial data dump into an error message.  stdout is read
+    only when it is the sole account of the failure.
+    """
+    return CommandError(list(cmd), rc, err or out)
 
 
 class Runner:
@@ -76,7 +117,7 @@ class SubprocessRunner(Runner):
     def run(self, cmd: Sequence[str], timeout: float = DEFAULT_TIMEOUT) -> str:
         rc, out, err = self.run_full(cmd, timeout)
         if rc != 0:
-            raise CommandError(list(cmd), rc, err)
+            raise _failure(cmd, rc, out, err)
         return out
 
     def run_full(
@@ -89,6 +130,23 @@ class SubprocessRunner(Runner):
                 list(cmd),
                 capture_output=True,
                 text=True,
+                # Slurm/GPFS output is UTF-8 in practice, and the bytes in it are not
+                # ours: a job name, a node's `Reason`, a fileset name and an account
+                # description are all free text a user or an admin typed. `text=True`
+                # alone decodes with the PARENT's locale, and under `LC_ALL=C` with
+                # coercion off that is `ANSI_X3.4-1968` -- pure ASCII -- so one
+                # accented character anywhere in the output killed the read.
+                #
+                # Measured: a node whose `Reason` read `disk caf\xc3\xa9 replaced`
+                # made all four queries raise `UnicodeDecodeError`, and `status`
+                # reported "every query failed, so there is nothing to report" with
+                # exit 3 -- on a healthy cluster. `replace` reads the rest and shows
+                # one lossy character instead, which is the honest trade: the field
+                # is decoration, the cluster state is the answer. Sibling packages
+                # already pass exactly this pair on their Slurm runners; this was the
+                # one funnel that did not.
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 env=env,
                 check=False,
@@ -117,7 +175,7 @@ class CapturingRunner(Runner):
     def run(self, cmd: Sequence[str], timeout: float = DEFAULT_TIMEOUT) -> str:
         rc, out, err = self.run_full(cmd, timeout)
         if rc != 0:
-            raise CommandError(list(cmd), rc, err)
+            raise _failure(cmd, rc, out, err)
         return out
 
     def run_full(
@@ -197,7 +255,7 @@ class RecordedRunner(Runner):
     ) -> str:
         rc, out, err = self._lookup(cmd)
         if rc != 0:
-            raise CommandError(list(cmd), rc, err)
+            raise _failure(cmd, rc, out, err)
         return out
 
     def run_full(  # `timeout` unused here but required by the interface

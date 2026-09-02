@@ -38,7 +38,9 @@ with "ask the cluster", which is what the tool did before this module existed.
 
 from __future__ import annotations
 
+import math
 import os
+import sys
 import time
 from collections.abc import Sequence
 
@@ -63,15 +65,66 @@ KEEP = 32
 VERSION = 1
 
 
+#: Values already complained about, so a run says it once rather than per call.
+_TTL_COMPLAINED: set[str] = set()
+
+
+def _ttl_ignored(raw: str, why: str) -> None:
+    """Say that the variable is not in effect, once per distinct value.
+
+    On stderr, not raised. This is a cache knob: erroring out because one is
+    mistyped would take the tool down over something it can simply do without,
+    and a sibling package makes that trade the other way only for a knob that
+    bounds a query (`SLURMPAST_TIMEOUT`, which really can hang a run).
+
+    But silence was wrong too. `ttl()` is consulted up to three times per run, so
+    the note is deduplicated rather than printed each time.
+    """
+    if raw in _TTL_COMPLAINED:
+        return
+    _TTL_COMPLAINED.add(raw)
+    # `sys.stderr.write`, not `print(file=...)`: `T20` is selected precisely to
+    # keep `print` out of the library modules, and it caught this line. The
+    # sibling package that writes everything this way is the reason the rule
+    # costs nothing there.
+    sys.stderr.write(
+        f"nodetop: ignoring NODETOP_ACCESS_TTL={raw!r} ({why}); using the default "
+        f"of {DEFAULT_TTL:.0f}s. Set it to a number of seconds, or 0 to disable "
+        f"the remembered answers.\n"
+    )
+
+
 def ttl() -> float:
-    """The freshness bound, honouring ``NODETOP_ACCESS_TTL`` (0 disables)."""
+    """The freshness bound, honouring ``NODETOP_ACCESS_TTL`` (0 disables).
+
+    One rule for every unusable value: the variable is ignored and the default
+    stands. It used to be three different rules, all silent --
+
+        NODETOP_ACCESS_TTL=abc    -> the default (86400s)
+        NODETOP_ACCESS_TTL=-5     -> 0, i.e. caching DISABLED
+        NODETOP_ACCESS_TTL=1e999  -> inf, i.e. answers never expire
+        NODETOP_ACCESS_TTL=nan    -> 0, i.e. disabled (from `max`'s NaN ordering)
+
+    -- so the same class of typo produced "default", "off" and "forever"
+    depending on which typo it was, and nothing said which. `inf` is the one that
+    could actually mislead: a remembered refusal would be reused for the life of
+    the cache file, long after the account was fixed.
+    """
     raw = os.environ.get("NODETOP_ACCESS_TTL")
     if raw is None:
         return DEFAULT_TTL
     try:
-        return max(0.0, float(raw))
+        value = float(raw)
     except ValueError:
+        _ttl_ignored(raw, "not a number")
         return DEFAULT_TTL
+    if not math.isfinite(value):
+        _ttl_ignored(raw, "not a finite number of seconds")
+        return DEFAULT_TTL
+    if value < 0:
+        _ttl_ignored(raw, "negative")
+        return DEFAULT_TTL
+    return value
 
 
 def directory() -> str | None:
@@ -174,11 +227,25 @@ def load(name: str, *, now: float | None = None
     verdicts = entry.get("verdicts")
     if not isinstance(at, (int, float)) or not isinstance(verdicts, dict):
         return None
-    age = (time.time() if now is None else now) - at
+    clock = time.time() if now is None else now
+    age = clock - at
     if age > window:
         return None
-    known = {k: v for k, v in verdicts.items()
-             if isinstance(k, str) and v in (YES, NO, MAYBE)}
+    # Each verdict expires on its own clock, not the file's. See :func:`save`:
+    # the merge carries forward answers this run never re-asked, so ageing the
+    # whole document together let one refusal be renewed indefinitely by writes
+    # about other partitions. A file written before ``seen`` existed has no
+    # per-verdict time and ages on the document's, exactly as it used to.
+    stamps = entry.get("seen")
+    stamps = stamps if isinstance(stamps, dict) else {}
+    known: dict[str, str] = {}
+    for k, v in verdicts.items():
+        if not isinstance(k, str) or v not in (YES, NO, MAYBE):
+            continue
+        when = stamps.get(k)
+        if isinstance(when, (int, float)) and clock - when > window:
+            continue
+        known[k] = v
     return known, max(0.0, age)
 
 
@@ -201,13 +268,38 @@ def save(
     # Merged, not replaced: a run only asks about the partitions with room right
     # now, and forgetting the others would make the next run -- with a slightly
     # different set -- a miss again. That is the bug this shape fixes.
-    previous = _read(name).get("verdicts")
+    before = _read(name)
+    previous = before.get("verdicts")
     merged = dict(previous) if isinstance(previous, dict) else {}
     merged.update(verdicts)
+    stamp = time.time() if now is None else now
+    # When each verdict was last *asked*, which is not when the file was last
+    # written -- and the difference is the bug. The merge above carries forward
+    # answers this run never re-asked, so one document timestamp restamped them
+    # all as new: a partition that stops having room stops being a candidate, is
+    # never re-probed, and its remembered refusal is renewed by every unrelated
+    # write. Measured with a fake clock: a `no` recorded twelve days earlier was
+    # still served, and reported as "checked 1s ago". That is the "reused long
+    # after the account was fixed" failure `ttl()` refuses `inf` to prevent,
+    # arriving through the merge instead of through the knob.
+    #
+    # Additive, and read defensively at both ends, so no version bump: a file
+    # without it ages on `at` as before, and an older nodetop ignores it.
+    seen: dict[str, float] = {}
+    stamps = before.get("seen")
+    if isinstance(stamps, dict):
+        seen.update({k: float(v) for k, v in stamps.items()
+                     if k in merged and isinstance(v, (int, float))})
+    was = before.get("at")
+    if isinstance(was, (int, float)):
+        for k in merged:
+            seen.setdefault(k, float(was))
+    seen.update(dict.fromkeys(verdicts, stamp))
     document = {
         "version": VERSION,
-        "at": time.time() if now is None else now,
+        "at": stamp,
         "verdicts": {k: merged[k] for k in sorted(merged)},
+        "seen": {k: seen[k] for k in sorted(seen)},
     }
     try:
         import json

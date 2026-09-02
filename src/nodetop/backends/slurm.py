@@ -34,7 +34,7 @@ from datetime import datetime
 from typing import TypedDict
 
 from ..core.duration import parse_timestamp
-from ..core.hardware import identify_accelerator
+from ..core.hardware import identify_accelerator, name_accelerator
 from ..core.model import (
     Allocation,
     Identity,
@@ -117,7 +117,7 @@ _BASE_TO_CONDITION = {
 
 #: Whitespace that is a field separator but is not a plain space.
 #:
-#: `_FIELDS_FAST` cannot see these, so their presence sends the record back to
+#: `_fields_fast` cannot see these, so their presence sends the record back to
 #: the regex. A `Reason` carrying a tab is rare and a tab-delimited record is
 #: rarer still, but the failure mode if one slipped past would be the worst one
 #: available: the whole record read as a single field, so a node with no state,
@@ -490,6 +490,7 @@ class SlurmBackend:
                     gpus_total=_gres_gpus(gres),
                     gpus_alloc=_tres_gpus(f.get("AllocTRES")),
                     accelerator=identify_accelerator(gres, labels),
+                    accelerator_label=name_accelerator(gres, labels) or "",
                     labels=tuple(t.strip() for t in labels.split(",") if t.strip()),
                     queues=tuple(expand(f.get("Partitions", ""))),
                     reason=reason,
@@ -700,6 +701,11 @@ class SlurmBackend:
         account_queues: dict[str, set[str]] = {}
         qos: set[str] = set()
         defaults: set[str] = set()
+        # Kept per ROW as well as unioned. The union answers "may I use this
+        # QOS anywhere"; only the row answers "which QOS applies to me on this
+        # partition", and that is the one a dry-run has to name. See
+        # `Identity.qos_for`.
+        per_assoc: dict[tuple[str, str], tuple[tuple[str, ...], str]] = {}
         for line in output.splitlines():
             parts = line.split("|")
             if not parts or not parts[0].strip():
@@ -714,12 +720,20 @@ class SlurmBackend:
             bucket = account_queues.setdefault(acct, set())
             if partition:
                 bucket.add(partition)
+            row_qos: list[str] = []
             for q in qos_field.split(","):
                 if q.strip():
                     qos.add(q.strip())
                     bucket.add(q.strip())
+                    row_qos.append(q.strip())
             if default_field and default_field != "(null)":
                 defaults.add(default_field)
+            row_default = "" if default_field == "(null)" else default_field
+            if row_qos or row_default:
+                # First row wins for a duplicated key: `sacctmgr` can list the
+                # same association twice through a cluster column this query
+                # does not ask for, and the two are the same grant.
+                per_assoc.setdefault((acct, partition), (tuple(row_qos), row_default))
         return Identity.from_account_queues(
             user, account_queues, qos, _unix_groups(user),
             # Whether an empty account list is a fact about the site or about
@@ -736,6 +750,7 @@ class SlurmBackend:
             # jobs run under different ceilings have no single answer, and
             # picking one of them would invent a limit for the other.
             default_qos=defaults.pop() if len(defaults) == 1 else None,
+            association_qos=per_assoc,
         )
 
     def load_identity(self) -> Identity:
@@ -989,10 +1004,10 @@ _PATTERNS: tuple[tuple[str, str], ...] = (
     (r"access/permission denied", VerdictCategory.ACCESS_DENIED),
 )
 
-# The acceptance line carries three separate facts, so it is read as three
-# separate patterns applied to that one line -- NOT as one sentence-shaped
-# regex. A single pattern makes every fact after the first hostage to the exact
-# wording between them, and that wording moves. Slurm 25.11 prints
+# The acceptance line carries several separate facts, so each is read by its own
+# pattern applied to that one line -- NOT by one sentence-shaped regex. A single
+# pattern makes every fact after the first hostage to the exact wording between
+# them, and that wording moves. Slurm 25.11 prints
 #
 #     sbatch: Job 556812 to start at 2026-08-24T17:32:50 a using 1 processors \
 #         on nodes mcn53 in partition standard
@@ -1003,8 +1018,14 @@ _PATTERNS: tuple[tuple[str, str], ...] = (
 # `predicted_nodes: []`, so the one thing a dry-run knows and nothing else does
 # -- which nodes the scheduler picked -- was dropped on every accepted probe on
 # that cluster, silently, while the verdict beside it still looked complete.
+#
+# Two patterns, not three: the line's `using N processors` clause is deliberately
+# not read. A processor count is derivable from the request nodetop just made, so
+# capturing it would add a field nothing consumes -- where the node list is, as
+# above, the one fact a dry-run knows and nothing else does. A third regex was
+# carried here unused for exactly that reason; it is gone rather than left to
+# read as a capability.
 _START = re.compile(r"Job\s+(?P<jobid>\d+)\s+to start at\s+(?P<when>\S+)")
-_START_PROCS = re.compile(r"using\s+(?P<procs>\d+)\s+processors")
 _START_NODES = re.compile(r"\bon nodes?\s+(?P<nodes>\S+)")
 _VERIFICATION = re.compile(r"Verification:\s*\**\s*(?P<v>PASSED|REJECTED)", re.IGNORECASE)
 _REASON = re.compile(r"^\s*Reason:\s*(?P<reason>.+?)\s*$", re.IGNORECASE | re.MULTILINE)

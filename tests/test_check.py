@@ -571,21 +571,26 @@ class TestUnansweredIsNotRefused:
         # Rendered, not re-derived: the first version of this test rebuilt the
         # same conditional it was meant to be checking, so it would have passed
         # against any implementation including the broken one.
+        from nodetop.core.model import VerdictCategory, category_label
         from nodetop.render import Glyphs, Style
 
         colour = Style(depth=24, glyphs=Glyphs())
         cmd_where(self._downed_cluster(), _args(["where", "-g", "1"]), colour)
         transient = capsys.readouterr().out
 
-        assert "CONTROL_PLANE_DOWN" in transient
+        # The DISPLAY form of the category, and not the wire form: the cell sits
+        # next to `confirmed` and `unchecked`, and painting the enum member
+        # through put two vocabularies in one column.
+        label = category_label(VerdictCategory.CONTROL_PLANE_DOWN)
+        assert label in transient
+        assert "CONTROL_PLANE_DOWN" not in transient
         # The warn colour, not the bad one: red on an outage reads as "denied".
         warn_seq = colour.warn("x")[: colour.warn("x").index("x")]
         bad_seq = colour.bad("x")[: colour.bad("x").index("x")]
         assert warn_seq != bad_seq
-        row = next(ln for ln in transient.splitlines()
-                   if "CONTROL_PLANE_DOWN" in ln)
+        row = next(ln for ln in transient.splitlines() if label in ln)
         assert warn_seq in row
-        assert row.index(warn_seq) < row.index("CONTROL_PLANE_DOWN")
+        assert row.index(warn_seq) < row.index(label)
 
     def test_check_counts_unanswered_apart_from_refused(self, capsys):
         # "1 of 3 accepted" hides that one of the other two was never asked.

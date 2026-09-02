@@ -21,6 +21,7 @@ for the fast-starting copy.
 
 from __future__ import annotations
 
+import pathlib
 import subprocess
 import sys
 import zipfile
@@ -29,14 +30,26 @@ import pytest
 
 pytest.importorskip("zipapp")
 
-TOOL = "tools/build_pyz.py"
+#: Resolved from this file, not from the working directory: `pytest` is run from
+#: wherever the reader happens to be standing, and a relative path made the
+#: builder unfindable from anywhere but the repo root.
+TOOL = pathlib.Path(__file__).resolve().parent.parent / "tools" / "build_pyz.py"
+
+# Skipped rather than failed when the builder is not in the tree. An sdist that
+# omits `tools/` still ships this file, and seven red tests for a missing build
+# script look precisely like a portability failure in the code -- the same shape
+# as a sibling package's `conftest.py` absence, which made a whole suite collect
+# zero tests and report success.
+pytestmark = pytest.mark.skipif(
+    not TOOL.is_file(), reason=f"{TOOL.name} is not in this tree (sdist without tools/)"
+)
 
 
 def _build(tmp_path, *flags):
     tmp_path.mkdir(parents=True, exist_ok=True)
     out = tmp_path / "nodetop.pyz"
     done = subprocess.run(
-        [sys.executable, TOOL, "-o", str(out), *flags],
+        [sys.executable, str(TOOL), "-o", str(out), *flags],
         capture_output=True, text=True,
     )
     assert done.returncode == 0, done.stderr

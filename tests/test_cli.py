@@ -1626,6 +1626,259 @@ class TestShapeFlags:
         assert JobShape(walltime="36h").walltime_seconds == 129600
 
 
+class TestExclusionIsNotReportedAsAHardwareLimit:
+    """The screen said "no node here has the right hardware" about fine hardware.
+
+    With `--exclude` covering every node, `hardware_nodes` empties and the note
+    line asserted a hardware limit, while the `WRONG HW` legend adds "go
+    elsewhere; waiting will not help" -- when what would help is dropping the
+    flag. The detail beside it was blank, because the reason histogram had nothing
+    in it (see `tests/test_capacity.py`).
+    """
+
+    @staticmethod
+    def _cluster(cpus=16):
+        from nodetop.core.cluster import Cluster
+        from nodetop.core.model import Identity, Node, Queue
+
+        nodes = [
+            Node(name=f"n{i}", state_raw="IDLE", cpus_total=cpus, memory_mb=64000,
+                 gpus_total=4, queues=("q",))
+            for i in range(3)
+        ]
+        queues = {"q": Queue(name="q", node_names=tuple(n.name for n in nodes),
+                             declared_nodes=3, nodes=nodes, allow_accounts=())}
+        return Cluster(
+            backend_name="synthetic", queue_term="partition",
+            nodes=nodes, queues=queues,
+            identity=Identity(user="me", accounts=("a",), qos=("q",)),
+        )
+
+    def _out(self, capsys, argv):
+        from nodetop.cli import cmd_where
+
+        cmd_where(self._cluster(), _args(argv), PLAIN)
+        return capsys.readouterr().out
+
+    def test_excluding_everything_does_not_blame_the_hardware(self, capsys):
+        out = self._out(capsys, ["where", "-c", "8", "--exclude", "n0,n1,n2", "--all"])
+        assert "excluded by request, not by hardware" in out, out
+        assert "no node here has the right hardware" not in out, out
+
+    def test_the_reason_is_shown_beside_it(self, capsys):
+        # The detail line was empty before, which is what made the wrong label
+        # unanswerable: nothing on screen said why.
+        out = self._out(capsys, ["where", "-c", "8", "--exclude", "n0,n1,n2", "--all"])
+        assert "kept out by --exclude" in out, out
+        assert "3 nodes" in out, out
+
+    def test_a_genuine_hardware_limit_still_says_so(self, capsys):
+        """CONTROL -- passes in both states, and keeps its own detail line."""
+        out = self._out(capsys, ["where", "-c", "32", "--all"])
+        assert "no node here has the right hardware" in out, out
+        assert "excluded by request" not in out, out
+        assert "only 16 CPUs installed, need 32" in out, out
+
+    def test_a_partial_exclusion_is_not_a_refusal_at_all(self, capsys):
+        """CONTROL -- two nodes remain, so there is no hardware note to reword."""
+        out = self._out(capsys, ["where", "-c", "8", "--exclude", "n0", "--all"])
+        assert "excluded by request, not by hardware" not in out, out
+        assert "no node here has the right hardware" not in out, out
+
+
+class TestTheGpusColumnNamesTheCardThatCanActuallyDoTheJob:
+    """The column said `V100x5, RTX6000x5` on a row whose `right hw` was an A100.
+
+    `right hw` is counted from `Capacity.hardware_nodes`; the `gpus` column took
+    `list(p.accelerator_models.items())[:2]` in dict order and said nothing about
+    what it dropped. So on a partition holding several models the two could
+    contradict each other, and on this cluster they did:
+
+        partition  fits/need  right hw   start  access     gpus
+        gpu              0/1      1/11  9h 44m  confirmed  V100x5, RTX6000x5
+
+    Neither V100 nor RTX6000 has 40 GiB of HBM. The single capable node was the
+    A100, truncated away -- so a reader asking "which card is the one node that
+    fits?" was shown the two cards that cannot, with no hint anything was hidden.
+    It now reads `A100x1, RTX6000x5 +1`.
+    """
+
+    #: The shape asks for 32 CPUs, which only the RARE model's node has. Using a
+    #: CPU constraint rather than --gpu-mem keeps the fixture independent of the
+    #: accelerator-spec plumbing while exercising the same `hardware_nodes` path.
+    BIG_CPUS = 64
+    SMALL_CPUS = 8
+
+    @staticmethod
+    def _cluster(spec, part="gpu"):
+        """One partition holding ``(label, count, cpus)`` groups of GPU nodes."""
+        from nodetop.core.cluster import Cluster
+        from nodetop.core.model import Identity, Node, Queue
+
+        nodes = []
+        for label, count, cpus in spec:
+            nodes += [
+                Node(name=f"n-{label}-{i}", state_raw="IDLE", cpus_total=cpus,
+                     memory_mb=256000, gpus_total=4, accelerator_label=label,
+                     queues=(part,))
+                for i in range(count)
+            ]
+        queues = {part: Queue(
+            name=part, node_names=tuple(n.name for n in nodes),
+            declared_nodes=len(nodes), nodes=nodes, allow_accounts=())}
+        return Cluster(
+            backend_name="synthetic", queue_term="partition",
+            nodes=nodes, queues=queues,
+            identity=Identity(user="me", accounts=("a",), qos=("q",)),
+        )
+
+    def _row(self, spec, capsys, cpus=32):
+        from nodetop.cli import cmd_where
+
+        cmd_where(self._cluster(spec),
+                  _args(["where", "-g", "1", "-c", str(cpus), "--all"]), PLAIN)
+        out = capsys.readouterr().out
+        # The TABLE row, not the summary box above it -- the box also carries
+        # "[RUN NOW]  gpu" and matched a looser filter first.
+        rows = [
+            ln for ln in out.splitlines()
+            if not ln.strip().startswith("\u2502")
+            and ("RUN NOW" in ln or "QUEUE" in ln)
+            and "/" in ln
+        ]
+        assert len(rows) == 1, f"expected one placement row, got {rows!r}"
+        return rows[0]
+
+    #: {V100: 5, RTX6000: 5, A100: 1} -- the live shape, with only the A100 fitting.
+    LIVE = [("V100", 5, SMALL_CPUS), ("RTX6000", 5, SMALL_CPUS), ("A100", 1, BIG_CPUS)]
+
+    def test_the_capable_model_is_named_even_when_it_is_the_rarest(self, capsys):
+        row = self._row(self.LIVE, capsys)
+        assert "A100x1" in row, row
+
+    def test_the_row_no_longer_contradicts_its_own_right_hw_count(self, capsys):
+        # The point of the fix, stated as the reader experiences it: the one card
+        # that fits is on screen, so `right hw 1/11` has something to refer to.
+        row = self._row(self.LIVE, capsys)
+        assert "1/11" in row, row
+        assert row.index("A100x1") > 0
+        # ...and the two that cannot do the job no longer crowd it out together.
+        assert not ("V100x5" in row and "RTX6000x5" in row and "A100" not in row)
+
+    def test_a_truncated_model_list_says_how_many_it_hid(self, capsys):
+        row = self._row(self.LIVE, capsys)
+        assert "+1" in row, row
+
+    def test_a_partition_where_everything_fits_keeps_count_order(self, capsys):
+        """CONTROL -- passes before and after; the fix must not always reorder.
+
+        Every node has the big CPU count, so every model is capable and the
+        `fits` key cannot discriminate. Order then falls to count descending,
+        which is the convention elsewhere in this file -- not alphabetical, or
+        `A40x9` would come first.
+        """
+        row = self._row([("A40", 9, self.BIG_CPUS), ("H100", 20, self.BIG_CPUS)], capsys)
+        assert row.index("H100x20") < row.index("A40x9"), row
+
+    def test_exactly_two_models_are_not_annotated(self, capsys):
+        """CONTROL -- the `+N` is conditional, not glued on."""
+        row = self._row([("A40", 9, self.BIG_CPUS), ("H100", 20, self.BIG_CPUS)], capsys)
+        assert "+" not in row.split("H100x20")[-1], row
+
+    def test_a_cpu_only_partition_still_shows_the_dash(self, capsys):
+        """CONTROL -- the empty case, which the `or dash` tail still has to reach."""
+        from nodetop.cli import cmd_where
+        from nodetop.core.cluster import Cluster
+        from nodetop.core.model import Identity, Node, Queue
+
+        nodes = [Node(name="c1", state_raw="IDLE", cpus_total=64, memory_mb=256000,
+                      queues=("cpu",))]
+        queues = {"cpu": Queue(name="cpu", node_names=("c1",), declared_nodes=1,
+                               nodes=nodes, allow_accounts=())}
+        cluster = Cluster(backend_name="synthetic", queue_term="partition",
+                          nodes=nodes, queues=queues,
+                          identity=Identity(user="me", accounts=("a",), qos=("q",)))
+        cmd_where(cluster, _args(["where", "-c", "8", "--all"]), PLAIN)
+        out = capsys.readouterr().out
+        assert "UNKNOWN" not in out, out
+
+
+class TestThePartitionsColumnBreaksTiesForwards:
+    """Which three partitions the reader is shown was decided backwards.
+
+    `holders()` built `(count, name)` pairs and sorted them with `reverse=True`,
+    which reverses the NAME as well as the count. Everywhere else in `cli.py` the
+    count is negated instead (`key=lambda kv: -len(kv[1])`,
+    `-totals(kv[1])[0]`) exactly so the secondary ordering is left alone.
+
+    It is visible because the caller prints only the first three and folds the rest
+    into `+N`: where a model sits in several equally-sized partitions, the partition
+    a reader was NOT shown was the alphabetically first one.
+    """
+
+    @staticmethod
+    def _cluster(spec):
+        """One GPU model spread over the given ``(partition, node count)`` pairs."""
+        from nodetop.core.cluster import Cluster
+        from nodetop.core.model import Identity, Node, Queue
+
+        nodes, queues = [], {}
+        for name, count in spec:
+            mine = [
+                Node(name=f"n-{name}-{i}", state_raw="IDLE", cpus_total=16,
+                     memory_mb=64000, gpus_total=4, queues=(name,))
+                for i in range(count)
+            ]
+            nodes += mine
+            queues[name] = Queue(
+                name=name, node_names=tuple(n.name for n in mine),
+                declared_nodes=count, nodes=mine, allow_accounts=())
+        return Cluster(
+            backend_name="synthetic", queue_term="partition",
+            nodes=nodes, queues=queues,
+            identity=Identity(user="me", accounts=("a",), qos=("q",)),
+        )
+
+    def _row(self, spec, capsys):
+        from nodetop.cli import cmd_accelerators
+
+        cmd_accelerators(self._cluster(spec), _args(["accelerators", "--all"]), PLAIN)
+        out = capsys.readouterr().out
+        return next(ln for ln in out.splitlines() if "UNKNOWN" in ln)
+
+    def test_partitions_tied_on_node_count_are_listed_alphabetically(self, capsys):
+        # Four partitions, two nodes each, so nothing but the name can order them.
+        row = self._row([("alpha", 2), ("bravo", 2), ("charlie", 2), ("delta", 2)], capsys)
+        assert "alpha, bravo, charlie" in row, row
+
+    def test_the_partition_hidden_behind_the_plus_n_is_the_last_one_alphabetically(
+        self, capsys
+    ):
+        # The consequence, stated as the reader experiences it: only three fit, so
+        # being sorted backwards decided WHICH ONE you do not get told about. Before
+        # the fix this row read "delta, charlie, bravo +1" and hid `alpha`.
+        row = self._row([("alpha", 2), ("bravo", 2), ("charlie", 2), ("delta", 2)], capsys)
+        assert "+1" in row, row
+        assert "delta" not in row, row
+
+    def test_node_count_still_outranks_the_name(self, capsys):
+        """CONTROL -- passes before and after, and is not a mirror of the fix.
+
+        The names are adversarial on purpose: alphabetically this is
+        alpha/mike/zulu, and by node count it is the exact reverse. A fix that
+        replaced the sort with a plain alphabetical one would satisfy both tests
+        above and break the column's whole point, which is "where the hardware is,
+        most of it first".
+        """
+        row = self._row([("zulu", 3), ("alpha", 1), ("mike", 2)], capsys)
+        assert "zulu, mike, alpha" in row, row
+
+    def test_a_partition_holding_none_of_the_model_is_still_omitted(self, capsys):
+        """CONTROL -- the `if n` filter, which sits in the same expression."""
+        row = self._row([("alpha", 2), ("empty", 0)], capsys)
+        assert "alpha" in row and "empty" not in row, row
+
+
 class TestAccelerators:
     """The one question no scheduler can answer."""
 
@@ -2059,15 +2312,33 @@ class TestHealthGroupsByReasonNotByTimestamp:
         out = self._out(["maintenance [root@2026-07-16T08:51:31]"], capsys)
         assert "2026-07-16T08:51:31" not in out
 
-    def test_the_oldest_stamp_becomes_the_group_age(self, capsys):
+    def test_one_stamp_becomes_the_group_age(self, capsys):
         # The stamp is not thrown away -- how long they have been out is the
-        # part worth knowing, and the oldest is the honest answer for a group.
+        # part worth knowing.
+        out = self._out([
+            "maintenance [root@2020-01-01T00:00:00]",
+            "maintenance [root@2020-01-01T00:00:00]",
+        ], capsys)
+        assert "for " in out
+        assert "d" in out.split("for ")[1][:12]  # an age in days
+
+    def test_a_spread_group_reports_its_newest_not_only_its_oldest(self, capsys):
+        # The oldest ALONE was the bug, and the group it lied about was the
+        # biggest on the cluster: 854 nodes "Not responding", oldest 809 days,
+        # newest four minutes -- a live compute node that had just failed,
+        # reported as down for 809 days. "for 809d" reads as decommissioned
+        # hardware to ignore; four minutes reads as an incident.
         out = self._out([
             "maintenance [root@2020-01-01T00:00:00]",
             "maintenance [root@2026-08-01T00:00:00]",
         ], capsys)
-        assert "for " in out
-        assert "d" in out.split("for ")[1][:12]  # an age in days
+        assert "newest" in out
+        assert "oldest" in out
+        # Both ends present, and the newest first: it is the actionable one.
+        assert out.index("newest") < out.index("oldest")
+        # And it is NOT reported as a single age, which is what hid the fresh
+        # failure inside the old ones.
+        assert "for " not in out
 
     def test_an_unstamped_reason_gets_no_age(self, capsys):
         out = self._out(["Not responding"], capsys)
@@ -3019,3 +3290,120 @@ class TestEachFunnelLabelIsItsOwnTarget:
         # The total, "open to you", and the single partition row. No exclusion
         # terms, because nothing is excluded.
         assert counts == [3]
+
+
+class TestANonsenseJobShapeIsRefused:
+    """Polish pass, 2026-08-28: `where -c -4` was answered, not refused.
+
+        $ nodetop where -c -4 --mem 2
+        │ 1 node, -4 CPU/node, 2 GiB RAM/node, 1:00:00 │
+        │ [RUN NOW]  caslake                          │
+
+    A request for negative four CPUs fits everywhere, so it reached 19 partitions
+    where a real request reaches 8, and the widest was called usable. `--mem`
+    already refused `-2` and named a good value; the four integer options were
+    bare `type=int`. All three sibling packages reject the analogous input --
+    `rapidu -t 0`, `slurmpast -n -1`, `slurmwatch --interval 0` -- each naming the
+    floor, so this was the outlier.
+    """
+
+    @pytest.mark.parametrize("argv,expect", [
+        (["where", "-c", "0", "--mem", "2"], "CPUs"),
+        (["where", "-c", "-4", "--mem", "2"], "CPUs"),
+        (["where", "-N", "0", "-c", "2", "--mem", "2"], "nodes"),
+        (["where", "-g", "-1", "-c", "2", "--mem", "2"], "accelerators"),
+        (["where", "--tasks-per-node", "0", "-c", "2", "--mem", "2"], "tasks"),
+    ])
+    def test_it_is_refused_and_the_floor_is_named(self, argv, expect, capsys):
+        parser = build_parser()
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(argv)
+        assert exc.value.code == 2
+        message = capsys.readouterr().err
+        assert expect in message, message
+        assert "is not a job that can run" in message, message
+
+    @pytest.mark.parametrize("argv", [
+        ["where", "-c", "1", "--mem", "2"],
+        ["where", "-g", "0", "-c", "2", "--mem", "2"],
+        ["where", "-N", "1", "-c", "2", "--mem", "2"],
+        ["where", "--tasks-per-node", "1", "-c", "2", "--mem", "2"],
+    ])
+    def test_the_smallest_real_request_is_still_accepted(self, argv):
+        """The control: the floors must be floors, not off-by-one exclusions.
+
+        `-g 0` is the default and means "no accelerator", so zero is legal there
+        and only there -- a fact worth pinning, since giving every option the same
+        floor would silently forbid the commonest request in the tool.
+        """
+        args = build_parser().parse_args(argv)
+        assert args.cpus >= 1 and args.nodes >= 1 and args.tasks_per_node >= 1
+        assert args.gpus >= 0
+
+    def test_a_non_integer_still_says_what_was_wanted(self, capsys):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["where", "-c", "abc", "--mem", "2"])
+        message = capsys.readouterr().err
+        assert "whole number of CPUs" in message, message
+
+
+class TestAnEmptyNameIsNotAName:
+    """Polish pass, 2026-08-28: `-q ''` reported the whole cluster.
+
+    An empty value came from somewhere, and almost always from `-q "$PART"` or
+    `-A "$ACCT"` in a script where the variable is unset. Each was accepted and
+    silently reinterpreted as "not given":
+
+        where -q ''    -> every partition, where one was asked for
+        where -A ''    -> all your accounts probed, where one was named
+
+    `-A nosuchacct` already yields nothing, correctly. It was only the empty
+    spelling that fell through — the spelling a shell produces by accident.
+    """
+
+    @pytest.mark.parametrize("argv,noun", [
+        (["where", "-q", "", "-c", "2", "--mem", "2"], "queue"),
+        (["where", "-A", "", "-c", "2", "--mem", "2"], "account"),
+        (["where", "--qos", "", "-c", "2", "--mem", "2"], "QOS"),
+        (["check", "-q", ""], "queue"),
+        (["check", "-A", ""], "account"),
+        (["queues", "-q", ""], "queue"),
+        (["where", "-q", "   ", "-c", "2", "--mem", "2"], "queue"),
+    ])
+    def test_an_empty_or_blank_name_is_refused(self, argv, noun, capsys):
+        parser = build_parser()
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(argv)
+        assert exc.value.code == 2
+        message = capsys.readouterr().err
+        assert f"an empty {noun} is not a {noun}" in message, message
+        # And it names both ways out, since either may be what was meant.
+        assert "drop the flag" in message and "variable" in message
+
+    @pytest.mark.parametrize("argv", [
+        ["where", "-q", "amd", "-c", "2", "--mem", "2"],
+        ["where", "-A", "rcc-staff", "-c", "2", "--mem", "2"],
+        ["where", "--qos", "normal", "-c", "2", "--mem", "2"],
+        ["where", "-c", "2", "--mem", "2"],
+    ])
+    def test_a_real_name_and_an_absent_flag_both_still_work(self, argv):
+        """The control: omitting the flag must stay the way to say "any".
+
+        The fix would be worse than the defect if it forced a value on anyone who
+        simply did not want to filter.
+        """
+        args = build_parser().parse_args(argv)
+        assert args.queue in ("", "amd")
+
+    def test_a_list_flag_is_left_alone(self):
+        """Only single-value names are policed.
+
+        `--accounts ''` and `--needs ''` are LISTS, where empty coherently means
+        "no entries" — reading that as an error would refuse a request that makes
+        sense.
+        """
+        args = build_parser().parse_args(
+            ["where", "--accounts", "", "--needs", "", "-c", "2", "--mem", "2"]
+        )
+        assert args.accounts == "" and args.needs == ""

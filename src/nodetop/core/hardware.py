@@ -39,6 +39,7 @@ __all__ = [
     "ACCELERATORS",
     "AcceleratorSpec",
     "identify_accelerator",
+    "name_accelerator",
     "supports",
 ]
 
@@ -90,6 +91,33 @@ def _nv(model, arch, mem, **kw) -> AcceleratorSpec:
 
 
 _SPECS: tuple[AcceleratorSpec, ...] = (
+    # -- NVIDIA, pre-Ampere -------------------------------------------------
+    # Old parts are not out of scope, and leaving them out is not the
+    # conservative choice it looks like.  On a 1,614-node cluster **232 of 384
+    # GPUs -- 60% -- rendered as `UNKNOWN`**, more than the V100s, K80s and
+    # P100s put together, because eight tokens the scheduler names in node
+    # features were missing from this table.  Three of the eight are Tesla
+    # datacentre parts from the same product line as the K80 just below, so
+    # "consumer cards are out of scope" did not explain the gap either.
+    #
+    # Every one of these is pre-Ampere, so `_nv` derives bf16/tf32/fp8/flash as
+    # False from the compute capability -- which is the answer, not a guess.
+    # The alternative was worse than a wrong label: an unidentified card is
+    # counted in NO capability row, so a survey printed `bf16 0/384` off a
+    # denominator that was 60% unknown.  That was right on this cluster by
+    # luck; one A100 behind an unrecognised token makes it false and identical.
+    _nv("M2090", "sm_20", 6, aliases=("m2090", "teslam2090")),
+    _nv("K20M", "sm_35", 5, aliases=("k20m", "k20", "teslak20m", "teslak20")),
+    _nv("K40M", "sm_35", 12, aliases=("k40m", "k40", "k40c", "teslak40m", "teslak40")),
+    _nv("GTX780", "sm_35", 3, aliases=("gtx780", "geforcegtx780")),
+    _nv("GTXTITANX", "sm_52", 12, aliases=("gtxtitanx", "titanx", "geforcegtxtitanx")),
+    _nv("GTX1080", "sm_61", 8, aliases=("gtx1080", "geforcegtx1080")),
+    _nv("GTX1080TI", "sm_61", 11, aliases=("gtx1080ti", "geforcegtx1080ti")),
+    # Volta, so sm_70 -- same architecture as the V100 beside it, and like the
+    # V100 it has no bf16.  The hyphen is why `_normalise` strips separators:
+    # this token arrives as `titan-v` on one cluster and `titanv` on the next.
+    _nv("TITANV", "sm_70", 12, aliases=("titanv", "titan-v", "nvidiatitanv")),
+    _nv("RTX2080TI", "sm_75", 11, aliases=("rtx2080ti", "geforcertx2080ti", "2080ti")),
     # -- NVIDIA -------------------------------------------------------------
     _nv("K80", "sm_37", 12, aliases=("k80", "teslak80")),
     _nv("P100", "sm_60", 16, aliases=("p100", "teslap100")),
@@ -251,6 +279,108 @@ def identify_accelerator(
             if len(alias) >= 3 and alias in flat:
                 return spec
     return None
+
+
+#: Tokens that NAME a vendor accelerator product, for a card the vocabulary
+#: above cannot identify.
+#:
+#: Used for one thing only: printing a name instead of ``UNKNOWN``.  No
+#: capability, memory or architecture is ever derived from a match --
+#: `identify_accelerator` still returns ``None``, so the row still reads `arch
+#: -`, `mem -`, `bf16 unknown`, and the card is still counted in no capability
+#: claim.  `rtx2080ti` tells a reader everything about the node; `UNKNOWN` tells
+#: them nothing and hides the fact that the scheduler DID say what the card is.
+#:
+#: **An explicit vendor or family prefix is required.**  A first version also
+#: accepted bare part-number shapes (`[aklpt]\d{1,3}`, `m\d{2,4}` and friends),
+#: which is how a node feature list is actually written and therefore full of
+#: false positives: `p9` and `p8` are POWER9/POWER8, a standard feature on every
+#: POWER+V100 cluster; `m1024`/`m2048` are memory sizes; `a64` is an
+#: architecture; `t2`, `k10`, `b100` are ordinary site labels.  Worse, none of
+#: those carries a family prefix, so on `p9,ib,<unknown-gpu>,gpu` the first
+#: match won and `cmd_accelerators` grouped the GPUs under a model called `p9`.
+#:
+#: A wrong name is worse than the shrug it replaces, so the shape test is gone
+#: and only a token that says whose product it is qualifies.  That is the same
+#: discipline `_VENDOR_MARKER` already applies to substring matching, and it
+#: costs nothing here: every token this fallback would have caught by shape is
+#: now in the vocabulary above.
+_GPU_NAME_SHAPED = re.compile(
+    r"""^(?:
+        (?:nvidia|geforce|gtx|rtx|quadro|titan|tesla)[a-z0-9]{1,12}
+      | (?:radeon|instinct|firepro)[a-z0-9]{1,12}
+      | gaudi\d*
+      | mi\d{2,3}x?
+    )$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+#: A driver or firmware version, which is not a card.
+#:
+#: ``nvidia_driver_535`` satisfies :data:`_GPU_NAME_SHAPED` exactly -- an
+#: ``nvidia`` prefix followed by twelve or fewer alphanumerics, once
+#: :func:`_normalise` has taken the underscores out -- so it became a model row
+#: in ``nodetop accelerators``.  Worse on a node that carries both:
+#: ``nvidia-driver-470,a100`` answered ``nvidia-driver-470``, because the driver
+#: label came first in the label list and both are "named family" tokens.
+#:
+#: Requiring a vendor prefix was the right narrowing and it does not reach this,
+#: because the driver label genuinely has one.  A driver version is a real fact
+#: about the node and it is not what the card is called, so it is refused here
+#: rather than promoted to a product name.  Tested against the NORMALISED value,
+#: since that is where the punctuation between the words has gone.  (``driver``
+#: is the form measured; ``firmware`` is the same class and costs nothing.)
+_DRIVER_LABEL = re.compile(r"(driver|firmware)", re.IGNORECASE)
+
+#: Prefixes that name a vendor product outright.  Every alternative in
+#: :data:`_GPU_NAME_SHAPED` now carries one, so this only orders the candidates.
+_NAMED_FAMILY = re.compile(
+    r"^(nvidia|geforce|gtx|rtx|quadro|titan|tesla|radeon|instinct|firepro|gaudi|mi\d)",
+    re.IGNORECASE,
+)
+
+
+def name_accelerator(
+    resource: str | None = None,
+    labels: str | list[str] | None = None,
+) -> str | None:
+    """The label that NAMES this node's accelerator, vocabulary or not.
+
+    Companion to :func:`identify_accelerator`, and deliberately separate from
+    it: that function answers "what can this card do", and must return ``None``
+    rather than guess.  This one answers "what did the scheduler call it", which
+    is a fact the node record already carries and which a report has no reason
+    to throw away.
+
+    Returns ``None`` when nothing in the labels is shaped like a product name.
+    """
+    if resource:
+        for entry in resource.split(","):
+            parts = entry.strip().replace("=", ":").split(":")
+            # A typed resource names the model in its second field, and there
+            # it needs no shape test: the scheduler has already said the field
+            # is a GPU type.
+            if len(parts) >= 3 and parts[0].lower() in {"gpu", "gres/gpu"} and parts[1]:
+                return parts[1]
+    if not labels:
+        return None
+    tokens = labels.split(",") if isinstance(labels, str) else list(labels)
+    shaped: list[str] = []
+    for raw in tokens:
+        token = raw.strip()
+        if not token or _NON_ACCELERATOR_LABEL.match(token):
+            continue
+        value = token.split("=", 1)[1] if "=" in token else token
+        flat = _normalise(value)
+        if flat and _GPU_NAME_SHAPED.match(flat) and not _DRIVER_LABEL.search(flat):
+            shaped.append(value)
+    if not shaped:
+        return None
+    # A named family beats a bare part number: on a node labelled
+    # `...,rtx2080ti,gpu,l16b` both could in principle fit a shape, and only one
+    # of them is a GPU.
+    named = [v for v in shaped if _NAMED_FAMILY.match(_normalise(v))]
+    return (named or shaped)[0]
 
 
 def supports(spec: AcceleratorSpec | None, requirement: str) -> bool | None:

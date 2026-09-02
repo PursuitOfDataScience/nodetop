@@ -409,3 +409,124 @@ class TestPartialQuotaSetsAreRefused:
             "qconf -srqsl": (1, "", "no resource quota set list defined"),
         })
         assert SgeBackend(runner).load_limits() == {}
+
+
+class TestGridEngineMemoryUnitsAreCaseSensitive:
+    """`sge_types(5)`: lower case is DECIMAL, upper case is BINARY.
+
+    Grid Engine is the odd one out. Everywhere else in this package -- PBS's
+    ``gb``, LSF's ``G``, Kubernetes' ``Gi`` -- a suffix means one thing however
+    it is cased. Grid Engine's memory specifier makes case the *base*::
+
+        k = 1000        K = 1024
+        m = 1000^2      M = 1024^2
+        g = 1000^3      G = 1024^3
+        t = 1000^4      T = 1024^4
+
+    `_mem_to_mb` matched with `re.IGNORECASE` and then `.upper()`-ed the
+    suffix, so every lower-case size was read on the binary scale: 1024/1000
+    per prefix too high. That is 2.4% at ``k`` and 7.4% at ``g`` -- too small
+    to look like a bug and too big to ignore, because it lands on
+    `Node.memory_mb` AND `Node.memory_alloc_mb`, and
+    ``memory_free_mb = memory_mb - memory_alloc_mb`` inherits the same 7.4%.
+    Overstated free memory is the direction that promises room that is not
+    there; it is the same failure mode as the PBS ``w`` defect, one order of
+    magnitude quieter.
+
+    ``qhost`` only ever prints the upper-case binary forms, which is why the
+    recorded fixture never caught this -- and why the control below matters
+    more than the fix: every value the function already got right has to come
+    out bit-identical.
+    """
+
+    #: value -> MB, with the arithmetic written out. MB is MiB throughout.
+    DECIMAL = [
+        # `1k` is 1000 bytes and `1g` is 10^9; expressed in MiB and truncated.
+        ("1048576k", 1000, "1048576 * 1000 B = 1000 MiB exactly (as K: 1024)"),
+        ("2097152k", 2000, "2 * the above"),
+        ("1000m", 953, "1000 * 10^6 B = 953.67 MiB (as M: 1000)"),
+        ("1g", 953, "10^9 B = 953.67 MiB (as G: 1024)"),
+        ("64g", 61035, "64 * 10^9 B (as G: 65536 -- 7.4% high)"),
+        ("512g", 488281, "512 * 10^9 B (as G: 524288)"),
+        ("1t", 953674, "10^12 B (as T: 1048576)"),
+    ]
+
+    #: Every form `_mem_to_mb` already answered correctly. CONTROL: these are
+    #: identical before and after the fix, to the exact integer.
+    BINARY = [
+        ("1K", 0), ("1024K", 1), ("1M", 1), ("2016M", 2016),
+        ("1G", 1024), ("64G", 65536), ("512G", 524288),
+        ("251.6G", 257638), ("12.4G", 12697), ("503.7G", 515788),
+        ("4.0G", 4096), ("0.0G", 0),
+        ("1T", 1048576), ("2T", 2097152),
+        ("1024", 0), ("1048576", 1), ("0", 0),
+    ]
+
+    @pytest.mark.parametrize("text,mb,note", DECIMAL)
+    def test_lower_case_is_decimal(self, text, mb, note):
+        from nodetop.backends.sge import _mem_to_mb
+
+        assert _mem_to_mb(text) == mb, note
+
+    @pytest.mark.parametrize("text,mb", BINARY)
+    def test_control_every_upper_case_and_bare_form_keeps_its_exact_value(self, text, mb):
+        # Holds in BOTH states. `qhost` emits only these, so this is the set
+        # that must not move by a single MB.
+        from nodetop.backends.sge import _mem_to_mb
+
+        assert _mem_to_mb(text) == mb
+
+    def test_the_two_bases_differ_by_exactly_the_documented_ratio(self):
+        from nodetop.backends.sge import _mem_to_mb
+
+        # 512 * 1024^3 / (512 * 1000^3) = 1.073741824
+        assert _mem_to_mb("512G") / _mem_to_mb("512g") == pytest.approx(1.073741824, rel=1e-5)
+
+    def test_control_the_recorded_fixture_totals_are_unchanged(self, sge_backend):
+        got = {n.name: (n.memory_mb, n.memory_alloc_mb) for n in sge_backend.load_nodes()}
+        assert got == {
+            "node001": (257638, 12697),
+            "node002": (257638, 204800),
+            "node003": (257638, 0),
+            "node004": (515788, 20480),
+        }
+
+    @pytest.mark.parametrize("text", [
+        "1P", "1p",       # no Grid Engine flavour documents a P multiplier
+        "1Gw", "1gw",     # `w` (words) is PBS vocabulary, not Grid Engine's
+        "1gb", "1GB",     # so is the `b` half of a PBS suffix
+        "1Gi",            # `Gi` is Kubernetes'
+        "infinity",       # what qhost prints for DBL_MAX
+        "-", "", "  ",    # what qhost prints for a host it could not reach
+        "1.2.3.4G", "251.6.1G", ".", "1..2",   # used to raise ValueError
+    ])
+    def test_a_shape_outside_grid_engines_vocabulary_reads_as_unknown(self, text):
+        # 0 is this package's "not read" -- `hardware_ok` gates on
+        # `memory_mb > 0`. `1P` used to come back as 1 PiB from one byte, and
+        # the multi-dot shapes raised `ValueError` out of `float`.
+        from nodetop.backends.sge import _mem_to_mb
+
+        assert _mem_to_mb(text) == 0
+
+    def test_one_malformed_memory_field_does_not_empty_the_node_listing(self):
+        # `[\d.]+` matched `1.2.3.4` and `float` raised through parse_nodes,
+        # so a single bad field cost every node -- reported downstream as
+        # "wrong backend, or the control plane is down".
+        from nodetop.backends.sge import SgeBackend
+
+        qhost = (
+            "HOSTNAME                ARCH         NCPU NSOC NCOR NTHR  LOAD  MEMTOT  MEMUSE"
+            "  SWAPTO  SWAPUS\n"
+            "------------------------------------------------------------------------------"
+            "----------------\n"
+            "good-01                 lx-amd64       32    2   16   32  0.05  251.6G   12.4G"
+            "    4.0G    0.0G\n"
+            "   all.q                BIP   0/2/32\n"
+            "bad-01                  lx-amd64       32    2   16   32  0.05 1.2.3.4G  12.4G"
+            "    4.0G    0.0G\n"
+            "   all.q                BIP   0/2/32\n"
+        )
+        nodes = {n.name: n for n in SgeBackend().parse_nodes(qhost)}
+        assert sorted(nodes) == ["bad-01", "good-01"]
+        assert nodes["good-01"].memory_mb == 257638
+        assert nodes["bad-01"].memory_mb == 0

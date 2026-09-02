@@ -33,7 +33,7 @@ import re
 from collections.abc import Iterable
 from datetime import datetime
 
-from ..core.hardware import identify_accelerator
+from ..core.hardware import identify_accelerator, name_accelerator
 from ..core.model import (
     Identity,
     Job,
@@ -229,6 +229,8 @@ class KubernetesBackend:
                     gpus_total=gpus,
                     gpus_alloc=used_gpu.get(name, 0),
                     accelerator=identify_accelerator(gpu_resource, model_labels or None),
+                    accelerator_label=name_accelerator(
+                        gpu_resource, model_labels or None) or "",
                     labels=tuple(f"{k}={v}" for k, v in sorted(labels.items())),
                     # Every namespace can target every node, so the queue
                     # mapping is filled in by load_queues instead.
@@ -429,7 +431,27 @@ class KubernetesBackend:
     def submit_flags(self, queue: str, shape: JobShape) -> list[str]:
         req = [f"cpu={shape.cpus_per_node}"]
         if shape.memory_gb:
-            req.append(f"memory={int(shape.memory_gb)}Gi")
+            # Derived from `memory_mb_per_node`, not `int(shape.memory_gb)`.
+            # `--mem` takes a fractional size, and truncating gibibytes threw
+            # the remainder away *downwards*: 1.5 GiB became `memory=1Gi` and
+            # 0.5 GiB became **`memory=0Gi`**, a request for no memory at all.
+            #
+            # Worse here than in the other adapters, because these flags are
+            # not only pasted -- `probe()` feeds them to `kubectl run
+            # --dry-run=server`, which is the one dry-run in this package that
+            # really does evaluate a ResourceQuota. Asking admission about a
+            # figure up to a gibibyte under the shape gets a PASS for a pod
+            # that would then be refused, which is the exact "accepted, then
+            # never runs" failure this tool exists to catch.
+            #
+            # `Mi` only where `Gi` would lose something: `memory=64Gi` reads
+            # better than `memory=65536Mi` in a command about to be pasted, and
+            # both suffixes are ordinary Kubernetes quantities. Same rule as
+            # the PBS and Grid Engine adapters.
+            mb = shape.memory_mb_per_node
+            req.append(
+                f"memory={mb // 1024}Gi" if mb % 1024 == 0 else f"memory={mb}Mi"
+            )
         if shape.gpus_per_node:
             req.append(f"nvidia.com/gpu={shape.gpus_per_node}")
         return [

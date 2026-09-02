@@ -44,8 +44,25 @@ class Placement:
     accelerator_models: dict[str, int] = field(default_factory=dict)
     #: Facts a decision here rests on that are inferences, not measurements.
     caveats: list[str] = field(default_factory=list)
-    #: True when the backend has no dry-run, so entitlement is declared only.
+    #: True when the control plane did not settle entitlement here -- for ANY
+    #: reason: the backend has no dry-run, this is a replay, the probe was not
+    #: run, the budget ran out, or it ran and answered something transient.
+    #:
+    #: It used to mean only the first of those, read straight off the recorded
+    #: capabilities, and a replay restores `probe=True` from the live run it was
+    #: recorded on.  So on a snapshot taken seconds earlier, 21 partitions the
+    #: live run had MEASURED as refusing this user came back `verdict: null`,
+    #: `confirmed: false`, `entitlement_unconfirmed: false`, `blockers: []`,
+    #: `caveats: []` -- with a ready-to-paste `submit_flags` list.  Three states
+    #: are representable (confirmed yes, confirmed no, unconfirmed) and the
+    #: replay used none of them; the one field whose job is to carry the hedge
+    #: said there was nothing to hedge.
     entitlement_unconfirmed: bool = False
+    #: ``(dry-runs fired for this queue, candidates there were)``.  ``(0, n)``
+    #: with ``n`` non-zero means probing WAS asked for and the global budget was
+    #: gone before this queue's turn -- a different fact from "no dry-run was
+    #: requested", and one the reader can act on by naming fewer queues.
+    probes: tuple[int, int] = (0, 0)
     #: The instant the snapshot describes, against which a predicted start is
     #: judged near or far.  ``None`` falls back to the wall clock, which is the
     #: same thing outside a replay.
@@ -236,8 +253,17 @@ def evaluate(
             )
         )
 
+    # Assessed BEFORE the probe, because it decides whether to spend one. Pure
+    # arithmetic over nodes already in the snapshot -- no round trip -- so the
+    # only thing moving it up costs is this comment.
+    capacity = assess_capacity(
+        queue.nodes, shape, cluster.node_free_times,
+        # Judge "not enough nodes here, ever" only when we believe we have seen
+        # the queue's nodes.
+        count_is_complete=not queue.unresolved_nodes,
+    )
+
     verdict: Verdict | None = None
-    caps = cluster.capabilities
     # A queue that accepts nothing from anybody cannot be talked round by a
     # dry-run, and asking costs a round trip -- the most expensive thing this
     # tool does. `reachable` is already False the moment a fatal blocker
@@ -258,12 +284,71 @@ def evaluate(
     # partitions before ranking sees them. It pays where those filters step
     # aside: `--all`, and a queue named explicitly. Free either way, since the
     # blockers are computed above regardless.
+    probes = (0, 0)
     dead = [b for b in blockers if b.fatal and b.code in _OPERATIONAL_BLOCKERS]
-    if use_probe and caps is not None and caps.probe and not dead:
+    # ...and neither can a queue whose hardware could never host this shape,
+    # which is the same argument one step further out: `Capacity.ever_possible`
+    # is False when no node here has the right kind of hardware, or when the
+    # queue does not contain enough of them. No entitlement answer changes that,
+    # and the row already says WRONG HW or TOO FEW.
+    #
+    # This is where the round trips actually were. Measured on an 87-partition
+    # cluster, `where -c 64 --mem 200`: **52 of 87 queues are
+    # hardware_incompatible and a probe had been spent on every one**, 130
+    # probes and 11.5s for a question whose answer was arithmetic. `-N 8 -c 32
+    # --mem 100` took 24s. `rank` already declines to probe a queue with no
+    # accelerator when one is asked for, and this is that rule stated in terms
+    # of the shape rather than of one resource.
+    # ...but only where the hardware is KNOWN not to fit.
+    #
+    # `ever_possible` is False the moment `hardware_nodes` is empty, and
+    # `assess_capacity` routes a node whose accelerator model is out of
+    # vocabulary into `unverified_nodes` rather than into `hardware`. So an
+    # unidentifiable GPU read as an incapable one, and this gate then withheld
+    # the dry-run as well: on the cluster the findings file is from, where **232
+    # of 384 GPUs are UNKNOWN**, `where --gpus 1 --gpu-mem 40` would have
+    # reported every GPU partition as wrong-hardware having asked the controller
+    # nothing. Invisible on the cluster this was written on, where all 230
+    # resolve -- which is exactly why it is checked here rather than trusted.
+    #
+    # That contradicts a rule this codebase states twice, in `node_fits`
+    # ("unknown" is not "incapable") and on `Capacity.unverified_nodes` (not
+    # incapable, just unverifiable), and the second clause honours the third
+    # statement of it: `count_is_complete=False` exists so that a queue whose
+    # node list did not resolve is never ruled out on the strength of a
+    # resolution failure, and a short-circuit on empty `hardware_nodes` defeated
+    # it.
+    #
+    # Costs nothing where the hardware IS known: measured over all 87 partitions
+    # here, the skipped count is identical with and without these two clauses for
+    # every shape tried (52, 70, 0 and 70 respectively).
+    impossible = (
+        capacity is not None
+        and not capacity.ever_possible
+        and not capacity.unverified_nodes
+        and not queue.unresolved_nodes
+    )
+    # `cluster.can_probe`, not `caps.probe`: the capabilities are part of the
+    # recording, so on a replay they say a dry-run is available while
+    # `Cluster.probe` correctly refuses to invent one. Asking anyway spent a
+    # probe budget on calls that returned None before they left the process.
+    if use_probe and cluster.can_probe and not dead and not impossible:
         budget = budget if budget is not None else ProbeBudget()
         verdict, tried, of = probe_queue(
             cluster, queue, queue.name, shape, accounts, budget
         )
+        probes = (tried, of)
+        if of and not tried:
+            # The budget ran out before this queue's turn. Recorded and said,
+            # not silently indistinguishable from a queue nobody asked about:
+            # on an 84-partition cluster with 6 accounts an exhaustive sweep is
+            # 504 dry-runs against a 150 ceiling, so this is the ordinary case
+            # there rather than an edge one -- and the remedy is a flag away.
+            caveats.append(
+                f"the dry-run budget ({MAX_PROBES_TOTAL} for the whole "
+                f"question) ran out before this queue was asked -- name fewer "
+                f"queues with -q to spend it here"
+            )
         settled = unsettled(verdict, tried, of)
         if settled is not verdict:
             verdict = settled
@@ -297,6 +382,39 @@ def evaluate(
                 "refused with no account named, because your associations "
                 "could not be read -- name one with -A to settle it"
             )
+        elif (
+            verdict is not None
+            and not verdict.allowed
+            and verdict.category in _SETTLEABLE_BY_FLAG
+        ):
+            # Two categories a reader can act on, and both used to be silent.
+            #
+            # `ACCOUNTS_UNTRIED` has said "name one with -A to settle it" for
+            # some time, and it is the reason three partitions stopped being
+            # hidden. `INVALID_QOS` and `ACCOUNT_MISMATCH` are the same shape
+            # of answer -- the control plane refused the ENVELOPE, not the job
+            # -- and carried no caveat, no hint and, until now, no flag to
+            # point at. On one cluster `INVALID_QOS` was the single largest
+            # group of unsettled answers, 16 of 25, on partitions that started
+            # a job immediately once the right QOS was named.
+            #
+            # LAST in this chain, deliberately. It first sat above the
+            # identity-error branch, and two of the categories it names --
+            # `ACCOUNT_MISMATCH` and `NO_ACCOUNT` -- are exactly the ones that
+            # branch exists to reclassify. So a refusal obtained after
+            # `sacctmgr` had died stopped being downgraded to
+            # `ACCOUNTS_UNTRIED`, stayed durable, and the queue was dropped
+            # from `where`: one failed association query turned back into "you
+            # have access to nothing", which is the finding that branch was
+            # written for. A hint is worth less than a correct verdict, so the
+            # hint goes last.
+            flag, what = _SETTLEABLE_BY_FLAG[verdict.category]
+            caveats.append(
+                f"the control plane refused the {what}, not the job -- "
+                f"name one with {flag} to settle it"
+                + (f" (tried {verdict.effective_qos})"
+                   if verdict.effective_qos else "")
+            )
 
     # Ceilings, against the limit set the control plane would actually apply.
     limits = _limits_for(cluster, queue, shape, verdict)
@@ -312,13 +430,6 @@ def evaluate(
                 f"{'that ceiling was' if len(limits.unreadable) == 1 else 'those ceilings were'} "
                 f"not checked at all"
             )
-
-    capacity = assess_capacity(
-        queue.nodes, shape, cluster.node_free_times,
-        # Judge "not enough nodes here, ever" only when we believe we have seen
-        # the queue's nodes.
-        count_is_complete=not queue.unresolved_nodes,
-    )
 
     if shape.gpu_memory_gb and any(
         n.accelerator is not None and not n.accelerator.memory_certain
@@ -348,7 +459,23 @@ def evaluate(
             f"the {len(queue.nodes)} we can see"
         )
 
-    unconfirmed = not (caps and caps.probe)
+    # Settled only by a DURABLE answer from the control plane. Everything else
+    # -- no verdict at all, or a transient one -- is "we do not know", which is
+    # what this flag is for.
+    unconfirmed = verdict is None or not verdict.durable
+    if verdict is None and not (probes[1] and not probes[0]):
+        # A caveat, not just a boolean, because `submit_flags` is the part a
+        # reader copies and `caveats` was empty beside it. Only for the
+        # no-answer case: a transient verdict has already appended a caveat of
+        # its own naming what the control plane actually said.
+        # Deliberately NOT naming the queue: an identical sentence on every
+        # row is hoisted into one footnote, and interpolating the name would
+        # make each copy unique and print it once per queue.
+        caveats.append(
+            "entitlement is DECLARED here, read from the queue's own access "
+            "lists -- no dry-run answer was obtained, so a submission may "
+            "still be refused"
+        )
     return Placement(
         queue=queue.name,
         shape=shape,
@@ -358,6 +485,7 @@ def evaluate(
         accelerator_models=queue.accelerator_models,
         caveats=caveats,
         entitlement_unconfirmed=unconfirmed,
+        probes=probes,
         as_of=cluster.taken_at,
     )
 
@@ -461,6 +589,18 @@ class ProbeBudget:
             return candidates
         rank = {a: i for i, a in enumerate(known)}
         return sorted(candidates, key=lambda a: rank.get(a or "", len(rank)))
+
+
+#: category -> (the flag that settles it, what was refused).
+#:
+#: A refusal of the submission's ENVELOPE rather than of the job: naming a
+#: different account or QOS may well be accepted, so this is not a fact about
+#: the queue and the reader has something to do about it.
+_SETTLEABLE_BY_FLAG: dict[str, tuple[str, str]] = {
+    VerdictCategory.INVALID_QOS: ("--qos", "QOS"),
+    VerdictCategory.ACCOUNT_MISMATCH: ("-A", "account"),
+    VerdictCategory.NO_ACCOUNT: ("-A", "account"),
+}
 
 
 #: Blocker codes that mean "this queue accepts nothing from anyone".

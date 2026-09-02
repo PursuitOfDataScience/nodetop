@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from itertools import islice
 
-__all__ = ["collapse", "expand", "split_groups"]
+__all__ = ["MAX_EXPANSION", "collapse", "expand", "split_groups"]
 
 # A trailing numeric suffix, captured so we can group ``node-0007`` with
 # ``node-0008``.  The width matters: Slurm pads to a fixed width per group and
@@ -60,11 +61,40 @@ def split_groups(nodelist: str) -> list[str]:
     return [g.strip() for g in groups if g.strip()]
 
 
+# A pathological expression must not be able to eat memory. A real allocation is
+# thousands of nodes at the very top end, so this sits far above anything genuine
+# and exists only so a malformed or mistyped expression cannot hang the tool.
+#
+# It is needed because `--exclude` is USER input: `nodetop where --exclude
+# "n[1-100000000]"` built names until the process died (an uncaught MemoryError at
+# a 2 GiB ceiling), and the bracket sections MULTIPLY, so the reachable cost is far
+# worse than one long range. Measured before this bound:
+#
+#     n[1-1000000]                1,000,000 names   0.28 s
+#     u[1-2000]r[1-2000]          4,000,000 names   0.34 s
+#     a[1-200]b[1-200]c[1-200]    8,000,000 names   0.68 s
+#
+# Enforced *while* expanding rather than by trimming the finished list, which is
+# the part that matters: the finished list is the thing we cannot afford to build.
+# Both sibling packages settled on the same bound, one of them after measuring the
+# `u[1-2000]r[1-2000]` case at 325 MiB, and this module was the one without it.
+MAX_EXPANSION = 65536
+
+
 def _expand_range_body(body: str) -> list[str]:
     """Expand the inside of one bracket group: ``"1-3,7"`` -> 1,2,3,7.
 
-    Zero padding is preserved from the widest endpoint, matching Slurm: a
-    range written ``0001-0003`` yields ``0001 0002 0003``, not ``1 2 3``.
+    Zero padding is taken from the LOW endpoint as written, which is what Slurm
+    does: ``0001-0003`` yields ``0001 0002 0003`` rather than ``1 2 3``, and
+    ``1-10`` yields ``n1 ... n10`` rather than ``n01 ... n10``.
+
+    It used to pad to the *wider* endpoint, and that produced node names no
+    cluster has. ``n[1-10]`` came back as ``n01 ... n10`` -- checked against
+    `scontrol show hostnames`, which answers ``n1 n2 ... n10`` -- so a
+    hand-written ``--exclude n[1-10]`` excluded nothing, because ``n01`` is a
+    different name from ``n1``. Slurm's own output is always padded to a single
+    consistent width (``midway3-[0001-0005]``), where the two rules agree, which
+    is why only a nodelist a person typed could hit it.
     """
     out: list[str] = []
     for piece in body.split(","):
@@ -76,10 +106,14 @@ def _expand_range_body(body: str) -> list[str]:
             if not (lo_s.isdigit() and hi_s.isdigit()):
                 out.append(piece)
                 continue
-            width = max(len(lo_s), len(hi_s))
+            width = len(lo_s)
             lo, hi = int(lo_s), int(hi_s)
             if hi < lo:
                 lo, hi = hi, lo
+            room = MAX_EXPANSION - len(out)
+            if room <= 0:
+                break
+            hi = min(hi, lo + room - 1)
             out.extend(str(n).zfill(width) for n in range(lo, hi + 1))
         else:
             out.append(piece)
@@ -110,12 +144,14 @@ def expand(nodelist: str | None) -> list[str]:
     # 417 inputs including 400 generated ones with and without brackets, plus
     # the degenerate `a],b`, `[`, `a[1-2` and empty-segment cases.
     if "[" not in text:
-        return [part.strip() for part in text.split(",") if part.strip()]
+        return [part.strip() for part in text.split(",") if part.strip()][:MAX_EXPANSION]
 
     names: list[str] = []
     for group in split_groups(text):
+        if len(names) >= MAX_EXPANSION:
+            break
         names.extend(_expand_group(group))
-    return names
+    return names[:MAX_EXPANSION]
 
 
 def _expand_group(group: str) -> list[str]:
@@ -144,7 +180,15 @@ def _expand_group(group: str) -> list[str]:
 
     names = [""]
     for section in parts:
-        names = [prefix + piece for prefix in names for piece in section]
+        # `islice` over a generator, not a list comprehension with the bound applied
+        # afterwards. Slicing the finished product is the guard doing nothing about
+        # the case that needs it: `a[1-70000]b[1-70000]` builds 65,536 x 65,536 =
+        # 4.3 billion strings and dies before any trim runs. Measured both ways --
+        # the comprehension form still raised MemoryError at a 2 GiB ceiling in
+        # 2.18 s, this one returns the bound in 0.02 s.
+        names = list(
+            islice((prefix + piece for prefix in names for piece in section), MAX_EXPANSION)
+        )
     return names
 
 

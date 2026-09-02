@@ -116,9 +116,10 @@ class TestTheCommonPathStaysNarrow:
     def test_json_output_still_works_from_its_deferred_import(self):
         """The other half of deferring `json`: `--json` must still emit JSON.
 
-        All eleven `--json` paths go through one helper now, so this is the
-        whole contract -- and `default=str` is part of it, since only two of the
-        eleven used to pass it.
+        All eleven `--json` VIEWS go through one helper now, so this is the whole
+        contract for them -- and `default=str` is part of it, since only two of
+        the eleven used to pass it. `snapshot -o` serialises separately, to a file
+        and with its own indent; `DEFERRED` above names it for that reason.
         """
         import datetime
         import json

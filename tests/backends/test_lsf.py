@@ -307,3 +307,389 @@ class TestWrappedQueueValuesAreNotTruncated:
         names = {q.name: q for q in lsf_backend.load_queues()}
         assert names["gpu"].allow_users == ("alice", "bob", "carol")
         assert names["normal"].allow_users == ()
+
+
+BHOSTS_SUSPENDED = """\
+HOST_NAME          STATUS       JL/U    MAX  NJOBS    RUN  SSUSP  USUSP    RSV
+susp-01            ok              -     40     40      0     24     16      0
+resv-01            ok              -     40     32      2      0      0     30
+run-01             ok              -     40     16     16      0      0      0
+idle-01            ok              -     40      0      0      0      0      0
+"""
+
+BHOSTS_GPU_SUSPENDED = """\
+HOST_NAME     GPU_ID   MODEL          MUSED    MRSV  NJOBS    RUN   SUSP    RSV
+susp-01       0        NVIDIA_A100     30G      0M      1      0      1      0
+susp-01       1        NVIDIA_A100      0M      0M      0      0      0      0
+"""
+
+
+class TestSuspendedAndReservedSlotsAreNotFreeCapacity:
+    """`bhosts` NJOBS is the dispatched slots; RUN is only the executing ones.
+
+    LSF documents NJOBS as the slots used by every job dispatched to the host --
+    running, suspended AND reserved -- and a suspended job gives nothing back:
+    LSF keeps its slots, its memory and its GPUs and resumes it in place. Its
+    preemption SUSPENDS rather than requeues by default, so on a preempting
+    cluster this is the ordinary state of a busy host and not a corner case.
+
+    Occupancy was read from RUN, so every SSUSP, USUSP and RSV slot on the
+    cluster was reported as free capacity: a 40-slot host holding 40 preempted
+    slots read as **empty**. Capacity on the screen that no job can have is the
+    one failure this tool exists to catch.
+    """
+
+    def _nodes(self, bhosts: str = BHOSTS_SUSPENDED, gpu: str = ""):
+        parsed = LsfBackend(RecordedRunner({})).parse_nodes(bhosts, "", gpu)
+        return {n.name: n for n in parsed}
+
+    def test_a_fully_suspended_host_has_nothing_free(self):
+        n = self._nodes()["susp-01"]
+        assert (n.cpus_alloc, n.cpus_free) == (40, 0)
+
+    def test_reserved_slots_are_held_not_free(self):
+        # RSV is held by the scheduler for a pending job it is backfilling
+        # around; handing those slots out is how that job never starts.
+        n = self._nodes()["resv-01"]
+        assert (n.cpus_alloc, n.cpus_free) == (32, 8)
+
+    def test_a_suspended_job_still_holds_its_card(self):
+        # GPU 0 is SUSP with 30G still resident on it; GPU 1 is genuinely free.
+        n = self._nodes(gpu=BHOSTS_GPU_SUSPENDED)["susp-01"]
+        assert (n.gpus_total, n.gpus_alloc, n.gpus_free) == (2, 1, 1)
+
+    # -- controls: these hold before and after -----------------------------
+    def test_control_a_plainly_running_host_is_read_the_same(self):
+        n = self._nodes()["run-01"]
+        assert (n.cpus_alloc, n.cpus_free) == (16, 24)
+
+    def test_control_an_idle_host_is_still_wholly_idle(self):
+        n = self._nodes()["idle-01"]
+        assert (n.cpus_alloc, n.cpus_free) == (0, 40)
+
+    def test_control_the_recorded_fixture_is_unchanged(self, lsf_backend):
+        # Every SSUSP/USUSP/RSV in it is zero, so NJOBS == RUN throughout and
+        # the recorded cluster must read exactly as it did.
+        got = {n.name: n.cpus_alloc for n in lsf_backend.load_nodes()}
+        assert got == {"gpu-01": 0, "gpu-02": 40, "gpu-03": 0, "gpu-04": 0,
+                       "cpu-01": 128, "cpu-02": 16}
+
+
+BHOSTS_STATUSES = """\
+HOST_NAME          STATUS       JL/U    MAX  NJOBS    RUN  SSUSP  USUSP    RSV
+lim-01             closed_LIM      -     40      0      0      0      0      0
+wind-01            closed_Wind     -     40      0      0      0      0      0
+later-01           closed_Zorp     -     40      0      0      0      0      0
+busy-01            closed_Busy     -     40      8      8      0      0      0
+full-01            closed_Full     -     40     40     40      0      0      0
+ok-01              ok              -     40      0      0      0      0      0
+"""
+
+
+class TestAnUnrecognisedStatusDoesNotReadAsHealthy:
+    """A `bhosts` STATUS the table does not list must not read as `ok`.
+
+    The lookup was `_STATUS_TO_CONDITION.get(status)`, and `None` is the
+    table's word for *nothing wrong here* -- the answer it gives `ok`. So every
+    status not in it produced a healthy host advertising its whole complement as
+    free. `closed_LIM` (sbatchd unreachable) and `closed_Wind` (shut by its own
+    run window) are documented `bhosts -w` values and were both missing, and so
+    is anything a newer LSF or a site's wrapper prints: 40 phantom slots per
+    host, in the direction that gets a job sent to a machine that cannot run it.
+    """
+
+    def _nodes(self):
+        parsed = LsfBackend(RecordedRunner({})).parse_nodes(BHOSTS_STATUSES)
+        return {n.name: n for n in parsed}
+
+    def test_closed_lim_is_down(self):
+        n = self._nodes()["lim-01"]
+        assert n.schedulable is False
+        assert "DOWN" in n.conditions
+
+    def test_closed_wind_is_drained(self):
+        n = self._nodes()["wind-01"]
+        assert n.schedulable is False
+        assert "DRAIN" in n.conditions
+
+    def test_a_status_nobody_recognises_degrades_to_unknown(self):
+        n = self._nodes()["later-01"]
+        assert n.conditions == frozenset({"UNKNOWN"})
+        assert n.schedulable is False
+
+    def test_what_lsf_actually_said_is_still_visible(self):
+        # Degrading must not hide the evidence: the raw status is carried
+        # through so the reader can see the word the table did not know.
+        n = self._nodes()["later-01"]
+        assert n.state_raw == "closed_Zorp"
+        assert "closed_Zorp" in n.reason
+
+    # -- controls: these hold before and after -----------------------------
+    def test_control_closed_full_and_closed_busy_stay_schedulable(self):
+        # The two deliberate `None` entries: busy, not broken. A blanket
+        # "anything closed is out" would hide capacity that reappears the
+        # moment a job ends.
+        nodes = self._nodes()
+        assert nodes["full-01"].schedulable is True
+        assert nodes["busy-01"].schedulable is True
+        assert nodes["busy-01"].conditions == frozenset()
+
+    def test_control_ok_carries_no_condition_and_no_reason(self):
+        n = self._nodes()["ok-01"]
+        assert n.conditions == frozenset()
+        assert n.reason == ""
+
+    def test_control_the_recorded_fixture_keeps_its_verdicts(self, lsf_backend):
+        got = {n.name: sorted(n.conditions) for n in lsf_backend.load_nodes()}
+        assert got == {"gpu-01": [], "gpu-02": [], "gpu-03": ["DRAIN"],
+                       "gpu-04": ["DOWN"], "cpu-01": [], "cpu-02": []}
+
+
+#: A minimal `lshosts -w` / `bhosts -w` pair, so a size can be driven through
+#: the real parser rather than only through `_mem_to_mb`. `maxmem` is the
+#: caller under test; everything else is filler that parses.
+def _lsf_pair(maxmem: str) -> tuple[str, str]:
+    lshosts = (
+        "HOST_NAME      type    model            cpuf ncpus maxmem maxswp server RESOURCES\n"
+        f"c-01           X86_64  AMD_EPYC        55.0   128 {maxmem}    16G      Yes (mg)\n"
+    )
+    bhosts = (
+        "HOST_NAME            STATUS  JL/U  MAX  NJOBS  RUN SSUSP USUSP  RSV\n"
+        "c-01                 ok         -  128      0    0     0     0    0\n"
+    )
+    return bhosts, lshosts
+
+
+class TestLsfMemorySizes:
+    """LSF's suffixes are binary and case-blind; its BARE number is a setting.
+
+    Nothing here changes a number LSF actually prints -- every suffixed form
+    keeps its exact value, and that is the control the rest of this class is
+    measured against. LSF is the ordinary convention, unlike `sge._mem_to_mb`
+    where case selects decimal vs binary.
+
+    A bare size is the one that moved. It has no unit in the string at all:
+    LSF takes it from ``LSF_UNIT_FOR_LIMITS`` in ``lsf.conf`` (MB by default
+    in 10.1, ``KB`` in older releases, and ``GB`` at plenty of sites).
+    `_mem_to_mb` used to assume MB, which on a ``KB`` site overstates a host's
+    memory by **1024x** -- the largest wrong answer this backend can produce,
+    and in the phantom-capacity direction. The assumption was kept last round
+    as unexercised, because ``lshosts``'s ``maxmem`` "always" prints a suffix;
+    that is an inference from IBM's example output rather than anything the
+    ``lshosts`` reference guarantees, and it is not a claim worth 1024x. So
+    the unit is now read from ``lsf.conf`` where that is possible, and
+    otherwise the answer is 0 = "not read", which `capacity.hardware_ok`
+    already handles by gating on ``memory_mb > 0``.
+
+    Also fixed earlier and still pinned: ``[\\d.]+`` accepted a multi-dot
+    string that `float` then refused, raising `ValueError` out of
+    `LsfBackend.parse_nodes` and taking every node with it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_site_unit_from_this_host(self, tmp_path, monkeypatch):
+        """No test in this class reads the real ``lsf.conf``, wherever it runs.
+
+        `_site_unit_mb` looks in ``$LSF_ENVDIR`` and then ``/etc/lsf.conf``,
+        which is right for the product and would make every "unknown unit"
+        assertion here depend on whether the host has LSF installed -- the
+        non-hermetic suite `conftest._detect_finds_a_recorded_backend`
+        describes. `raising=False` on both, so this is a no-op against a build
+        that has neither name and the controls stay state-independent.
+        """
+        monkeypatch.delenv("LSF_ENVDIR", raising=False)
+        monkeypatch.setattr(
+            "nodetop.backends.lsf._LSF_CONF_FALLBACK",
+            str(tmp_path / "no-such-dir" / "lsf.conf"),
+            raising=False,
+        )
+
+    #: CONTROL: every SUFFIXED form, exact. None of these consults the site
+    #: unit -- a suffix says what it means -- so every entry holds both before
+    #: and after the bare-number change, which is what makes it the control.
+    KNOWN_GOOD = [
+        ("256G", 262144), ("512G", 524288), ("2016M", 2016),
+        ("15.9G", 16281), ("1K", 0), ("1024K", 1), ("1000000 K", 976),
+        ("1T", 1048576), ("1P", 1073741824),
+        ("1M", 1), ("16G", 16384),
+        ("512g", 524288), ("256g", 262144),   # LSF has no case distinction
+    ]
+
+    @pytest.mark.parametrize("text,mb", KNOWN_GOOD)
+    def test_control_every_readable_size_keeps_its_exact_value(self, text, mb):
+        from nodetop.backends.lsf import _mem_to_mb
+
+        assert _mem_to_mb(text) == mb
+
+    @pytest.mark.parametrize("text,mb", KNOWN_GOOD)
+    def test_control_a_suffix_outranks_the_site_unit(self, text, mb, tmp_path, monkeypatch):
+        """CONTROL, and the one that matters: ``256G`` is 256 GiB on every site.
+
+        ``LSF_UNIT_FOR_LIMITS`` scales the sizes LSF prints *without* a letter.
+        A suffixed size is already explicit, so the setting must not touch it.
+        Deliberately state-independent: this holds under the old code (which
+        never looked at ``lsf.conf``) and under the new (which does), so a
+        bare-number fix that leaked into the suffixed branch fails here.
+        """
+        from nodetop.backends.lsf import LsfBackend, _mem_to_mb
+
+        (tmp_path / "lsf.conf").write_text("LSF_UNIT_FOR_LIMITS=KB\n")
+        monkeypatch.setenv("LSF_ENVDIR", str(tmp_path))
+        assert _mem_to_mb(text) == mb
+        if " " not in text:
+            # Space-free forms only, and the exclusion is load-bearing: a
+            # positional `lshosts` column cannot hold a space, so `1000000 K`
+            # is a `_mem_to_mb`-level form rather than a cell. Fed to
+            # `parse_nodes` it splits in two, `maxmem` reads as bare `1000000`,
+            # and on this KB site that lands on 976 by arithmetic accident --
+            # a control that agrees with the fix for the wrong reason, and it
+            # was the teeth that showed it up.
+            node = LsfBackend().parse_nodes(*_lsf_pair(text))[0]
+            assert node.memory_mb == mb
+
+    def test_control_the_recorded_fixture_keeps_its_memory_figures(self, lsf_backend):
+        """CONTROL: the recorded `lshosts` is all suffixed, so nothing moves.
+
+        Resolving the site unit added file access to `parse_nodes`; this pins
+        that the recorded path is unaffected by it either way.
+        """
+        got = {n.name: n.memory_mb for n in lsf_backend.load_nodes()}
+        assert got == {"gpu-01": 524288, "gpu-02": 524288, "gpu-03": 524288,
+                       "gpu-04": 524288, "cpu-01": 262144, "cpu-02": 262144}
+
+    @pytest.mark.parametrize("bare", ["2048", "1", "1000000", "0"])
+    def test_a_bare_size_with_no_readable_site_unit_is_not_read(self, bare, monkeypatch):
+        """A bare number whose unit nobody can look up answers 0, not MB.
+
+        This is the 1024x assumption. ``LSF_UNIT_FOR_LIMITS`` is cluster-wide
+        and lives in ``lsf.conf``; with no ``LSF_ENVDIR`` and no
+        ``/etc/lsf.conf`` there is nothing to read it from, and "MB" would be a
+        guess that is 1024x wrong on a ``KB`` site. 0 is this package's "not
+        read" -- `hardware_ok` gates on ``memory_mb > 0``.
+        """
+        from nodetop.backends.lsf import LsfBackend, _mem_to_mb
+
+        monkeypatch.delenv("LSF_ENVDIR", raising=False)
+        monkeypatch.setattr("nodetop.backends.lsf._site_unit_mb", lambda: None)
+        assert _mem_to_mb(bare) == 0
+        # And through the real caller: the host still appears, memory unread.
+        node = LsfBackend().parse_nodes(*_lsf_pair(bare))[0]
+        assert node.name == "c-01"
+        assert node.cpus_total == 128
+        assert node.memory_mb == 0
+
+    @pytest.mark.parametrize("unit,mb", [
+        ("KB", 2), ("MB", 2048), ("GB", 2048 * 1024), ("TB", 2048 * 1024 * 1024),
+    ])
+    def test_a_bare_size_reads_its_unit_from_lsf_conf(self, unit, mb, tmp_path, monkeypatch):
+        """Where the site setting IS readable, the bare number is read right.
+
+        LSF finds ``lsf.conf`` via ``$LSF_ENVDIR`` (else the ``/etc/lsf.conf``
+        symlink), so any client that could run ``lshosts`` had one -- which is
+        why looking it up beats answering 0 everywhere. The 1024x spread
+        between these rows is the size of the assumption being removed.
+        """
+        from nodetop.backends.lsf import LsfBackend
+
+        (tmp_path / "lsf.conf").write_text(
+            f"LSB_SHAREDIR=/x/work\nLSF_UNIT_FOR_LIMITS={unit}\n"
+        )
+        monkeypatch.setenv("LSF_ENVDIR", str(tmp_path))
+        assert LsfBackend().parse_nodes(*_lsf_pair("2048"))[0].memory_mb == mb
+
+    def test_a_commented_out_setting_is_not_a_setting(self, tmp_path, monkeypatch):
+        """``lsf.conf`` ships parameters present-but-commented.
+
+        Reading ``#LSF_UNIT_FOR_LIMITS=GB`` as GB would invent a site decision
+        nobody made -- and be 1024x off in the other direction.
+        """
+        from nodetop.backends.lsf import _site_unit_mb
+
+        (tmp_path / "lsf.conf").write_text(
+            "# LSF_UNIT_FOR_LIMITS=GB\n#LSF_UNIT_FOR_LIMITS=TB\n"
+        )
+        monkeypatch.setenv("LSF_ENVDIR", str(tmp_path))
+        assert _site_unit_mb() is None
+
+    @pytest.mark.parametrize("body,mb", [
+        ("LSF_UNIT_FOR_LIMITS=GB\n", 1024),
+        ("  LSF_UNIT_FOR_LIMITS = GB\n", 1024),
+        ('LSF_UNIT_FOR_LIMITS="GB"\n', 1024),
+        ("LSF_UNIT_FOR_LIMITS=G\n", 1024),
+        ("#LSF_UNIT_FOR_LIMITS=GB\nLSF_UNIT_FOR_LIMITS=KB\n", 1 / 1024),
+        ("LSF_UNIT_FOR_LIMITS=EB\n", None),      # documented value, no row
+        ("LSF_UNIT_FOR_LIMITS=\n", None),
+        ("LSB_SHAREDIR=/x\n", None),
+        ("", None),
+    ])
+    def test_the_site_unit_is_read_or_declared_unknown(self, body, mb, tmp_path, monkeypatch):
+        from nodetop.backends.lsf import _site_unit_mb
+
+        (tmp_path / "lsf.conf").write_text(body)
+        monkeypatch.setenv("LSF_ENVDIR", str(tmp_path))
+        assert _site_unit_mb() == mb
+
+    def test_an_unreadable_lsf_conf_is_not_a_crash(self, tmp_path, monkeypatch):
+        """A missing or unreadable ``lsf.conf`` must degrade, not raise.
+
+        `load_nodes` would otherwise lose every host to an `OSError` from a
+        directory named ``lsf.conf`` or an unset-but-wrong ``LSF_ENVDIR`` --
+        an empty listing this tool reports as "wrong backend or dead control
+        plane", which is the misdiagnosis the rest of this file guards against.
+        """
+        from nodetop.backends.lsf import LsfBackend, _site_unit_mb
+
+        monkeypatch.setenv("LSF_ENVDIR", str(tmp_path / "nope"))
+        assert _site_unit_mb() is None
+        (tmp_path / "lsf.conf").mkdir()          # a directory, not a file
+        monkeypatch.setenv("LSF_ENVDIR", str(tmp_path))
+        assert _site_unit_mb() is None
+        assert LsfBackend().parse_nodes(*_lsf_pair("256G"))[0].memory_mb == 262144
+
+    @pytest.mark.parametrize("text", [
+        "1.2.3.4G", "256.1.2G", ".", "..", "1..2", "8.8.8.8",
+    ])
+    def test_a_multi_dot_size_reads_as_unknown_instead_of_raising(self, text):
+        from nodetop.backends.lsf import _mem_to_mb
+
+        assert _mem_to_mb(text) == 0
+
+    @pytest.mark.parametrize("text,note", [
+        ("1E", "EB is a documented LSF_UNIT_FOR_LIMITS value; the table stops at P"),
+        ("1Gi", "`Gi` is Kubernetes' spelling, not LSF's"),
+        ("1gw", "`w` (words) is PBS vocabulary"),
+        ("512G (mg)", "a whole lshosts line is not a size"),
+        ("infinity", ""),
+        ("-", "lshosts prints this when it has no info for a host"),
+    ])
+    def test_a_size_lsf_cannot_read_is_unknown_not_one_megabyte(self, text, note):
+        # Unanchored, these all fell through to the bare-number branch and
+        # became their leading digits in MB -- `1E` (an exabyte, if LSF ever
+        # prints one) read as 1 MB. 0 is this package's "not read", and
+        # `hardware_ok` gates on `memory_mb > 0`.
+        from nodetop.backends.lsf import _mem_to_mb
+
+        assert _mem_to_mb(text) == 0, note
+
+    def test_one_malformed_maxmem_does_not_empty_the_node_listing(self):
+        from nodetop.backends.lsf import LsfBackend
+
+        lshosts = (
+            "HOST_NAME      type    model            cpuf ncpus maxmem maxswp server RESOURCES\n"
+            "good-01        X86_64  AMD_EPYC        55.0   128   256G    16G      Yes (mg)\n"
+            "bad-01         X86_64  AMD_EPYC        55.0   128 1.2.3.4G  16G      Yes (mg)\n"
+        )
+        bhosts = (
+            "HOST_NAME            STATUS  JL/U  MAX  NJOBS  RUN SSUSP USUSP  RSV\n"
+            "good-01              ok         -  128      0    0     0     0    0\n"
+            "bad-01               ok         -  128      0    0     0     0    0\n"
+        )
+        nodes = {n.name: n for n in LsfBackend().parse_nodes(bhosts, lshosts)}
+        assert sorted(nodes) == ["bad-01", "good-01"]
+        assert nodes["good-01"].memory_mb == 262144
+        assert nodes["bad-01"].memory_mb == 0
+
+    def test_control_the_recorded_fixture_totals_are_unchanged(self, lsf_backend):
+        got = {n.name: n.memory_mb for n in lsf_backend.load_nodes()}
+        assert got == {"gpu-01": 524288, "gpu-02": 524288, "gpu-03": 524288,
+                       "gpu-04": 524288, "cpu-01": 262144, "cpu-02": 262144}

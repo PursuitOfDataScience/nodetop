@@ -46,6 +46,7 @@ __all__ = [
     "Allocation",
     "BackendCapabilities",
     "Blocker",
+    "CATEGORY_LABELS",
     "Identity",
     "Job",
     "JobShape",
@@ -55,6 +56,7 @@ __all__ = [
     "Verdict",
     "VerdictCategory",
     "capability_gap",
+    "category_label",
     "split_reason",
 ]
 
@@ -175,6 +177,14 @@ class Node:
     gpus_total: int = 0
     gpus_alloc: int = 0
     accelerator: AcceleratorSpec | None = None
+    #: What the scheduler CALLED this node's accelerator, whether or not the
+    #: model is in the vocabulary -- ``rtx2080ti`` for a card
+    #: :attr:`accelerator` is ``None`` for.  A name and nothing else: no
+    #: capability, memory or architecture follows from it, which is why it is a
+    #: separate field rather than a half-populated
+    #: :class:`~nodetop.core.hardware.AcceleratorSpec`.  See
+    #: :func:`~nodetop.core.hardware.name_accelerator`.
+    accelerator_label: str = ""
     #: Free-form labels: Slurm features, PBS resources, k8s labels.
     labels: tuple[str, ...] = ()
     #: Queues/partitions/namespaces this node serves.
@@ -269,6 +279,31 @@ class Node:
         CPU work ends up occupying an accelerator.
         """
         return self.gpus_total > 0
+
+    @property
+    def accelerator_name(self) -> str:
+        """What to CALL this node's accelerator, in one place.
+
+        Three answers, in order: the identified model, then whatever the
+        scheduler called the card, then ``UNKNOWN``.  The middle one is the
+        point.  A cluster where 60% of the GPUs fell through to ``UNKNOWN``
+        was not a cluster whose scheduler was silent about them -- it named
+        every one in the node's feature list, and the vocabulary simply did not
+        have the token.  ``rtx2080ti`` tells the reader the whole story;
+        ``UNKNOWN`` tells them nothing and reads as though nobody knew.
+
+        Naming a card does NOT claim anything about it.  :attr:`accelerator` is
+        still ``None``, so `supports()` still answers ``None`` for every
+        capability and the card is still counted in no capability row.
+        """
+        if self.accelerator is not None:
+            return self.accelerator.model
+        return self.accelerator_label or "UNKNOWN"
+
+    @property
+    def accelerator_identified(self) -> bool:
+        """Whether anything is known about the card beyond its name."""
+        return self.accelerator is not None
 
     @property
     def gpus_free(self) -> int:
@@ -828,8 +863,7 @@ class Queue:
         counts: dict[str, int] = {}
         for n in self.nodes:
             if n.is_gpu_node:
-                key = n.accelerator.model if n.accelerator else "UNKNOWN"
-                counts[key] = counts.get(key, 0) + 1
+                counts[n.accelerator_name] = counts.get(n.accelerator_name, 0) + 1
         return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
     def __str__(self) -> str:  # pragma: no cover - cosmetic
@@ -981,9 +1015,70 @@ class Identity:
     accounts_required: bool = False
     #: account -> queues the scheduler associates with it.
     account_queues: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
+    #: ``(account, queue)`` -> ``(allowed QOS names, default QOS or "")``, from
+    #: the association table.  ``queue == ""`` is the account's blanket row,
+    #: which applies wherever there is no partition-specific one.
+    #:
+    #: Per-association, because that is where a scheduler keeps it, and the
+    #: union in :attr:`qos` cannot answer the question a dry-run has to ask:
+    #: *which* QOS applies to me on THIS queue.  Getting that wrong is not
+    #: cosmetic.  Where an association names a QOS and leaves ``DefaultQOS``
+    #: empty there is nothing for the scheduler to fall back on, so a probe
+    #: sent with no ``--qos`` is refused outright -- ``Invalid qos
+    #: specification`` on 16 of 30 partitions on one cluster, every one of
+    #: which accepted the same job the instant the QOS the association already
+    #: named was supplied.
+    association_qos: dict[tuple[str, str], tuple[tuple[str, ...], str]] = field(
+        default_factory=dict, repr=False
+    )
     #: True when every account claims an identical queue list -- a strong hint
     #: the entitlement table is a template rather than a grant.
     entitlements_look_templated: bool = False
+
+    def qos_for(self, account: str | None, queue: str) -> str | None:
+        """The QOS a dry-run for ``(account, queue)`` should name, if any.
+
+        ``None`` means "do not name one", and it is returned in exactly the two
+        cases where naming one would be a guess: no association row to read,
+        or a row offering several QOS with no default to break the tie.  A
+        wrong ``--qos`` turns an answerable question into a refusal, which is
+        the failure this whole method exists to remove -- so it declines rather
+        than picks.
+        """
+        rows = []
+        if account:
+            # Partition-specific first: it is the more specific grant, and on
+            # sites that use both, the blanket row is the fallback.
+            for key in ((account, queue), (account, "")):
+                got = self.association_qos.get(key)
+                if got is not None:
+                    rows.append(got)
+        if account and not rows:
+            # A named account with no association row. There is nothing to read
+            # for it, and reading somebody ELSE's row would be the guess this
+            # method exists not to make: it used to fall through to the
+            # queue-wide scan below and answer with another account's grant, so
+            # `where -A <account-with-no-row>` sent `--qos=<not yours>` and got
+            # `Invalid qos specification` -- the exact failure it was written to
+            # remove, now caused by it.
+            return None
+        if not rows:
+            # No account named at all -- the honest probe on a site with no
+            # associations, and what `probe_accounts` sends when the caller has
+            # none. Any row for this queue is better than nothing, but only if
+            # they agree; otherwise there is no answer to give.
+            here = [v for (_a, q), v in self.association_qos.items() if q == queue]
+            names = {v[1] or (v[0][0] if len(v[0]) == 1 else "") for v in here}
+            names.discard("")
+            if len(names) == 1:
+                return names.pop()
+            return self.default_qos or None
+        allowed, default = rows[0]
+        if default:
+            return default
+        if len(allowed) == 1:
+            return allowed[0]
+        return None
 
     @property
     def account_set(self) -> set[str]:
@@ -1006,6 +1101,7 @@ class Identity:
         groups: Iterable[str] = (),
         default_qos: str | None = None,
         accounts_required: bool = False,
+        association_qos: dict[tuple[str, str], tuple[tuple[str, ...], str]] | None = None,
     ) -> Identity:
         """Build an identity and run the templated-entitlements check."""
         lists = [frozenset(v) for v in account_queues.values() if v]
@@ -1017,6 +1113,7 @@ class Identity:
             default_qos=default_qos,
             accounts_required=accounts_required,
             account_queues={k: tuple(sorted(v)) for k, v in account_queues.items()},
+            association_qos=dict(association_qos or {}),
             entitlements_look_templated=len(lists) > 1 and len(set(lists)) == 1,
         )
 
@@ -1037,6 +1134,15 @@ class JobShape:
     gpus_per_node: int = 0
     cpus_per_task: int = 1
     tasks_per_node: int = 1
+    #: RAM per node, in **gibibytes** despite the field name -- ``cli`` parses
+    #: "a bare number meaning GiB" and :meth:`memory_mb_per_node` returns
+    #: ``memory_gb * 1024``, so the value is binary end to end. It is rendered
+    #: "GiB" for that reason: measured against this controller, ``--mem=244G``
+    #: is accepted and ``--mem=245G`` refused on a 250000 MB node, identically
+    #: to ``249856M`` and ``250880M``, so Slurm's own ``G`` is 1024-based and a
+    #: "GB" label understated what the reader typed by 7%. The four sibling
+    #: tools all print GiB for memory. The field name is left alone: it is on
+    #: the public ``JobShape`` and renaming it is not a labelling fix.
     memory_gb: float = 0.0
     walltime: str = "01:00:00"
     #: Minimum per-accelerator memory in GiB; 0 disables the check.
@@ -1085,7 +1191,7 @@ class JobShape:
             bits.append(f">={self.gpu_memory_gb:g} GiB HBM")
         bits.append(f"{self.cpus_per_node} CPU/node")
         if self.memory_gb:
-            bits.append(f"{self.memory_gb:g} GB RAM/node")
+            bits.append(f"{self.memory_gb:g} GiB RAM/node")
         bits.append(format_duration(self.walltime_seconds))
         if self.requires:
             bits.append("needs " + "+".join(self.requires))
@@ -1124,6 +1230,58 @@ class VerdictCategory:
     #: other hid three partitions this user can submit to.
     ACCOUNTS_UNTRIED = "ACCOUNTS_UNTRIED"
     UNKNOWN = "UNKNOWN"
+
+
+#: One short phrase per :class:`VerdictCategory` member, for a table cell.
+#:
+#: The categories are a wire vocabulary -- they go into ``--json``, they are
+#: compared in code, and they must not drift -- so they are SCREAMING_SNAKE and
+#: stay that way.  A view that paints one straight through prints
+#: ``ACCOUNTS_UNTRIED`` next to ``confirmed`` and ``unchecked`` in the same
+#: column, which is two vocabularies in one place and reads as a leak.  The
+#: meanings are worth keeping, so they get a display form instead of being
+#: collapsed into "refused".
+#:
+#: Every member is listed.  ``test_model`` asserts that, because a category
+#: added later and left out here would fall back to its raw name and reintroduce
+#: exactly the leak this table exists to close.
+CATEGORY_LABELS: dict[str, str] = {
+    "OK": "confirmed",
+    "NOT_ENTITLED": "refused",
+    "ACCOUNT_MISMATCH": "wrong account",
+    "NO_ACCOUNT": "needs an account",
+    "ACCESS_DENIED": "denied",
+    "GROUP_DENIED": "group denied",
+    "UNKNOWN_QUEUE": "no such queue",
+    "QUEUE_CLOSED": "closed",
+    "SHAPE_UNAVAILABLE": "shape unavailable",
+    "QUOTA_EXCEEDED": "over quota",
+    # NOT "qos undecided": the control plane DID decide -- it said `Invalid qos
+    # specification` -- and calling that an absence is the same misdirection
+    # NT-8 was about. A row here means the QOS was rejected, whether nodetop
+    # named one from the association or `qos_for` declined to choose and Slurm
+    # found no default to apply. Both are actionable; "undecided" reads as
+    # nodetop not having got round to it.
+    "INVALID_QOS": "qos rejected",
+    "TIME_LIMIT": "over time limit",
+    "CONTROL_PLANE_DOWN": "no answer",
+    "NOT_SUPPORTED": "no dry-run",
+    "ACCOUNTS_UNTRIED": "accounts untried",
+    "UNKNOWN": "answer unrecognised",
+}
+
+
+def category_label(category: str) -> str:
+    """``ACCOUNTS_UNTRIED`` -> ``accounts untried``.
+
+    Falls back to a lower-cased, de-underscored form rather than to the raw
+    token: a category this table has not caught up with should still read as
+    prose in a prose column.
+    """
+    known = CATEGORY_LABELS.get(category)
+    if known is not None:
+        return known
+    return category.replace("_", " ").lower() if category else "unknown"
 
 
 #: Categories that say nothing durable about your access.

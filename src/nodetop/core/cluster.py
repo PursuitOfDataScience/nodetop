@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -163,7 +163,19 @@ class Cluster:
             by_name.setdefault(node.name, node)
         nodes = list(by_name.values())
         for q in queues:
-            q.nodes = [by_name[n] for n in q.node_names if n in by_name]
+            # Deduplicated HERE too, which is where it was missed. A membership
+            # list naming a node twice -- an overlapping range in a partition's
+            # `Nodes=`, a host repeated in a pool's host list -- put the SAME
+            # record into `q.nodes` twice, and every per-queue gauge reads that
+            # list: `cpus_total`, `gpus_total`, `gpus_free`, `schedulable_nodes`,
+            # `idle_nodes`. All of them doubled. Measured with
+            # `NODETOP_HOSTS=localhost,localhost`: a pool of one 6-CPU machine
+            # reported 12 CPUs over 2 schedulable nodes, and `where -N 2`
+            # answered RUN NOW, "fits/need 2/2", for a two-node job on a
+            # one-machine pool -- the aggregation claiming more than the parts
+            # hold, which is the one thing this layer must never do.
+            # `reachable_nodes` was already immune because it builds a set.
+            q.nodes = [by_name[n] for n in dict.fromkeys(q.node_names) if n in by_name]
 
         return cls(
             backend_name=backend.name,
@@ -182,13 +194,40 @@ class Cluster:
         )
 
     # -- delegation ---------------------------------------------------------
+    def with_qos(
+        self, queue: str, shape: JobShape, account: str | None = None
+    ) -> JobShape:
+        """``shape`` with the QOS this (account, queue) actually runs under.
+
+        A caller's own ``--qos`` always wins; this only fills a blank.
+
+        Why it is filled at all: a QOS is a per-association grant, and where
+        the association names one and leaves ``DefaultQOS`` empty the scheduler
+        has nothing to fall back on -- so a submission that names no QOS is
+        refused before any of its resources are looked at.  On one cluster that
+        was **16 of 30 partitions** answering ``Invalid qos specification``,
+        every one of them reported to the reader as "could not be confirmed",
+        and every one of them starting immediately once the QOS its own
+        association already named was supplied.  nodetop's first query reads
+        that field; only the probe never used it.
+
+        Applied here rather than in each caller so the dry-run and the
+        ``submit_flags`` printed beside it cannot disagree about the job -- a
+        probe that succeeds only because of a flag the reader is not shown is
+        its own kind of wrong answer.
+        """
+        if shape.qos or self.identity is None:
+            return shape
+        qos = self.identity.qos_for(account or shape.account, queue)
+        return replace(shape, qos=qos) if qos else shape
+
     def probe(
         self, queue: str, shape: JobShape, account: str | None = None
     ) -> Verdict | None:
         """Ask the control plane about one (queue, account) pair."""
         if self._backend is None or self.replayed or not self.can_probe:
             return None
-        return self._backend.probe(queue, shape, account)
+        return self._backend.probe(queue, self.with_qos(queue, shape, account), account)
 
     def format_nodelist(self, names) -> str:
         """Render a node set in the backend's own notation.
@@ -207,7 +246,11 @@ class Cluster:
     def submit_flags(self, queue: str, shape: JobShape) -> list[str]:
         if self._backend is None:
             return []
-        return self._backend.submit_flags(queue, shape)
+        # The same shape the probe used, QOS included. Where a QOS had to be
+        # supplied to get an answer at all, omitting it from the flags hands
+        # the reader a command that fails for the reason nodetop just worked
+        # around -- and it is the part they copy.
+        return self._backend.submit_flags(queue, self.with_qos(queue, shape))
 
     @property
     def can_probe(self) -> bool:

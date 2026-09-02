@@ -23,13 +23,13 @@ import json
 import os
 import re
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 
 from ..core.duration import parse_timestamp
-from ..core.hardware import identify_accelerator
+from ..core.hardware import identify_accelerator, name_accelerator
 from ..core.model import Identity, Job, JobShape, Limits, Node, Queue, Verdict
-from ..runner import Runner, SubprocessRunner, which
+from ..runner import Runner, SubprocessRunner, resolve, which
 from .base import BackendCapabilities, count
 
 __all__ = ["PbsBackend"]
@@ -78,15 +78,48 @@ _STATE_TO_CONDITION = {
 }
 
 
+#: Bytes in one PBS *word* -- the unit behind the ``w`` suffix family (``w``,
+#: ``kw``, ``mw``, ``gw``, ``tw``, ``pw``) of PBS's documented size syntax.
+#:
+#: **A 64-bit PBS server is assumed here**, and stated rather than implied
+#: because the word size is a property of the machine PBS runs on, not of
+#: nodetop: PBS defines a word as the host's word, and a size string carries no
+#: way to ask which host printed it. Every platform current PBS Pro and OpenPBS
+#: ship for is 64-bit, so 8 is right in practice; against a 32-bit relic it
+#: reads 2x high, which is the one direction this constant can be wrong in and
+#: is why it is not simply left out.
+_PBS_WORD_BYTES = 8
+
+
 def _mem_to_mb(text: str | None) -> int:
-    """PBS memory strings: ``256gb``, ``1024mb``, ``2tb``, bare bytes."""
+    """PBS memory strings: ``256gb``, ``1024mb``, ``2tb``, ``16gw``, bare bytes.
+
+    A PBS suffix is a size prefix *and* a unit, and both have to be read.  The
+    ``b``/``w`` half used to be matched and thrown away, which is not the
+    harmless half: a word is :data:`_PBS_WORD_BYTES` bytes, so ``1gw`` is 8 GiB
+    and reading it as ``1gb`` answered 1024 MB -- an **8x understatement**, the
+    direction that makes an over-limit job look acceptable and a node look
+    smaller than it is rather than raising a false alarm.  It is also not
+    confined to queue ceilings: the same function supplies `Node.memory_mb`,
+    so a ``mem = 4gw`` node was published with a quarter of its memory.
+
+    Sub-megabyte sizes still truncate to 0 -- ``1024w`` is 8 KiB either way --
+    and :func:`_pbs_mem_mb` is what turns that 0 back into "unread".
+    """
     if not text:
         return 0
-    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?)([bw]?)\s*$", str(text), re.IGNORECASE)
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([kmgtp]?)([bw]?)\s*$", str(text), re.IGNORECASE)
     if not m:
         return 0
     value = float(m.group(1))
-    scale = {"": 1 / (1024 * 1024), "k": 1 / 1024, "m": 1, "g": 1024, "t": 1024 * 1024}
+    if m.group(3).lower() == "w":
+        value *= _PBS_WORD_BYTES
+    # `p` is in PBS's documented suffix list and was missing here, so `1pb`
+    # fell out as 0 -- a node with no memory, and a ceiling of nothing.
+    scale = {
+        "": 1 / (1024 * 1024), "k": 1 / 1024, "m": 1,
+        "g": 1024, "t": 1024 * 1024, "p": 1024 * 1024 * 1024,
+    }
     return int(value * scale.get(m.group(2).lower(), 1))
 
 
@@ -108,17 +141,112 @@ def _pbs_walltime(text: str | None) -> int | None:
     return nums[0]
 
 
-def _strip_pbs_limit(value: str) -> int | None:
-    """``max_run_res.ngpus = [u:PBS_GENERIC=8]`` -> 8.
+#: One ``[kind:entity=value]`` cell of a PBS per-entity limit table. The kind
+#: (``u`` user, ``g`` group, ``p`` project, ``o`` overall) is optional only
+#: because reading a malformed cell as generic beats discarding the ceiling.
+#:
+#: The value is captured as *text*, not as digits. Cells carry units --
+#: ``max_run_res.mem = [u:PBS_GENERIC=200gb]`` -- and a digits-only capture
+#: does not see such a cell at all, so the whole table fell through to the
+#: "this is not a table" branch and the ceiling was discarded. Whether the
+#: winning cell is a number is the caller's question, asked *after* the right
+#: cell has been picked; a digits-only capture also answers it during the pick,
+#: which is how ``[u:alice=unlimited],[u:bob=4]`` came to hand bob's 4 to
+#: everybody as the one remaining "lone" cell.
+_PBS_LIMIT_ENTRY = re.compile(
+    r"\[\s*(?:([A-Za-z])\s*:\s*)?([^=\[\]]*?)\s*=\s*([^=\[\]]*?)\s*\]")
 
-    PBS expresses a limit as a per-entity table; the generic entry is the one
-    that applies to an ordinary user.
-    """
-    m = re.search(r"=\s*(\d+)\s*\]?\s*$", str(value))
-    if m:
-        return int(m.group(1))
-    m = re.match(r"^\s*(\d+)\s*$", str(value))
+#: A limit value that is a number and nothing else.
+_PBS_BARE_INT = re.compile(r"^\s*(\d+)\s*$")
+
+
+def _pbs_int(cell: str) -> int | None:
+    """A resolved limit cell as a count, or ``None`` if it is not one."""
+    m = _PBS_BARE_INT.match(cell)
     return int(m.group(1)) if m else None
+
+
+def _pbs_mem_mb(cell: str) -> int | None:
+    """A resolved limit cell as MB, or ``None`` if it is not readable as size.
+
+    :func:`_mem_to_mb` answers 0 both for "no value" and for a shape it cannot
+    read -- a unit outside PBS's suffix list (``2eb``), a word or a cell that
+    is not a size at all -- and 0 is not a memory ceiling anybody published, so
+    0 becomes ``None`` here and the caller records the attribute as unread
+    rather than as absent.  (``2pb`` and ``1gw`` used to land here too, from
+    the missing peta prefix and the discarded ``w`` unit; both are read now.)
+    """
+    return _mem_to_mb(cell) or None
+
+
+def _pbs_limit_cell(value: str | None, user: str | None = None) -> str | None:
+    """The one cell of ``max_run_res.ngpus = [u:PBS_GENERIC=8]`` that is ours.
+
+    PBS expresses a limit as a per-entity *table*: ``[u:alice=99]`` for a named
+    user, ``[u:PBS_GENERIC=4]`` for every user without an entry of their own,
+    and ``g:``/``p:``/``o:`` forms for group, project and the queue-wide total.
+    Which cell applies depends on who is asking, so they are tried in that
+    order -- the caller's own ``u:`` entry, then the generic one, then (only
+    where a single entity is named and there is no way to tell whether it is
+    ours) that lone value.
+
+    Reading the *tail* of the string is not a shortcut for this.  An
+    end-anchored search answers 99 for ``[u:PBS_GENERIC=4],[u:alice=99]``, i.e.
+    hands back a *different* user's ceiling as the caller's, and PBS prints the
+    cells in whatever order the administrator set them.  Where the table names
+    only other users the answer is ``None``: no per-entity limit applies to us,
+    which is not the same thing as inheriting a stranger's.
+
+    A bare value (Torque's ``max_user_run = 4``, and every ``resources_max.*``
+    on PBS Pro) is not a table and is returned as itself, for the caller to
+    read as a count or a size.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    entries = _PBS_LIMIT_ENTRY.findall(text)
+    if entries:
+        if user:
+            for kind, entity, cell in entries:
+                if kind in ("u", "") and entity == user:
+                    return cell
+        for kind, entity, cell in entries:
+            if kind in ("u", "") and entity == "PBS_GENERIC":
+                return cell
+        for _kind, entity, cell in entries:
+            if entity == "PBS_GENERIC":
+                return cell
+        if len(entries) == 1:
+            return entries[0][2]
+        return None
+    return text.strip()
+
+
+#: PBS resource names this model has a ceiling axis for.
+#:
+#: A resource missing from the map is one nothing here ever checks
+#: (``ompthreads``, ``place``, ``mpiprocs``), so its limit is neither read nor
+#: reported as unread -- naming those would put a caveat on every queue about
+#: checks that were never going to run.
+_PBS_LIMIT_RESOURCES = {"ngpus": "gpu", "ncpus": "cpu", "nodect": "node", "mem": "mem_mb"}
+
+
+def _pbs_limit_declared(value: str | None) -> bool:
+    """Whether a limit attribute held a ceiling, as opposed to nothing.
+
+    The PBS side of :func:`nodetop.backends.slurm._looks_present`, and the
+    boundary that keeps `Limits.unreadable` honest: an attribute PBS never
+    printed, and one printed with an empty value or an explicit "no limit"
+    sentinel, are the same thing -- no ceiling, nothing to warn about. PBS
+    prints an unset attribute empty rather than omitting it (the recorded
+    fixture's ``acl_users =`` is that shape), so treating empty as present
+    would make every queue on the cluster warn.
+    """
+    if value is None or not str(value).strip():
+        return False
+    return str(value).strip().lower() not in {
+        "unlimited", "infinite", "none", "n/a", "(null)", "-",
+    }
 
 
 class PbsBackend:
@@ -137,10 +265,111 @@ class PbsBackend:
         # second `pbsnodes -a -F json` is 14 MB on the largest cluster tested.
         self._cache_lock = threading.RLock()
 
+    #: Binaries only a real PBS installation ships.  A Slurm site has none of
+    #: them, and any of them settles the question on its own.
+    _PBS_ONLY = ("pbs_server", "pbsdsh", "pbs_mom", "qmgr", "pbs_rstat")
+
+    #: What another scheduler's PBS shim writes into its own output.
+    #:
+    #: The third signal, and the only one that does not depend on how the
+    #: wrapping scheduler was packaged.  Slurm's `pbsnodes` contrib writes
+    #: `slurmstate=<state>` into every node's status line, which no real PBS
+    #: emits -- and `pbsnodes` is already the first command this backend runs, so
+    #: the evidence arrives with data that was being fetched anyway.
+    _WRAPPER_OUTPUT_MARKERS = (("slurmstate=", "slurm"),)
+
+    @classmethod
+    def wrapped_by(cls, runner: Runner | None = None) -> str | None:
+        """The OTHER scheduler whose compatibility shims are on PATH, if any.
+
+        Slurm ships ``contribs/torque`` -- ``qstat``, ``qsub``, ``qdel``,
+        ``pbsnodes`` -- and a great many sites install them by default, so
+        ``pbsnodes && qstat`` is satisfied on clusters with no PBS at all.
+        This is not a niche case; it is the common case for the backend most
+        likely to be misdetected.
+
+        And the failure was not a visibly empty report, which would have been
+        harmless.  ``pbsnodes`` IS the shim and really does enumerate every
+        node, so ``--backend pbs`` produced *correct denominators* -- 1614
+        nodes, 422 GPUs, matching the slurm backend exactly -- with ``0 up`` on
+        a cluster with 589 up, and exit 0.
+
+        Returns the wrapping scheduler's name, or ``None`` when the clients
+        look like a genuine PBS.
+
+        **Three signals, because the first two are properties of PACKAGING.**
+        The marker-binary check and the install-prefix check both hold on a site
+        that installs Slurm under a versioned prefix -- and the most common
+        packaging defeats both: the distro `slurm-torque` RPM puts the shims in
+        `/usr/bin`, so there is no `slurm-<version>` path component, and it still
+        ships none of the five PBS-only binaries. Neither rule fires and the
+        wrappers read as a real PBS again, which is the ordinary case on any
+        RPM/DEB-packaged Slurm cluster rather than an exotic one.
+
+        So the last signal asks the wrapper what it is. See
+        :data:`_WRAPPER_OUTPUT_MARKERS`.
+        """
+        if any(which(b) for b in cls._PBS_ONLY):
+            # A real PBS: `qmgr`/`pbs_server`/`pbsdsh` have no Slurm equivalent
+            # and no Slurm package installs them.
+            return None
+        for binary in ("pbsnodes", "qstat", "qsub"):
+            path = resolve(binary)
+            if not path:
+                continue
+            for other in ("slurm", "lsf", "sge", "gridengine"):
+                # A path COMPONENT, so a queue directory called `/data/slurm`
+                # cannot be mistaken for an install prefix.
+                if other in path.lower().split("/"):
+                    return other  # pragma: no cover - subsumed below
+                # `/software/slurm-23.02-el7-x86_64/bin/qstat` -- the version is
+                # in the directory name, which is how these are laid out.
+                #
+                # A DIGIT after the dash, so the component has to look like a
+                # versioned install prefix. `startswith(other + "-")` alone also
+                # matched `slurm-logs`, `slurm-data` and anything else a site
+                # happens to name that way, so a genuine PBS installed under such
+                # a path was reported as somebody else's wrapper and not detected
+                # at all. Narrow: it takes a client-only PBS (none of
+                # `_PBS_ONLY`) under a `slurm-*` directory to reach this, but the
+                # rule should say what it means.
+                if any(
+                    c.lower() == other
+                    or (c.lower().startswith(other + "-")
+                        and c[len(other) + 1:len(other) + 2].isdigit())
+                    for c in path.split("/")
+                ):
+                    return other
+        # Signal three: ask the wrapper. Independent of where it was installed.
+        return cls._wrapper_says(runner)
+
+    @classmethod
+    def _wrapper_says(cls, runner: Runner | None = None) -> str | None:
+        """The scheduler `pbsnodes` names in its own output, if it names one.
+
+        Bounded and failure-tolerant: a real PBS answers without any marker, and
+        a `pbsnodes` that cannot run at all tells us nothing either way, so both
+        come back ``None`` and the caller keeps the answer the path rules gave.
+        """
+        run = runner or SubprocessRunner()
+        try:
+            rc, out, err = run.run_full(["pbsnodes"], timeout=10.0)
+        except Exception:  # pragma: no cover - a probe must not break detection
+            return None
+        text = f"{out}\n{err}".lower()
+        for marker, other in cls._WRAPPER_OUTPUT_MARKERS:
+            if marker in text:
+                return other
+        return None
+
     @classmethod
     def detect(cls) -> bool:
         # qstat alone is ambiguous (SGE ships one too); pbsnodes is specific.
-        return which("pbsnodes") and which("qstat")
+        if not (which("pbsnodes") and which("qstat")):
+            return False
+        # ...and pbsnodes is not specific either where it is somebody else's
+        # wrapper. See `wrapped_by`.
+        return cls.wrapped_by() is None
 
     def capabilities(self) -> BackendCapabilities:
         return BackendCapabilities(
@@ -190,6 +419,7 @@ class PbsBackend:
                     gpus_total=gpus_total,
                     gpus_alloc=gpus_total if whole else count(used.get("ngpus")),
                     accelerator=identify_accelerator(None, model or labels),
+                    accelerator_label=name_accelerator(None, model or labels) or "",
                     labels=tuple(labels),
                     queues=tuple(
                         q.strip()
@@ -249,6 +479,7 @@ class PbsBackend:
                         gpus_total if whole
                         else count(fields.get("resources_assigned.ngpus"))),
                     accelerator=identify_accelerator(None, model or labels),
+                    accelerator_label=name_accelerator(None, model or labels) or "",
                     labels=tuple(labels),
                     queues=tuple(
                         q.strip()
@@ -439,33 +670,96 @@ class PbsBackend:
         return queues
 
     # -- limits -------------------------------------------------------------
-    def _limits_from_fields(self, name: str, fields: dict[str, str]) -> Limits:
-        """One queue's ceilings, from its flat ``key.subkey = value`` map."""
+    def _limit_entity(self) -> str | None:
+        """Who we are, for resolving a per-entity limit table -- or ``None``.
+
+        `load_identity` insists on a username, because there an unknown caller
+        would read as belonging to no group and that is a false denial.  Here it
+        is genuinely optional: ``PBS_GENERIC`` is the right answer for an
+        ordinary user anyway, so a host with no passwd entry must not turn every
+        queue's declared ceilings into an error.
+        """
+        try:
+            return os.environ.get("USER") or getpass.getuser()
+        except Exception:  # no passwd entry and no LOGNAME: getuser() raises
+            return None
+
+    def _limits_from_fields(
+        self, name: str, fields: dict[str, str], user: str | None = None
+    ) -> Limits:
+        """One queue's ceilings, from its flat ``key.subkey = value`` map.
+
+        `user` is the entity a per-entity table is resolved against; see
+        :func:`_pbs_limit_cell`.
+        """
         per_job: dict[str, int] = {}
         per_user: dict[str, int] = {}
-        for key, value in fields.items():
-            target = None
+        # A field that held something we could not read is not the same as an
+        # absent one, and only the first silently disables a check -- the
+        # `Limits.unreadable` contract the Slurm adapter established
+        # (MaxWall/MaxTRESPerUser/MaxTRESPerJob) and this one left empty. A
+        # `max_run_res.*` or `resources_max.*` value in a shape the parser does
+        # not understand used to simply disappear, so the queue read as
+        # UNLIMITED on that axis and was indistinguishable from one that
+        # declares no ceiling at all -- on a scheduler with no dry-run, where
+        # the declared ceiling is the only warning there is.
+        unreadable: list[str] = []
+
+        def read(key: str, convert: Callable[[str], int | None]) -> int | None:
+            """One ceiling, plus a note when it was published but unread."""
+            raw = fields.get(key)
+            if not _pbs_limit_declared(raw):
+                return None  # unset, or an explicit "unlimited": no ceiling
+            cell = _pbs_limit_cell(raw, user)
+            if cell is None:
+                # The table parsed and none of its cells is ours:
+                # `[u:alice=99],[u:bob=1]` declares nothing for carol. That is
+                # a ceiling correctly not applied, not one we failed to read,
+                # and calling it unreadable would warn about a limit that does
+                # not exist for the caller.
+                return None
+            got = convert(cell)
+            if got is None:
+                unreadable.append(key)
+            return got
+
+        # PBS prints attributes in whatever order the administrator set them,
+        # so the names are collected in a fixed order rather than that one.
+        wall = read("resources_max.walltime", _pbs_walltime)
+        for key in sorted(fields):
             if key.startswith("max_run_res."):
                 target = per_user
             elif key.startswith("resources_max."):
                 target = per_job
-            if target is None:
+            else:
                 continue
-            resource = key.split(".", 1)[1]
-            got = _strip_pbs_limit(value)
-            if got is None:
+            mapped = _PBS_LIMIT_RESOURCES.get(key.split(".", 1)[1])
+            if mapped is None:
                 continue
-            mapped = {"ngpus": "gpu", "ncpus": "cpu", "nodect": "node"}.get(resource)
-            if mapped:
+            got = read(key, _pbs_mem_mb if mapped == "mem_mb" else _pbs_int)
+            if got is not None:
                 target[mapped] = got
+        # Read before the constructor call rather than inside it: `read` is
+        # what appends to `unreadable`, so anything read after it is passed
+        # would not be in it.
+        max_jobs = read("max_run", _pbs_int)
+        max_submitted = read("max_queued", _pbs_int)
         return Limits(
             name=name,
-            max_walltime_seconds=_pbs_walltime(fields.get("resources_max.walltime")),
+            max_walltime_seconds=wall,
             per_job=per_job,
             per_user=per_user,
-            max_jobs=_int_or_none(fields.get("max_run")),
-            max_submitted=_int_or_none(fields.get("max_queued")),
+            # These two are per-entity tables exactly like `max_run_res.*`
+            # above -- the recorded fixture carries `max_run =
+            # [u:PBS_GENERIC=4]` -- so they resolve through the same cell
+            # picker rather than through `_int_or_none`, which anchors at the
+            # start of the string and read every one of them as `None`. Slurm
+            # fills the same two fields from MaxJobsPerUser /
+            # MaxSubmitJobsPerUser, so the per-user resolution matches.
+            max_jobs=max_jobs,
+            max_submitted=max_submitted,
             source="pbs queue limits",
+            unreadable=tuple(unreadable),
         )
 
     def load_limits(self) -> dict[str, Limits]:
@@ -483,12 +777,13 @@ class PbsBackend:
         # another 14.9s, 38 seconds for the same 37 KB of queue attributes,
         # fetched at two different instants -- which is also how one report
         # comes to describe two moments.
+        user = self._limit_entity()
         payload = self._queue_json()
         if payload is not None:
             try:
                 return {
                     name: self._limits_from_fields(
-                        name, {k: str(v) for k, v in _flat(q).items()})
+                        name, {k: str(v) for k, v in _flat(q).items()}, user)
                     for name, q in (json.loads(payload).get("Queue") or {}).items()
                 }
             except Exception:
@@ -500,7 +795,7 @@ class PbsBackend:
         def flush() -> None:
             if not name:
                 return
-            out[name] = self._limits_from_fields(name, fields)
+            out[name] = self._limits_from_fields(name, fields, user)
 
         for raw in _unwrap(self._queue_text()):
             if raw.startswith("Queue:"):
@@ -610,7 +905,21 @@ class PbsBackend:
         if shape.gpus_per_node:
             select += f":ngpus={shape.gpus_per_node}"
         if shape.memory_gb:
-            select += f":mem={int(shape.memory_gb)}gb"
+            # A fractional --mem is accepted (`--mem 1.5G` -> memory_gb 1.5), and
+            # `int()` on gigabytes threw the remainder away *downwards*: 1.5 became
+            # 1G and 0.5 became **0G**, a request for no memory at all. Under-asking
+            # is what gets a job killed, so the flags this tool hands over to be
+            # pasted must not ask for less than the shape they were computed from.
+            # Megabytes are exact and both schedulers take the unit; the Slurm and
+            # LSF backends already emit MB for the same reason.
+            #
+            # Gigabytes are KEPT when the figure is a whole number of them: that is
+            # what almost every request is, `mem=64gb` reads better than `mem=65536mb`
+            # in a command someone is about to paste, and two existing backend tests
+            # rightly asserted that spelling. Megabytes appear only where gigabytes
+            # would lose something.
+            mb = shape.memory_mb_per_node
+            select += f":mem={mb // 1024}gb" if mb % 1024 == 0 else f":mem={mb}mb"
         args = ["-q", queue, "-l", select, "-l", f"walltime={_hhmmss(shape.walltime_seconds)}"]
         if shape.account:
             args += ["-A", shape.account]

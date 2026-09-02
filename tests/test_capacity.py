@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from nodetop.core.capacity import assess_capacity, hardware_ok, node_fits
+from nodetop.core.capacity import (
+    EXCLUDED_REASON,
+    assess_capacity,
+    hardware_ok,
+    node_fits,
+)
 from nodetop.core.hardware import ACCELERATORS
 from nodetop.core.model import JobShape, Node
 
@@ -77,6 +82,52 @@ class TestHardwareGate:
 
     def test_cpu_job_on_an_accelerator_node_is_fine(self):
         assert hardware_ok(_node(model="A100"), JobShape(cpus_per_task=4))[0] is True
+
+    def test_a_backend_that_never_mentioned_memory_is_not_wrong_hardware(self):
+        # `memory_mb == 0` is "the backend does not report memory", not "this
+        # machine has none" -- the rule `Node.memory_exhausted` states in so
+        # many words ("inventing a shortage on a system that never mentioned
+        # memory would be its own kind of lie"). Reachable through
+        # `SshPoolBackend.parse_host`, where a host whose probe returns no
+        # MEMTOTAL line lands here with 48 idle cores and memory_mb=0.
+        #
+        # Read as a size, it makes the durable verdict: an empty
+        # `hardware_nodes` is `ever_possible is False`, which `where` renders
+        # as WRONG HW -- "no node of the right kind ... go elsewhere; waiting
+        # will not help" -- and exits 1.
+        silent = _node(mem=0, gpus=0)
+        shape = JobShape(nodes=1, cpus_per_task=4, memory_gb=8)
+        ok, why = hardware_ok(silent, shape)
+        assert ok is True, why
+        assert not any("RAM installed" in w for w in why)
+        cap = assess_capacity([silent], shape)
+        assert cap.hardware_nodes == ("n",)
+        assert cap.ever_possible is True
+
+    def test_a_reported_memory_size_that_is_too_small_still_excludes(self):
+        # CONTROL: the check itself has to keep working. A node that DID report
+        # its memory and reported less than the job needs is genuinely the
+        # wrong machine, and the suppression above must not reach it. Passes
+        # both before and after that change.
+        small = _node(mem=4096, gpus=0)
+        shape = JobShape(nodes=1, cpus_per_task=4, memory_gb=8)
+        ok, why = hardware_ok(small, shape)
+        assert ok is False
+        assert any("only 4 GiB RAM installed, need 8" in w for w in why)
+        cap = assess_capacity([small], shape)
+        assert cap.hardware_nodes == ()
+        assert cap.ever_possible is False
+
+    def test_the_unreported_size_is_still_kept_out_of_the_room_count(self):
+        # CONTROL: suppressing the durable verdict must not invent capacity.
+        # "Cannot tell how much RAM is here" is not "there is room here", so
+        # the node stays out of `fitting_nodes` and the shape does not run now
+        # -- it queues. Passes both before and after the change.
+        silent = _node(mem=0, gpus=0)
+        shape = JobShape(nodes=1, cpus_per_task=4, memory_gb=8)
+        cap = assess_capacity([silent], shape)
+        assert cap.fitting_nodes == ()
+        assert cap.satisfies(shape) is False
 
 
 class TestNodeFits:
@@ -274,6 +325,25 @@ class TestEverPossibleCountsNodes:
         assert cap.ever_possible is True
         assert cap.too_few_nodes is False
 
+    def test_it_suppresses_the_hardware_verdict_too_when_nothing_resolved(self):
+        """A queue whose nodes ALL failed to resolve is not "wrong hardware".
+
+        The suppression above only covered the count.  With nothing resolved,
+        `hardware_nodes` is empty for want of a node list rather than for want
+        of the right node, and the short-circuit read that as a verdict: a
+        partition declaring four nodes, none of them found, rendered as
+        `WRONG HW` -- "go elsewhere; waiting will not help" -- immediately above
+        its own caveat, "the queue claims 4 nodes but only 0 could be resolved".
+        One report, asserting a fact about nodes and then admitting it had seen
+        none of them.
+        """
+        cap = assess_capacity(
+            [], JobShape(nodes=1, gpus_per_node=1), count_is_complete=False)
+        assert cap.considered == 0
+        assert cap.hardware_nodes == ()
+        assert cap.ever_possible is True
+        assert cap.too_few_nodes is False
+
     def test_considered_is_the_denominator(self):
         cap = assess_capacity(self._nodes(11), JobShape(nodes=1, gpus_per_node=1))
         assert cap.considered == 11
@@ -286,3 +356,113 @@ class TestEverPossibleCountsNodes:
                                               gpu_memory_gb=999))
         assert cap.considered == 1
         assert sum(cap.hardware_reasons.values()) >= 1
+
+
+class TestTheEmptyCaseIsStillAVerdictWhereItIsEarned:
+    """Controls on the suppression above: it must not swallow a real refusal.
+
+    "We saw nothing" is not the same claim as "we saw nothing suitable", and
+    only the first is exempt.  Both of these queues have been *looked at*, so
+    an empty capable set is evidence rather than a lookup failure.
+    """
+
+    @staticmethod
+    def _nodes(n, gpus=4):
+        return [
+            Node(name=f"n{i}", state_raw="IDLE", cpus_total=8, memory_mb=16000,
+                 gpus_total=gpus, accelerator=ACCELERATORS["A100"])
+            for i in range(n)
+        ]
+
+    def test_a_queue_that_really_owns_no_nodes_is_still_impossible(self):
+        # Complete list, and it is empty: there is no hardware here to wait for.
+        cap = assess_capacity([], JobShape(nodes=1, gpus_per_node=1),
+                              count_is_complete=True)
+        assert cap.considered == 0
+        assert cap.required_nodes == 1
+        assert cap.ever_possible is False
+
+    def test_a_partly_resolved_queue_of_the_wrong_kind_is_still_impossible(self):
+        # Incomplete, but two nodes WERE examined and neither can host the
+        # shape. That verdict rests on nodes, not on a failure to find any.
+        cap = assess_capacity(
+            self._nodes(2, gpus=0), JobShape(nodes=1, gpus_per_node=1),
+            count_is_complete=False,
+        )
+        assert cap.considered == 2
+        assert cap.required_nodes == 0
+        assert cap.hardware_nodes == ()
+        assert cap.ever_possible is False
+
+    def test_a_complete_list_of_the_wrong_kind_is_still_impossible(self):
+        cap = assess_capacity(self._nodes(4, gpus=0),
+                              JobShape(nodes=1, gpus_per_node=1))
+        assert cap.ever_possible is False
+
+
+class TestAnExcludedNodeSaysSoInsteadOfSayingNothing:
+    """`--exclude` was the one path to a refusal with an empty explanation.
+
+    `Capacity.hardware_reasons` states its own contract: *"Hardware mismatch
+    reason -> node count, so a 'wrong hardware' verdict can always say **what**
+    was wrong rather than just refusing."* A node that is `hw_ok` but named in
+    `shape.exclude` took the `else` branch with an empty `hw_why`, so the loop
+    recorded nothing: exclude every node and `hardware_nodes` emptied,
+    `ever_possible` went False, and the histogram stayed `{}`.
+
+    The screen then read `✗ WRONG HW` / "no node here has the right hardware"
+    about nodes whose hardware was fine, with the legend "go elsewhere; waiting
+    will not help" -- when what would help is dropping `--exclude`.
+    """
+
+    @staticmethod
+    def _nodes(n=3, cpus=16):
+        return [
+            Node(name=f"n{i}", state_raw="IDLE", cpus_total=cpus, memory_mb=64000,
+                 gpus_total=4, queues=("q",))
+            for i in range(n)
+        ]
+
+    def test_excluding_every_node_still_explains_itself(self):
+        cap = assess_capacity(
+            self._nodes(), JobShape(nodes=1, cpus_per_task=8,
+                                    exclude=("n0", "n1", "n2")))
+        assert cap.hardware_nodes == ()
+        assert cap.hardware_reasons == {EXCLUDED_REASON: 3}
+
+    def test_a_partial_exclusion_is_counted_without_changing_the_verdict(self):
+        # One of three excluded: two remain, so the job is still possible. The
+        # reason is recorded anyway -- it explains the 2/3, which is the number
+        # the reader sees.
+        cap = assess_capacity(
+            self._nodes(), JobShape(nodes=1, cpus_per_task=8, exclude=("n0",)))
+        assert len(cap.hardware_nodes) == 2
+        assert cap.ever_possible is True
+        assert cap.hardware_reasons == {EXCLUDED_REASON: 1}
+
+    def test_a_genuine_hardware_mismatch_reads_exactly_as_before(self):
+        """CONTROL -- passes in both states."""
+        cap = assess_capacity(self._nodes(), JobShape(nodes=1, cpus_per_task=32))
+        assert cap.hardware_nodes == ()
+        assert cap.hardware_reasons == {"only 16 CPUs installed, need 32": 3}
+        assert EXCLUDED_REASON not in cap.hardware_reasons
+
+    def test_a_node_that_is_both_wrong_and_excluded_is_not_double_reported(self):
+        """CONTROL -- and a deliberate scope line.
+
+        A node that genuinely does not fit already explains itself, so the
+        exclusion is not added on top; the histogram stays about the hardware.
+        Recording both would be defensible (the field documents that its values
+        do not sum to a node count) but it would crowd the one sentence the
+        reader gets.
+        """
+        cap = assess_capacity(
+            self._nodes(), JobShape(nodes=1, cpus_per_task=32,
+                                    exclude=("n0", "n1", "n2")))
+        assert cap.hardware_reasons == {"only 16 CPUs installed, need 32": 3}
+
+    def test_no_exclusion_records_no_reason(self):
+        """CONTROL -- the ordinary path must stay empty, not gain a 0 entry."""
+        cap = assess_capacity(self._nodes(), JobShape(nodes=1, cpus_per_task=8))
+        assert cap.hardware_reasons == {}
+        assert cap.hardware_nodes == ("n0", "n1", "n2")

@@ -199,3 +199,159 @@ class TestClaimedFlags:
             for choice in sub.choices.values():  # type: ignore[attr-defined]
                 actions |= {o for a in choice._actions for o in a.option_strings}
         assert flag in actions, f"{flag} is documented but the CLI does not accept it"
+
+
+class TestTheVersionIsSpelledOnce:
+    """`pyproject.toml` and `_version.py` both carry the version literal.
+
+    That duplication is deliberate and documented: `_version.py` is a literal so
+    the package imports straight from a source tree with no build step, which a
+    tool for diagnosing a cluster outage should not need. What was missing is
+    anything keeping the two equal -- they agreed today with nothing to keep them
+    agreeing tomorrow, which is the same defect this file's docstring is about,
+    one layer down.
+
+    The failure it guards is quiet in the worst way: a release bumps
+    `pyproject.toml`, the wheel goes to PyPI as 0.6.0, and `nodetop --version`
+    keeps saying 0.5.0 because that is what the literal says. A version string is
+    the field a reader trusts without checking.
+    """
+
+    @staticmethod
+    def _pyproject_version() -> str:
+        root = pathlib.Path(__file__).resolve().parent.parent
+        text = (root / "pyproject.toml").read_text()
+        # A plain regex rather than a TOML parse: this must hold on 3.10, where
+        # `tomllib` does not exist, and the package takes no dependencies.
+        found = re.search(r"^version\s*=\s*\"([^\"]+)\"", text, re.M)
+        assert found, "pyproject.toml declares no static version"
+        return found.group(1)
+
+    def test_the_two_literals_agree(self):
+        from nodetop._version import VERSION
+
+        declared = self._pyproject_version()
+        assert declared == VERSION, (
+            f"_version.py says {VERSION}, pyproject.toml says {declared} — "
+            f"`nodetop --version` reports the former and PyPI publishes the latter"
+        )
+
+    def test_what_the_cli_reports_is_that_same_string(self):
+        # The control: the guard is only worth anything if `--version` really
+        # reads the literal it pins. Asserted through the parser rather than by
+        # reading the source, so a future indirection still has to agree.
+        import nodetop
+
+        assert nodetop.__version__ == self._pyproject_version()
+
+    def test_the_version_is_a_release_number_not_a_placeholder(self):
+        # `0.0.0`, `0.0.0+unknown` and an empty string all mean "we do not know",
+        # and shipping one of those as a version is worse than failing to build.
+        version = self._pyproject_version()
+        assert re.fullmatch(r"\d+\.\d+\.\d+[\w.+-]*", version), version
+        assert not version.startswith("0.0.0"), version
+
+
+class TestTheNoDependenciesClaimIsTrue:
+    """"No dependencies" is asserted in three places and guarded in none.
+
+    `pyproject.toml` says `dependencies = []` with a comment explaining why, the
+    README carries a `dependencies-none` badge, and DESIGN.md restates it — and
+    nothing checked the tree. The claim is load-bearing rather than decorative:
+    this is a tool reached for while a cluster is misbehaving, on a login node
+    with nothing but the system Python, so one `import rich` ends its reason to
+    exist.
+
+    A sibling package had the same gap, with the check living only in a CI job —
+    which cannot fail during the local gate run that introduces the import.
+    """
+
+    #: Stdlib modules that post-date this package's floor, and when they landed.
+    #:
+    #: `sys.stdlib_module_names` is the RUNNING interpreter's, so it answers "is
+    #: this stdlib now" and cannot answer "was it stdlib at 3.10". Importing
+    #: `tomllib` would pass the third-party check while raising
+    #: `ModuleNotFoundError` on the oldest interpreter `_MIN_PYTHON` allows.
+    TOO_NEW = {"tomllib": (3, 11), "dbm.sqlite3": (3, 13), "annotationlib": (3, 14)}
+
+    @staticmethod
+    def _sources():
+        import nodetop
+
+        return sorted(pathlib.Path(nodetop.__file__).parent.rglob("*.py"))
+
+    @classmethod
+    def _imports(cls, path):
+        import ast
+
+        found = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                found |= {a.name for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                found.add(node.module)
+        return found
+
+    def test_there_are_sources_to_check(self):
+        # A silent glob miss would make everything below vacuously pass.
+        assert len(self._sources()) >= 15
+
+    def test_no_module_imports_anything_third_party(self):
+        import sys
+
+        stdlib = set(sys.stdlib_module_names)
+        local = {p.stem for p in self._sources()} | {"nodetop"}
+        offenders = {}
+        for path in self._sources():
+            third = {
+                name.split(".")[0]
+                for name in self._imports(path)
+                if name.split(".")[0] not in stdlib
+                and name.split(".")[0] not in local
+            }
+            if third:
+                offenders[path.name] = sorted(third)
+        assert not offenders, (
+            f"{offenders} — pyproject declares none, the README badge says none, "
+            f"and DESIGN.md explains why it matters"
+        )
+
+    def test_no_module_imports_a_stdlib_addition_newer_than_the_floor(self):
+        from nodetop.cli import _MIN_PYTHON
+
+        offenders = {}
+        for path in self._sources():
+            names = self._imports(path)
+            hit = {
+                mod: ver
+                for mod, ver in self.TOO_NEW.items()
+                if ver > _MIN_PYTHON
+                and (mod in names or any(n.split(".")[0] == mod for n in names))
+            }
+            if hit:
+                offenders[path.name] = hit
+        assert not offenders, f"{offenders} post-date the {_MIN_PYTHON} floor"
+
+    def test_pyproject_still_declares_an_empty_list(self):
+        # The claim from the other direction: a dependency declared but not yet
+        # imported already breaks `pip install` on an air-gapped node.
+        root = pathlib.Path(__file__).resolve().parent.parent
+        text = (root / "pyproject.toml").read_text()
+        found = re.search(r"^dependencies\s*=\s*\[(.*?)\]", text, re.S | re.M)
+        assert found is not None, "pyproject declares no `dependencies` key at all"
+        declared = [x for x in (v.strip().strip('",') for v in found.group(1).split("\n")) if x]
+        assert not declared, declared
+
+    def test_the_readme_badge_still_says_none(self):
+        root = pathlib.Path(__file__).resolve().parent.parent
+        assert "dependencies-none" in (root / "README.md").read_text()
+
+    def test_the_detector_would_notice_a_real_import(self):
+        # The control: a guard that cannot fail is not a guard.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = pathlib.Path(tmp) / "probe.py"
+            probe.write_text("import rich\nfrom textual.app import App\nimport tomllib\n")
+            names = self._imports(probe)
+            assert {"rich", "textual", "tomllib"} <= {n.split(".")[0] for n in names}

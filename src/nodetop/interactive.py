@@ -81,7 +81,8 @@ _KEYS = {
 #: that a deliberate Escape does not feel stuck.
 _ESCAPE_GRACE = 0.05
 
-#: The tails of the CSI sequences an arrow key sends.  Read after ``ESC [``.
+#: The tails of the sequences an arrow key sends.  Read after the introducer,
+#: which is ``[`` (CSI) or ``O`` (SS3) -- see :func:`read_key`.
 _ARROWS = {"A": Key.UP, "B": Key.DOWN, "C": Key.RIGHT, "D": Key.BACK,
            "H": Key.TOP, "F": Key.BOTTOM}
 
@@ -216,7 +217,17 @@ def read_key(readch: Callable[[float | None], str] | None = None) -> str:
     if not ch:
         return Key.QUIT
     if ch == "\x1b":
-        if read(_ESCAPE_GRACE) != "[":
+        # Two introducers, not one. ``ESC [ A`` (CSI) is what a terminal in the
+        # normal cursor mode sends; ``ESC O A`` (SS3) is what the same key sends
+        # once DECCKM -- application cursor mode -- is set, and Home/End reach
+        # for SS3 on xterm sooner than the arrows do. Accepting only ``[`` read
+        # every one of those as a bare Escape, so arrows stopped working and
+        # instead dismissed the view. That mode is reachable without nodetop ever
+        # asking for it: it is set by full-screen programs and is left set by one
+        # that dies before restoring it, which is the same "terminal handed over
+        # in a bad state" case _FATAL_SIGNALS below exists for. Anything else
+        # after ESC is still a lone Escape.
+        if read(_ESCAPE_GRACE) not in ("[", "O"):
             return Key.ESCAPE        # a lone Escape
         return _ARROWS.get(read(_ESCAPE_GRACE), Key.OTHER)
     return _KEYS.get(ch, Key.OTHER)
@@ -310,19 +321,28 @@ class _RawMode:
         """Ctrl-Z: hand the terminal back, stop, and take it again on resume."""
         import signal
 
-        saved, previous = self._saved, dict(self._previous)
+        saved = self._saved
         self.__exit__()
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
-        # Resumed. Retake the terminal exactly as it was.
-        signal.signal(signum, self._suspend)
-        self._saved, self._previous = saved, previous
+        # Resumed. Retake the terminal exactly as it was -- and that includes
+        # the handlers, not just the modes. `__exit__` above put the ORIGINAL
+        # SIGTERM/SIGHUP dispositions back, as it must for the shell that now
+        # owns the terminal, so restoring the saved `_previous` dict records
+        # what they replaced without reinstalling anything: a resumed browse
+        # ran with `_die` uninstalled and default-handled fatal signals, which
+        # is precisely the process `_FATAL_SIGNALS` exists to prevent. SIGHUP
+        # from a dropped ssh connection then ends it with echo off, canonical
+        # mode off and the cursor hidden. `_catch_signals` re-arms them and
+        # re-reads what it displaced, so `__exit__` still hands back the truth.
+        self._saved = saved
         if saved is not None:
             import tty
 
             tty.setcbreak(sys.stdin.fileno())
             sys.stdout.write("\033[?25l")
             sys.stdout.flush()
+        self._catch_signals()
 
     def __exit__(self, *exc: object) -> None:
         self._restore_signals()

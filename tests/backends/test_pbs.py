@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from nodetop.backends.pbs import PbsBackend
 from nodetop.core.model import JobShape
 from nodetop.runner import RecordedRunner
@@ -163,6 +165,498 @@ class TestLimits:
         limits = pbs_backend.load_limits()["gpuq"]
         got = limits.blockers(JobShape(nodes=4, gpus_per_node=4, walltime="1h"))
         assert "MAX_GPU_USER" in {b.code for b in got}
+
+
+def _limits_from_qstat(text: str):
+    """Queue ceilings from hand-built `qstat -Qf` text.
+
+    The recorded fixture declares one entity per table, which is the shape that
+    cannot distinguish "the generic entry" from "the last entry" -- so the
+    multi-entity tables below are built here rather than added to it.
+    """
+    return PbsBackend(RecordedRunner({"qstat -Qf": (0, text, "")})).load_limits()
+
+
+#: PBS prints the cells of a per-entity limit table in whatever order the
+#: administrator set them, so a named user may appear before OR after
+#: `PBS_GENERIC`. `gpuq` puts alice last and `cpuq` puts her first; the same
+#: caller must get the same ceiling out of both.
+ENTITY_TABLES = """Queue: gpuq
+    queue_type = Execution
+    resources_max.walltime = 48:00:00
+    max_run_res.ngpus = [u:PBS_GENERIC=4],[u:alice=99]
+    max_run = [u:PBS_GENERIC=6],[u:alice=77]
+    max_queued = [u:PBS_GENERIC=9]
+    enabled = True
+    started = True
+
+Queue: cpuq
+    queue_type = Execution
+    max_run_res.ncpus = [u:alice=64],[u:PBS_GENERIC=8]
+    enabled = True
+    started = True
+"""
+
+
+class TestPerEntityLimitsResolveToTheCaller:
+    """`[u:PBS_GENERIC=4],[u:alice=99]` is a table, and 99 is not our number.
+
+    The read was end-anchored, so it returned the LAST cell -- which on any
+    queue that names a per-user override after the generic entry is somebody
+    else's ceiling, reported as ours. `Limits.blockers` then either invents a
+    `MAX_*_USER` blocker against a limit we do not have, or (the direction that
+    actually costs something) stays silent about the one we do: reading alice's
+    99 GPUs where PBS would hold us to 4 makes an over-limit job look
+    acceptable, and PBS has no dry-run to catch it afterwards.
+
+    Resolution order is the caller's own `u:` cell, then the generic cell.
+    """
+
+    def test_a_stranger_gets_the_generic_cell_not_the_tail(self, monkeypatch):
+        monkeypatch.setenv("USER", "bob")
+        # 99 is alice's override; bob is held to the generic 4.
+        assert _limits_from_qstat(ENTITY_TABLES)["gpuq"].per_user["gpu"] == 4
+
+    def test_our_own_cell_wins_over_the_generic_one(self, monkeypatch):
+        monkeypatch.setenv("USER", "alice")
+        assert _limits_from_qstat(ENTITY_TABLES)["gpuq"].per_user["gpu"] == 99
+
+    def test_our_own_cell_wins_wherever_it_sits_in_the_table(self, monkeypatch):
+        # cpuq lists alice FIRST, so reading the tail gives her the generic 8 --
+        # the same defect pointing the other way, and the reason position is not
+        # a usable proxy for identity.
+        monkeypatch.setenv("USER", "alice")
+        assert _limits_from_qstat(ENTITY_TABLES)["cpuq"].per_user["cpu"] == 64
+
+    def test_a_table_naming_only_other_users_declares_no_ceiling(self, monkeypatch):
+        monkeypatch.setenv("USER", "carol")
+        text = ENTITY_TABLES.replace(
+            "[u:PBS_GENERIC=4],[u:alice=99]", "[u:alice=99],[u:bob=1]")
+        # No cell applies to carol. Inheriting bob's 1 would refuse her a job
+        # PBS accepts; inheriting alice's 99 would promise one it will not run.
+        assert "gpu" not in _limits_from_qstat(text)["gpuq"].per_user
+
+    def test_control_a_lone_generic_cell_and_a_bare_integer_are_unchanged(
+        self, pbs_backend, monkeypatch
+    ):
+        """CONTROL -- passes before the fix and after it.
+
+        The recorded fixture's `max_run_res.ngpus = [u:PBS_GENERIC=8]` names one
+        entity, and `resources_max.ncpus = 256` is not a table at all. Neither
+        reading depends on the resolution order, so this test pins what the fix
+        must NOT disturb: a one-cell table, a plain integer, and a walltime that
+        goes nowhere near this helper.
+        """
+        monkeypatch.setenv("USER", "alice")  # named in the fixture's ACL
+        limits = pbs_backend.load_limits()["gpuq"]
+        assert limits.per_user["gpu"] == 8
+        assert limits.per_job["cpu"] == 256
+        assert limits.max_walltime_seconds == 48 * 3600
+
+
+class TestJobCountCeilingsAreTablesToo:
+    """`max_run` / `max_queued` carry the same per-entity syntax.
+
+    They were parsed with the plain-integer helper, whose regex anchors at the
+    START of the string -- so `[u:PBS_GENERIC=4]` yielded `None` and
+    `Limits.max_jobs` / `max_submitted` were `None` on every PBS cluster, while
+    the `max_run_res.ngpus` line directly above parsed fine. Nothing renders
+    these two fields today; the point is that the parse now agrees with the
+    sibling line instead of quietly dropping the value.
+    """
+
+    def test_max_run_becomes_max_jobs(self, pbs_backend):
+        # Recorded fixture, gpuq: `max_run = [u:PBS_GENERIC=4]`.
+        assert pbs_backend.load_limits()["gpuq"].max_jobs == 4
+
+    def test_max_queued_becomes_max_submitted(self, monkeypatch):
+        monkeypatch.setenv("USER", "bob")
+        assert _limits_from_qstat(ENTITY_TABLES)["gpuq"].max_submitted == 9
+
+    def test_the_callers_own_cell_applies_here_too(self, monkeypatch):
+        monkeypatch.setenv("USER", "alice")
+        assert _limits_from_qstat(ENTITY_TABLES)["gpuq"].max_jobs == 77
+
+    def test_control_an_undeclared_job_ceiling_stays_none(self, pbs_backend):
+        """CONTROL -- passes before the fix and after it.
+
+        `cpuq` declares neither attribute and the fixture's `gpuq` has no
+        `max_queued`. An absent ceiling must stay `None` rather than become a
+        number the site never published.
+        """
+        limits = pbs_backend.load_limits()
+        assert limits["gpuq"].max_submitted is None
+        assert limits["cpuq"].max_jobs is None
+        assert limits["cpuq"].max_submitted is None
+
+
+#: One queue declaring six ceilings, every one in a shape the parser answers
+#: `None` for; one declaring nothing at all. Before the fix these two produced
+#: byte-identical `Limits`.
+#:
+#: The shapes are PBS's own: a walltime in a spelling PBS never prints, a table
+#: cell that is not a number, a memory unit outside PBS's suffix list (`eb`),
+#: a word count too small to survive rounding to MB (`1024w` is 8 KiB), and two
+#: job counters holding words.  `pb` and `gw` were here until `_mem_to_mb`
+#: learned the peta prefix and the `w` unit -- both are read now.
+UNREADABLE_SHAPES = """Queue: shapeq
+    queue_type = Execution
+    resources_max.walltime = 2 days
+    resources_max.ncpus = [u:PBS_GENERIC=unlimited]
+    resources_max.mem = 2eb
+    max_run_res.mem = 1024w
+    max_run = many
+    max_queued = [o:PBS_ALL=lots]
+    enabled = True
+    started = True
+
+Queue: silentq
+    queue_type = Execution
+    enabled = True
+    started = True
+"""
+
+
+class TestPublishedButUnreadableCeilingsAreNamed:
+    """A ceiling PBS printed and we could not read must not read as no ceiling.
+
+    `Limits.unreadable` exists for exactly this: the Slurm adapter fills it
+    with `MaxWall` / `MaxTRESPerUser` / `MaxTRESPerJob` when a field is present
+    but unparseable, so `fit.evaluate` can say the check did not run. This
+    adapter filled the same dataclass and never touched the field -- so a
+    `max_run_res.*` or `resources_max.*` value in an unfamiliar shape simply
+    disappeared and the queue looked UNLIMITED on that axis, on the one
+    scheduler with no dry-run to catch it afterwards.
+    """
+
+    def test_every_unread_ceiling_is_named(self):
+        # Fixed order, not the order PBS happened to print them in.
+        assert _limits_from_qstat(UNREADABLE_SHAPES)["shapeq"].unreadable == (
+            "resources_max.walltime",
+            "max_run_res.mem",
+            "resources_max.mem",
+            "resources_max.ncpus",
+            "max_run",
+            "max_queued",
+        )
+
+    def test_no_blocker_is_invented_for_the_ceiling_that_was_not_read(self):
+        # Naming the gap must not become a limit nobody published: the numbers
+        # are genuinely unknown, so a 64-node 4096-CPU job is not "refused".
+        limits = _limits_from_qstat(UNREADABLE_SHAPES)["shapeq"]
+        shape = JobShape(nodes=64, cpus_per_task=64, memory_gb=900, walltime="72h")
+        assert limits.blockers(shape) == []
+        assert limits.per_job == {} and limits.max_jobs is None
+
+    def test_the_gap_reaches_the_report(self):
+        from nodetop.core.cluster import Cluster
+        from nodetop.core.fit import evaluate
+        from nodetop.core.model import BackendCapabilities, Node, Queue
+
+        queue = Queue(name="shapeq", node_names=("n",))
+        queue.nodes = [Node(name="n", cpus_total=32, memory_mb=256 * 1024,
+                            state_raw="up")]
+        cluster = Cluster(
+            backend_name="pbs", nodes=queue.nodes, queues={"shapeq": queue},
+            limits={"shapeq": _limits_from_qstat(UNREADABLE_SHAPES)["shapeq"]},
+            capabilities=BackendCapabilities(probe=False),
+        )
+        caveats = evaluate(cluster, JobShape(), queue).caveats
+        assert any("could not read resources_max.walltime" in c for c in caveats)
+        assert any("not checked at all" in c for c in caveats)
+
+    def test_control_a_queue_that_declares_no_ceiling_says_nothing(self):
+        """CONTROL -- passes before the fix and after it.
+
+        The boundary the whole change turns on: `silentq` prints none of these
+        attributes, so there is nothing unread about it. Reading absence as
+        unreadable would attach a caveat to every queue on every cluster and
+        make the field worthless.
+        """
+        assert _limits_from_qstat(UNREADABLE_SHAPES)["silentq"].unreadable == ()
+
+    def test_control_a_sentinel_or_an_empty_value_is_absence_not_a_shape(self):
+        """CONTROL -- passes before the fix and after it.
+
+        PBS prints an unset attribute with an empty value rather than omitting
+        it (the recorded fixture's `acl_users =` is that shape), and `unlimited`
+        says outright that there is no ceiling. Both mean the same as never
+        printing the line.
+        """
+        text = """Queue: sentinelq
+    queue_type = Execution
+    resources_max.walltime = unlimited
+    resources_max.ncpus =
+    max_run_res.ngpus = none
+    max_run =
+    enabled = True
+    started = True
+"""
+        limits = _limits_from_qstat(text)["sentinelq"]
+        assert limits.unreadable == ()
+        assert limits.max_walltime_seconds is None
+        assert limits.per_job == {} and limits.per_user == {}
+
+    def test_control_a_table_naming_only_other_users_is_read_not_unread(
+        self, monkeypatch
+    ):
+        """CONTROL -- passes before the fix and after it.
+
+        `[u:alice=99],[u:bob=1]` parses perfectly and correctly declares no
+        ceiling for carol; it is the one `None` here that is an answer rather
+        than a failure. Calling it unreadable would warn about a limit that
+        does not apply to the caller -- and this case already has a test one
+        class up asserting the ceiling itself stays absent.
+        """
+        monkeypatch.setenv("USER", "carol")
+        text = ENTITY_TABLES.replace(
+            "[u:PBS_GENERIC=4],[u:alice=99]", "[u:alice=99],[u:bob=1]")
+        limits = _limits_from_qstat(text)["gpuq"]
+        assert "gpu" not in limits.per_user
+        assert "max_run_res.ngpus" not in limits.unreadable
+
+
+#: `resources_max.mem` is the per-job memory ceiling and `max_run_res.mem` the
+#: per-user one; PBS prints the latter's cells with units, which is the shape
+#: that decided how the cell picker captures a value.  `ompthreads` is a real
+#: PBS resource this model has no ceiling axis for.
+MEM_CEILINGS = """Queue: memq
+    queue_type = Execution
+    resources_max.mem = 256gb
+    max_run_res.mem = [u:PBS_GENERIC=200gb],[u:alice=2tb]
+    resources_max.ompthreads = banana
+    enabled = True
+    started = True
+"""
+
+
+class TestMemoryCeilingsAreReadAtAll:
+    """`Limits.per_job["mem_mb"]` is a documented axis PBS never filled.
+
+    The resource map went `ngpus`/`ncpus`/`nodect` only, so every PBS memory
+    ceiling was dropped on the floor -- `Limits.blockers` checks `mem_mb`, and
+    Slurm supplies it from `MaxTRES`, so the same over-limit job was flagged on
+    one scheduler and silently accepted on the other. Dropping it also hid it
+    from `unreadable`: an axis nothing reads has nothing to report as unread,
+    which is why `2eb` above needed this fix before it could be named.
+    """
+
+    def test_a_per_job_memory_ceiling_is_read(self):
+        assert _limits_from_qstat(MEM_CEILINGS)["memq"].per_job["mem_mb"] == 256 * 1024
+
+    def test_a_per_entity_memory_table_resolves_like_any_other(self, monkeypatch):
+        monkeypatch.setenv("USER", "bob")
+        assert _limits_from_qstat(MEM_CEILINGS)["memq"].per_user["mem_mb"] == 200 * 1024
+
+    def test_the_callers_own_cell_wins_here_too(self, monkeypatch):
+        monkeypatch.setenv("USER", "alice")
+        assert _limits_from_qstat(MEM_CEILINGS)["memq"].per_user["mem_mb"] == 2048 * 1024
+
+    def test_an_over_limit_request_is_now_blocked(self, monkeypatch):
+        monkeypatch.setenv("USER", "bob")
+        got = _limits_from_qstat(MEM_CEILINGS)["memq"].blockers(
+            JobShape(nodes=1, memory_gb=300, walltime="1h"))
+        assert {"MAX_MEM_MB_JOB", "MAX_MEM_MB_USER"} <= {b.code for b in got}
+
+    def test_control_a_resource_with_no_ceiling_axis_here_is_left_alone(self):
+        """CONTROL -- passes before the fix and after it.
+
+        `ompthreads` is unreadable-looking and must stay unmentioned: it is a
+        limit nothing here was ever going to check, so naming it would be a
+        warning about a check that does not exist. Only an axis
+        `Limits.blockers` actually tests can go unchecked.
+        """
+        limits = _limits_from_qstat(MEM_CEILINGS)["memq"]
+        assert "ompthreads" not in limits.per_job
+        assert limits.unreadable == ()
+
+    def test_control_the_recorded_fixture_is_unchanged(self, pbs_backend, monkeypatch):
+        """CONTROL -- passes before the fix and after it.
+
+        Every queue in the recorded `qstat -Qf`, including the one printing an
+        empty `acl_users`: the axes that already worked keep their numbers and
+        nothing anywhere is reported unread.
+        """
+        monkeypatch.setenv("USER", "alice")
+        limits = pbs_backend.load_limits()
+        assert limits["gpuq"].per_user["gpu"] == 8
+        assert limits["gpuq"].per_job["cpu"] == 256
+        assert limits["gpuq"].max_walltime_seconds == 48 * 3600
+        assert limits["gpuq"].max_jobs == 4
+        assert all(not q.unreadable for q in limits.values())
+
+
+#: One node whose memory PBS reported in words. 512 GiB installed, one job
+#: holding 8 gigawords of it.
+WORD_NODE = """{
+  "nodes": {
+    "w001": {
+      "state": "free",
+      "resources_available": {"ncpus": 64, "mem": "64gw", "Qlist": "wordq"},
+      "resources_assigned": {"ncpus": 8, "mem": "8gw"}
+    }
+  }
+}
+"""
+
+#: Two queues whose memory ceilings use the two suffixes that were dropped.
+WORD_CEILING = """Queue: wordq
+    queue_type = Execution
+    resources_max.mem = 1gw
+    enabled = True
+    started = True
+
+Queue: petaq
+    queue_type = Execution
+    resources_max.mem = 1pb
+    enabled = True
+    started = True
+"""
+
+
+#: PBS's ``w`` unit, one row per shape PBS prints, as ``(text, mb)``.
+#:
+#: A PBS suffix is a size prefix *and* a unit: ``b`` is bytes and ``w`` is
+#: *words*, 8 bytes each on a 64-bit server. `_mem_to_mb` matched the unit and
+#: threw it away, so every `w` form answered its `b` twin's number -- `1gw`
+#: came out as 1024 MB where PBS means 8 GiB. An 8x understatement.
+WORD_SIZES = [
+    ("1mw", 8),
+    ("1gw", 8 * 1024),
+    ("1tw", 8 * 1024 * 1024),
+    ("16GW", 128 * 1024),        # PBS accepts either case
+    ("1.5gw", 12 * 1024),        # and a fraction, per its own syntax
+    ("131072w", 1),              # unprefixed, and the first such size past 1 MB
+]
+
+#: The ``b`` half of the same syntax, value for value -- the CONTROL rows.
+#: This scaling was verified correct in an earlier round and rewriting the
+#: regex is exactly how it would break, so every one of these must answer
+#: today's number both before the `w` fix and after it.
+BYTE_SIZES = [
+    ("1024kb", 1),
+    ("128gb", 128 * 1024),
+    ("2tb", 2 * 1024 * 1024),
+    ("1Gb", 1024),
+    ("1.5gb", 1536),
+    ("2097152", 2),              # bare = bytes
+    ("512kb", 0),                # under 1 MB: truncates, and always did
+    ("1b", 0),
+    ("0gb", 0),
+]
+
+
+class TestTheWordUnitIsEightBytes:
+    """`mem = 1gw` is 8 GiB, and PBS prints it.
+
+    PBS Pro's size syntax is ``<num><prefix><unit>`` where the unit is ``b``
+    *or* ``w``, a machine word -- so ``w``, ``kw``, ``mw``, ``gw``, ``tw`` are
+    all legal and all eight times their ``b`` twin. The regex matched ``[bw]``
+    and used only the prefix, which is not a harmless simplification of the
+    grammar: it published an eighth of the number PBS reported.
+
+    Nothing here is confined to queue ceilings. `_mem_to_mb` is also what
+    supplies `Node.memory_mb` and `Node.memory_alloc_mb`, and understating an
+    *assignment* is the one direction that invents capacity: free memory is
+    total minus assigned, so an `8gw` job holding 64 GiB was recorded as
+    holding 8, and the 56 GiB difference was published as available.
+    """
+
+    @pytest.mark.parametrize("text,mb", WORD_SIZES)
+    def test_a_word_size_is_read_as_words(self, text, mb):
+        from nodetop.backends.pbs import _mem_to_mb
+
+        assert _mem_to_mb(text) == mb
+
+    def test_a_node_sized_in_words_is_not_an_eighth_of_itself(self):
+        nodes = PbsBackend(RecordedRunner({"pbsnodes -a -F json": (0, WORD_NODE, "")})
+                           ).load_nodes()
+        assert {n.name: n.memory_mb for n in nodes} == {"w001": 512 * 1024}
+
+    def test_memory_held_by_a_job_is_not_published_as_free(self):
+        # The dangerous direction: `resources_assigned.mem = 8gw` is 64 GiB
+        # held, so 448 GiB is free -- not the 504 GiB an 8 GiB reading left.
+        node = PbsBackend(RecordedRunner({"pbsnodes -a -F json": (0, WORD_NODE, "")})
+                          ).load_nodes()[0]
+        assert node.memory_alloc_mb == 64 * 1024
+        assert node.memory_free_mb == 448 * 1024
+
+    def test_a_memory_ceiling_in_words_is_read_as_words(self):
+        limits = _limits_from_qstat(WORD_CEILING)["wordq"]
+        assert limits.per_job["mem_mb"] == 8 * 1024
+
+    def test_a_request_under_the_real_ceiling_is_not_refused(self):
+        # An understated ceiling refuses work the site accepts: 4 GB is well
+        # inside `1gw` = 8 GiB, and was blocked against a 1 GiB misreading.
+        limits = _limits_from_qstat(WORD_CEILING)["wordq"]
+        assert limits.blockers(JobShape(nodes=1, memory_gb=4, walltime="1h")) == []
+        assert [b.code for b in limits.blockers(
+            JobShape(nodes=1, memory_gb=16, walltime="1h"))] == ["MAX_MEM_MB_JOB"]
+
+    def test_a_sub_megabyte_word_count_answered_zero_before_and_after(self):
+        """Which forms were silently wrong, and which were already caught.
+
+        `1024w` is 8 KiB and `1kw` is the same 8 KiB; both truncate to 0 MB
+        with the unit read and without it, so `_pbs_mem_mb` turned them into
+        `None` and `Limits.unreadable` named them either way. Only the
+        prefixed forms big enough to survive the rounding -- `mw` and up --
+        landed silently wrong, which is why the matrix above starts there.
+        """
+        from nodetop.backends.pbs import _mem_to_mb, _pbs_mem_mb
+
+        assert _mem_to_mb("1024w") == _mem_to_mb("1kw") == 0
+        assert _pbs_mem_mb("1024w") is None
+        assert "max_run_res.mem" in _limits_from_qstat(UNREADABLE_SHAPES)["shapeq"].unreadable
+
+    def test_a_petabyte_is_not_a_node_with_no_memory(self):
+        """`p` is in PBS's suffix list and was missing from the scale map.
+
+        Safe as errors go -- 0 MB understates, and `Node.hardware_ok` drops a
+        node claiming no memory rather than offering it -- but it dropped the
+        node, and a ceiling of 0 is no ceiling at all.
+        """
+        from nodetop.backends.pbs import _mem_to_mb
+
+        assert _mem_to_mb("1pb") == 1024 * 1024 * 1024
+        assert _mem_to_mb("2PB") == 2 * 1024 * 1024 * 1024
+        assert _mem_to_mb("1pw") == 8 * 1024 * 1024 * 1024
+        assert _limits_from_qstat(WORD_CEILING)["petaq"].per_job["mem_mb"] == 1024 ** 3
+
+    @pytest.mark.parametrize("text,mb", BYTE_SIZES)
+    def test_control_every_byte_form_keeps_its_exact_value(self, text, mb):
+        """CONTROL -- passes before the fix and after it."""
+        from nodetop.backends.pbs import _mem_to_mb
+
+        assert _mem_to_mb(text) == mb
+
+    def test_control_the_recorded_fixture_is_unchanged(self, pbs_backend):
+        """CONTROL -- passes before the fix and after it.
+
+        The recorded `pbsnodes -a -F json` is all `gb` and one `0kb`, so every
+        node in it must come out byte-identical to the numbers a live PBS Pro
+        2022.1 printed.
+        """
+        nodes = {n.name: n for n in pbs_backend.load_nodes()}
+        assert [(n.memory_mb, n.memory_alloc_mb, n.memory_free_mb)
+                for _, n in sorted(nodes.items())] == [
+            (256 * 1024, 16 * 1024, 240 * 1024),    # cpu001, 16gb assigned
+            (256 * 1024, 0, 256 * 1024),            # cpu002, nothing assigned
+            (512 * 1024, 0, 512 * 1024),            # gpu001, "0kb" assigned
+            (512 * 1024, 500 * 1024, 12 * 1024),    # gpu002
+            (512 * 1024, 0, 512 * 1024),            # gpu003
+        ]
+
+    @pytest.mark.parametrize("junk", ["1wg", "1gbb", "1 g b", "gw", "-8gw", "1eb", "words"])
+    def test_control_a_shape_pbs_never_prints_is_still_nothing(self, junk):
+        """CONTROL -- passes before the fix and after it.
+
+        A wider unit vocabulary must not become a wider *grammar*: the unit
+        follows the prefix, there is exactly one of each, and anything else is
+        0 rather than a number guessed from the digits it happens to contain.
+        """
+        from nodetop.backends.pbs import _mem_to_mb
+
+        assert _mem_to_mb(junk) == 0
 
 
 class TestNoProbe:

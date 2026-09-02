@@ -186,6 +186,127 @@ class TestProbe:
         assert v.durable is False
 
 
+def _memory_quantity(flags):
+    """The ``memory=`` quantity out of a ``--requests=`` flag, or None."""
+    for flag in flags:
+        if flag.startswith("--requests="):
+            for part in flag.split("=", 1)[1].split(","):
+                key, _, value = part.partition("=")
+                if key == "memory":
+                    return value
+    return None
+
+
+class TestTheMemoryAskedForIsTheMemoryRequested:
+    """A pod request must not be smaller than the shape it was computed from.
+
+    ``--mem`` takes a fractional size, and this adapter built its quantity with
+    ``int(shape.memory_gb)``, which threw the remainder away *downwards*::
+
+        asked        emitted (before)   shape wants
+        0.5 GiB      memory=0Gi         512 MiB
+        1.5 GiB      memory=1Gi         1536 MiB
+        3.7 GiB      memory=3Gi         3788 MiB
+
+    The sub-gigabyte row is not a smaller request, it is a meaningless one. And
+    these flags are not only pasted: ``probe()`` hands them to ``kubectl run
+    --dry-run=server``, the one dry-run here that really evaluates a
+    ResourceQuota -- so the quota question was being asked about a figure up to
+    a gibibyte under the job.
+    """
+
+    #: Sizes a user can actually type. The sub-gigabyte pair is the one that
+    #: used to produce a request for nothing.
+    SIZES = [0.25, 0.5, 0.9, 1.0, 1.5, 2.0, 3.7, 15.5, 64.0, 500.75]
+
+    @staticmethod
+    def _mb(quantity):
+        if quantity.endswith("Mi"):
+            return int(quantity[:-2])
+        if quantity.endswith("Gi"):
+            return int(quantity[:-2]) * 1024
+        raise AssertionError(f"unexpected memory quantity {quantity!r}")
+
+    @pytest.mark.parametrize("gb", SIZES)
+    def test_the_request_is_exact(self, gb):
+        from nodetop.backends.kubernetes import KubernetesBackend
+
+        shape = JobShape(cpus_per_task=2, memory_gb=gb)
+        got = _memory_quantity(KubernetesBackend().submit_flags("research", shape))
+        assert got is not None, f"no memory quantity emitted for {gb} GiB"
+        assert self._mb(got) == shape.memory_mb_per_node, (
+            f"asks for {got} where the shape is {shape.memory_mb_per_node} MiB"
+        )
+
+    def test_a_sub_gigabyte_request_is_not_zero(self):
+        from nodetop.backends.kubernetes import KubernetesBackend
+
+        flags = KubernetesBackend().submit_flags(
+            "research", JobShape(memory_gb=0.5))
+        assert _memory_quantity(flags) == "512Mi"
+
+    def test_the_dry_run_asks_admission_about_the_real_figure(self):
+        # The quota verdict is only worth having if it was obtained for the
+        # shape that was assessed.
+        runner = RecordedRunner({
+            "auth can-i": (0, "yes\n", ""),
+            "kubectl run": (0, "pod/probe\n", ""),
+        })
+        from nodetop.backends.kubernetes import KubernetesBackend
+
+        KubernetesBackend(runner).probe("research", JobShape(memory_gb=1.5))
+        sent = " ".join(runner.calls[-1])
+        assert "memory=1536Mi" in sent, sent
+        assert "memory=1Gi" not in sent, sent
+
+    def test_it_agrees_with_the_other_adapters_on_the_number(self):
+        # One shape, one figure, whatever each scheduler's spelling of it.
+        from nodetop.backends.kubernetes import KubernetesBackend
+        from nodetop.backends.slurm import SlurmBackend
+
+        shape = JobShape(cpus_per_task=2, memory_gb=1.5)
+        k8s = self._mb(
+            _memory_quantity(KubernetesBackend().submit_flags("q", shape)))
+        slurm = next(
+            int(f.split("=")[1].rstrip("M"))
+            for f in SlurmBackend().submit_flags("q", shape)
+            if f.startswith("--mem=")
+        )
+        assert k8s == slurm == 1536
+
+
+class TestTheZeroAndUnsetMemoryCasesAreUnchanged:
+    """Controls: the fix must not invent a request, nor respell an exact one."""
+
+    def test_no_memory_asked_means_no_memory_quantity(self):
+        # An absent request must stay absent rather than become `memory=0Gi`.
+        from nodetop.backends.kubernetes import KubernetesBackend
+
+        flags = KubernetesBackend().submit_flags(
+            "research", JobShape(cpus_per_task=4, memory_gb=0.0))
+        assert _memory_quantity(flags) is None
+        assert "memory" not in " ".join(flags)
+
+    def test_a_whole_gibibyte_keeps_the_gi_spelling(self):
+        # `memory=64Gi` is what someone about to paste this wants to read;
+        # megabytes are for the figures gibibytes would lose.
+        from nodetop.backends.kubernetes import KubernetesBackend
+
+        flags = KubernetesBackend().submit_flags("research", JobShape(memory_gb=64))
+        assert _memory_quantity(flags) == "64Gi"
+
+    def test_requests_and_limits_still_carry_the_same_quantities(self):
+        from nodetop.backends.kubernetes import KubernetesBackend
+
+        flags = KubernetesBackend().submit_flags(
+            "research", JobShape(cpus_per_task=4, gpus_per_node=2, memory_gb=1.5))
+        requests = next(f for f in flags if f.startswith("--requests="))
+        limits = next(f for f in flags if f.startswith("--limits="))
+        assert requests.split("=", 1)[1] == limits.split("=", 1)[1]
+        assert "cpu=4" in requests
+        assert "nvidia.com/gpu=2" in requests
+
+
 class TestIdentity:
     def test_whoami(self, k8s_backend):
         ident = k8s_backend.load_identity()

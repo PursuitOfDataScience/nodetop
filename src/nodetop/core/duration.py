@@ -21,7 +21,7 @@ there the grammar is fixed by the system rather than chosen by us.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 __all__ = ["format_duration", "format_wait", "parse_duration", "parse_timestamp"]
 
@@ -102,7 +102,22 @@ def parse_duration(text: str | int | None) -> int | None:
 
 
 def format_duration(seconds: int | None) -> str:
-    """Render seconds as ``D-HH:MM:SS`` / ``H:MM:SS``."""
+    """Render seconds as ``D-HH:MM:SS`` / ``H:MM:SS``.
+
+    ``None`` is "unlimited" because that is what an absent Slurm ``MaxTime``
+    means, not because the value is missing.
+
+    The negative branch is unreachable defence, and is kept rather than removed
+    so the function is total. Every caller formats a walltime that came through
+    :func:`parse_duration` -- a queue maximum, an effective maximum, or the
+    walltime the user asked for -- and that function returns ``None`` for
+    anything non-positive: the ``int`` path is guarded (``text if text > 0``)
+    and both regexes anchor on unsigned digit groups, so no spelling of a
+    negative survives parsing. Clamping is therefore the right answer *here*, where the
+    alternative would be a number nothing can produce; contrast
+    :func:`format_wait` below, which is handed raw scheduler arithmetic and so
+    must name a negative ("overdue") rather than flatten it to "now".
+    """
     if seconds is None:
         return "unlimited"
     if seconds < 0:
@@ -194,15 +209,51 @@ def parse_timestamp(text: str | None) -> datetime | None:
         "%Y-%m-%dT%H:%M:%S",   # Slurm
         "%Y-%m-%dT%H:%M",
         "%a %b %d %H:%M:%S %Y",  # PBS / LSF long form
-        "%b %d %H:%M",           # LSF short form (no year)
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d",
     ):
         try:
-            got = datetime.strptime(t, fmt)
+            return datetime.strptime(t, fmt)
         except ValueError:
             continue
-        # A format with no year defaults to 1900; assume the current year,
-        # which is the only sane reading for a scheduler's near-term estimate.
-        return got.replace(year=datetime.now().year) if got.year == 1900 else got
+    # LSF's short form carries no year, and the year is supplied HERE rather
+    # than left to `strptime`'s 1900 default.
+    #
+    # The default is the thing Python is removing. CPython already warns --
+    # "the default behavior will change in Python 3.15 to either always raise
+    # an exception or to use a different default year (TBD)" -- and both
+    # announced outcomes broke the `got.year == 1900` sentinel this used to
+    # rely on, one of them silently: a raise is swallowed by the `except
+    # ValueError: continue` above and the branch stops matching, while a
+    # different default year no longer trips the sentinel and feeds a wrong
+    # year into every duration computed from it. `requires-python` has no
+    # upper bound, so 3.15 will install this.
+    #
+    # Appending the year to both input and format is what the warning itself
+    # advises, and it also fixes the leap-day case the warning names: Feb 29
+    # is unparsable against 1900 and parses fine against a real leap year.
+    now = datetime.now()
+    for fmt in ("%b %d %H:%M", "%b %d %H:%M:%S"):
+        try:
+            got = datetime.strptime(f"{t} {now.year}", f"{fmt} %Y")
+        except ValueError:
+            continue
+        # Across a New Year boundary the current year is the wrong guess, and
+        # wrong by eleven months: `Dec 31 23:50` read on 2 January becomes a date
+        # in the *future*, and this format is LSF's short form -- used for exactly
+        # the recent events where the wrap matters. The classic syslog-timestamp
+        # bug, and it only surfaces in the first days of January, which is why it
+        # survives review.
+        #
+        # A day of slack, not zero: these are scheduler estimates, and a start
+        # time a few minutes ahead of the local clock is ordinary (see the
+        # clock-skew note in `nodetop.core.fit`). Only a stamp that cannot be
+        # recent gets rolled back.
+        if got - now > timedelta(days=1):
+            try:
+                return got.replace(year=now.year - 1)
+            except ValueError:
+                # 29 February in the assumed year, absent from the previous one.
+                return got
+        return got
     return None

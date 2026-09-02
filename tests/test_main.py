@@ -160,6 +160,12 @@ class TestBackendSelection:
         assert rc == 2
         assert "unknown backend" in err
         assert "slurm" in err  # the options are named, not just rejected
+        # ...and it reads as a sentence. The registry raises KeyError, whose
+        # __str__ is repr(args[0]), so printing str(exc) wrapped the whole line
+        # in quotes: "unknown backend 'torque-classic'; known: slurm, ...".
+        first = err.strip().splitlines()[0]
+        assert not first.startswith('"'), first
+        assert not first.endswith('"'), first
 
     def test_forcing_an_undetected_backend_warns_but_proceeds(self, capsys, monkeypatch):
         # The detector is deliberately conservative and a caller may know

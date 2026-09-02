@@ -21,7 +21,7 @@ import re
 from collections.abc import Iterable
 from datetime import datetime
 
-from ..core.hardware import identify_accelerator
+from ..core.hardware import identify_accelerator, name_accelerator
 from ..core.model import (
     Identity,
     Job,
@@ -50,15 +50,51 @@ _STATE_LETTERS = {
 }
 
 
+#: Grid Engine's memory multipliers, in MB (= MiB, as everywhere else here).
+#:
+#: **Case is significant, and it is the opposite convention to every other
+#: scheduler in this package**: `sge_types(5)` defines lower case as DECIMAL and
+#: upper case as BINARY -- ``k`` is 1000 bytes but ``K`` is 1024, ``g`` is
+#: 1000^3 but ``G`` is 1024^3.  Folding the two together (which is what
+#: ``re.IGNORECASE`` plus ``.upper()`` did here) reads every lower-case size
+#: 1024/1000 per prefix too HIGH: 2.4% at ``k``, 4.9% at ``m``, 7.4% at ``g``,
+#: 10.0% at ``t``.  Small, silent, and in the dangerous direction -- both
+#: `Node.memory_mb` and `Node.memory_alloc_mb` come through here, so
+#: ``memory_free_mb = memory_mb - memory_alloc_mb`` scales with them and a
+#: ``512g``/``64g`` host published 7.4% more free memory than it has.
+#:
+#: ``P`` is deliberately absent: no Grid Engine flavour documents a petabyte
+#: multiplier, and inventing one turned a 1-byte ``1P`` into 1 PiB.
+_SGE_MULTIPLIER_MB = {
+    "": 1 / (1024 * 1024),
+    "k": 1000 / (1024 * 1024),          "K": 1 / 1024,
+    "m": 1000**2 / (1024 * 1024),       "M": 1,
+    "g": 1000**3 / (1024 * 1024),       "G": 1024,
+    "t": 1000**4 / (1024 * 1024),       "T": 1024 * 1024,
+}
+
+
 def _mem_to_mb(text: str | None) -> int:
+    """Grid Engine memory sizes: ``251.6G``, ``4.0G``, ``512g``, bare bytes.
+
+    Case carries the base -- see :data:`_SGE_MULTIPLIER_MB`.  ``1G`` is 1024 MB
+    and ``1g`` is 953; ``qhost`` itself only ever prints the upper-case binary
+    forms, but an admin-written ``h_vmem=512g`` is decimal and means 488281 MB,
+    not 524288.
+
+    The match is anchored, so a shape outside Grid Engine's own vocabulary
+    (``1P``, ``1Gw``, ``infinity``, ``-``) answers 0 = "not read" rather than
+    being truncated to whatever prefix happens to parse.  The digit group is
+    also pinned to one optional decimal point: ``[\\d.]+`` accepted ``1.2.3.4``
+    and then raised `ValueError` out of `float`, which took the *whole* node
+    listing down rather than one field.
+    """
     if not text or text in {"-", ""}:
         return 0
-    m = re.match(r"^\s*([\d.]+)\s*([KMGTP]?)", str(text), re.IGNORECASE)
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([kKmMgGtT]?)\s*$", str(text))
     if not m:
         return 0
-    scale = {"": 1 / (1024 * 1024), "K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024,
-             "P": 1024**3}
-    return int(float(m.group(1)) * scale.get(m.group(2).upper(), 1))
+    return int(float(m.group(1)) * _SGE_MULTIPLIER_MB[m.group(2)])
 
 
 def _sge_seconds(text: str | None) -> int | None:
@@ -184,6 +220,9 @@ class SgeBackend:
                     accelerator=identify_accelerator(
                         None, model or [f"{k}={v}" for k, v in resources.items()]
                     ),
+                    accelerator_label=name_accelerator(
+                        None, model or [f"{k}={v}" for k, v in resources.items()]
+                    ) or "",
                     labels=tuple(f"{k}={v}" for k, v in resources.items()),
                     queues=tuple(queues),
                     unreachable="u" in letters,
@@ -454,7 +493,23 @@ class SgeBackend:
             m, s = divmod(rem, 60)
             resources.append(f"h_rt={h:02d}:{m:02d}:{s:02d}")
         if shape.memory_gb:
-            resources.append(f"h_vmem={int(shape.memory_gb)}G")
+            # A fractional --mem is accepted (`--mem 1.5G` -> memory_gb 1.5), and
+            # `int()` on gigabytes threw the remainder away *downwards*: 1.5 became
+            # 1G and 0.5 became **0G**, a request for no memory at all. Under-asking
+            # is what gets a job killed, so the flags this tool hands over to be
+            # pasted must not ask for less than the shape they were computed from.
+            # Megabytes are exact and both schedulers take the unit; the Slurm and
+            # LSF backends already emit MB for the same reason.
+            #
+            # Gigabytes are KEPT when the figure is a whole number of them: that is
+            # what almost every request is, `mem=64gb` reads better than `mem=65536mb`
+            # in a command someone is about to paste, and two existing backend tests
+            # rightly asserted that spelling. Megabytes appear only where gigabytes
+            # would lose something.
+            mb = shape.memory_mb_per_node
+            resources.append(
+                f"h_vmem={mb // 1024}G" if mb % 1024 == 0 else f"h_vmem={mb}M"
+            )
         if shape.gpus_per_node:
             resources.append(f"gpu={shape.gpus_per_node}")
         if resources:
