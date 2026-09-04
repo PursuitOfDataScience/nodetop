@@ -18,12 +18,20 @@ Three facts about real clusters shape the design:
   in whatever case the admin typed that day (``a100``, ``A100``, ``H100``,
   ``L40S``, ``rtx6000``).  Kubernetes is the same story: ``nvidia.com/gpu``
   plus a ``nvidia.com/gpu.product=NVIDIA-A100-SXM4-40GB`` label.
-* **Memory size is an inference, never a measurement.**  Every scheduler's
-  memory field is host RAM; none record accelerator memory.  ``A100`` alone
-  does not say 40 GB or 80 GB.  Values here are therefore reported as
-  inferences with an explicit :attr:`AcceleratorSpec.memory_certain` flag, and
-  the conservative variant is used for fit decisions so the failure mode is a
-  needless warning rather than an OOM ninety minutes into a run.
+* **Memory size is an inference until the label says otherwise.**  Every
+  scheduler's *memory field* is host RAM; none of them record accelerator
+  memory as a resource, and ``A100`` alone does not say 40 GiB or 80 GiB.
+  Values here are therefore reported as inferences with an explicit
+  :attr:`AcceleratorSpec.memory_certain` flag, and the conservative variant is
+  used for fit decisions so the failure mode is a needless warning rather than
+  an OOM ninety minutes into a run.  But the *product string* frequently does
+  say: ``NVIDIA-A100-SXM4-80GB`` and ``a100-40gb`` name the size outright, and
+  so does a typed ``Gres=gpu:a100-80gb:4``.  :func:`identify_accelerator` reads
+  it back off either when it names one of the sizes this table already declares
+  for that part, and pins nothing when the two contradict each other -- see
+  :func:`_pin_memory_from_label`.  Selecting among declared variants is not
+  guessing; discarding the one place a scheduler DOES record the size is what
+  ruled out every 80 GiB node under ``--gpu-mem 80``.
 * **Capability is not a function of one number.**  Deriving dtype support from
   a CUDA compute capability works until an AMD or Intel part shows up, and
   then it silently reports nonsense.  Each capability is therefore stored
@@ -33,7 +41,7 @@ Three facts about real clusters shape the design:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 __all__ = [
     "ACCELERATORS",
@@ -57,7 +65,31 @@ class AcceleratorSpec:
     #: Architecture string as the vendor names it: ``sm_80``, ``gfx90a``,
     #: ``Xe-HPC``.  For display and for matching a toolchain target.
     arch: str
+    #: Accelerator memory in **gibibytes** despite the field name.  This is the
+    #: vendor's own figure, and the vendor's figure is binary -- checked against
+    #: NVIDIA's MIG user guide rather than assumed, because if it were decimal
+    #: every "GiB" this tool prints for HBM would be 7% high::
+    #:
+    #:     |   0  A100-SXM4-40GB      Off  | 00000000:36:00.0 Off |         0 |
+    #:     | N/A   29C    P0    62W / 400W |      0MiB / 40537MiB | 6% Default|
+    #:
+    #: Decimal 40 GB is 40e9 B = **38146 MiB** (37.25 GiB).  The card reports
+    #: **40537 MiB**, which is 2390 MiB MORE than the decimal reading allows and
+    #: 423 MiB (~1%) less than 40 x 2**30 -- the ECC and reserved carve-out.  So
+    #: "40GB" in the product name is 40 GiB.  The same guide's ``mig -lgip``
+    #: table settles the unit outright: its Memory column is headed ``GiB`` and
+    #: the eighth-of-a-card ``1g.5gb`` profile is listed as ``4.75``, so
+    #: NVIDIA's own "5gb" is 5 GiB less reserve, not 4.66.
+    #:
+    #: This is the JEDEC convention (JESD100B.01 defines ``G`` as 2**30 in front
+    #: of a semiconductor memory capacity), the same one that makes Slurm's
+    #: ``--mem=244G`` binary -- so ``--gpu-mem`` and this field are the same
+    #: quantity and compare like for like.  The field name is left alone: it is
+    #: on the public :class:`AcceleratorSpec` and renaming it is not a
+    #: labelling fix.
     memory_gb: int
+    #: Every size this part ships in, when the model name does not pin one.
+    #: A label may SELECT from this tuple; it may never add to it.
     memory_variants: tuple[int, ...] = ()
     #: False when the model name alone does not pin the memory size.
     memory_certain: bool = True
@@ -225,6 +257,192 @@ _NON_ACCELERATOR_LABEL = re.compile(
 )
 
 
+#: A label naming a MIG *slice* rather than a whole card.  Either spelling is
+#: conclusive: ``-MIG-`` as its own token, or the ``<n>g.<m>gb`` profile shape.
+_MIG_SLICE = re.compile(r"\bmig\b|\d+g\.\d+gb", re.IGNORECASE)
+
+
+def _pin_memory_from_label(spec: AcceleratorSpec, *values: str) -> AcceleratorSpec:
+    """``spec`` with its memory pinned, if ``values`` name a declared variant.
+
+    **The one place a scheduler does record accelerator memory is the product
+    string, and it was being thrown away.**  ``nvidia.com/gpu.product`` is
+    ``NVIDIA-A100-SXM4-80GB``; a Slurm feature is written ``a100-80gb``; the
+    alias table below already lists ``a10080gb`` and ``h10080gb`` precisely
+    because sites write it that way.  All of them matched the ``A100`` row and
+    inherited its *conservative* 40 with ``memory_certain=False``, so
+    ``where -g 1 --gpu-mem 80`` answered "A100 has 40 GiB, need 80 (inferred
+    from model)" and ruled out every node -- on a cluster that had said 80 in
+    the label the tool was reading.
+
+    Two rules keep this a selection rather than a guess, which is the whole
+    difference between this and inventing a number:
+
+    * **Only a size already in :attr:`~AcceleratorSpec.memory_variants` counts.**
+      A part with no variants is pinned by its model name and is left alone; a
+      label naming a size the table has never heard of (a future 96 GiB A100)
+      leaves the conservative default AND ``memory_certain=False`` in place, so
+      an unknown stays an honest unknown.
+    * **The size is read off the RAW value, never the normalised one**, and a
+      digit may not immediately precede it.  ``_normalise`` strips separators,
+      which turns ``A100-SXM4-40GB`` into ``a100sxm440gb`` -- where a plain
+      ``(\\d+)gb`` reads the size as **440**, borrowing the ``4`` from the form
+      factor.  The lookbehind is what makes ``-40GB`` legible and ``sxm440gb``
+      not.
+
+    The size is deliberately NOT anchored to the end of the string, because the
+    80 GiB PCIe part is labelled ``NVIDIA-A100-80GB-PCIe`` -- ``nvidia-smi -L``
+    names it that way and the GPU feature discovery label follows -- so an
+    end-anchored read would miss the flagship 80 GiB card and go on ruling it
+    out.  ``NVIDIA-H100-80GB-HBM3`` is the same shape.
+
+    **A MIG slice is refused outright.**  ``NVIDIA-A100-SXM4-40GB-MIG-1g.5gb``
+    names a 40 GiB card, but the unit the scheduler hands out is a 1/8 slice
+    with 4.75 GiB behind it, so pinning 40 as CERTAIN there would let a 40 GiB
+    job onto a 4.75 GiB allocation -- an error in the OOM direction, which is
+    the one this module exists to avoid.  Unpinned it stays: ``>=40``, flagged
+    as an inference, exactly as before.
+
+    The cost of the raw-value rule is a label written with no separator at all
+    (``a10080gb``): ``80`` there is preceded by a digit, so the size is not
+    read and the conservative 40 stands.  That is the safe direction, and it is
+    the alias spelling rather than anything a scheduler emits.
+
+    **More than one source may name the card, and then they must agree.**  A
+    Slurm node can carry both a typed ``Gres=gpu:a100-80gb:4`` and a feature
+    ``a100-80gb``; :func:`identify_accelerator` passes both here.  With one
+    value this is the single-source rule above, unchanged.  With two:
+
+    * Either naming a size while the other names none pins it -- a source that
+      is silent about the size is not evidence against it.
+    * Both naming the SAME size pins it, which is the common case and the whole
+      reason a site types its GRES.
+    * Both naming DIFFERENT sizes pins nothing.  ``Gres=gpu:a100-80gb:4`` on a
+      node whose feature says ``a100-40gb`` is a site where one of the two
+      strings is stale, and nothing here says which: both are hand-typed by the
+      same admin, so ranking them would be a guess dressed as precedence.  The
+      module's rule is that only a *known* fact decides, and a contradiction is
+      not a known anything -- so the conservative variant and
+      ``memory_certain=False`` stay, which is exactly the state an untyped
+      ``a100`` is already in.  That keeps the error on the needless-warning
+      side rather than admitting an 80 GiB job onto a 40 GiB card, and the
+      caveat the flag already prints ("the smaller was assumed") points the
+      reader at the labels.
+    * A MIG spelling in ANY value refuses the pin outright, even one another
+      value names a size for.  ``Gres=gpu:a100-80gb:4`` with a product label of
+      ``NVIDIA-A100-SXM4-80GB-MIG-3g.40gb`` is an 80 GiB card handing out
+      40 GiB thirds; pinning the 80 the GRES states would be the OOM-direction
+      error the guard exists to prevent, so the veto crosses sources.
+    """
+    if not spec.memory_variants or any(_MIG_SLICE.search(v) for v in values):
+        return spec
+    named = set()
+    for value in values:
+        for variant in spec.memory_variants:
+            if re.search(rf"(?<![0-9]){variant}\s*G(?:i?B)?(?![0-9A-Za-z])",
+                         value, re.IGNORECASE):
+                named.add(variant)
+                break
+    if len(named) != 1:
+        return spec
+    return replace(spec, memory_gb=named.pop(), memory_certain=True)
+
+
+#: A memory size written as a suffix on a model name: the ``-80gb`` of
+#: ``a100-80gb``, the ``-32GB`` of ``V100-32GB``.  The ``b`` is required, so a
+#: host-RAM feature written ``256g`` is not read as an accelerator size.
+_MEMORY_SUFFIX = re.compile(r"[-_ ]?\d+\s*gi?b$", re.IGNORECASE)
+
+
+def _spec_for_token(value: str) -> AcceleratorSpec | None:
+    """The spec one token names exactly, allowing a trailing memory size.
+
+    **Naming the size cost a site the whole card.**  The alias table carries
+    size-suffixed entries for exactly two parts -- ``a10040gb``/``a10080gb``
+    and ``h10080gb``, hand-written because sites spell it that way -- and
+    nothing generates the rest, so every other multi-variant part resolved to
+    ``None`` the moment the size appeared in the string::
+
+        identify_accelerator("gpu:v100-32gb:4")     -> None
+        identify_accelerator("gpu:gh200-144gb:4")   -> None
+        identify_accelerator("gpu:pvc-128gb:4")     -> None
+        identify_accelerator("gpu:h100-94gb:4")     -> None
+
+    while the bare form answered ``V100 16``, ``GH200 96``, ``PVC 48``,
+    ``H100 80``.  ``None`` is not a smaller answer than those -- it is a
+    different one: the row prints ``arch -``, ``mem -``, ``bf16 unknown`` and
+    the card is counted in no capability claim at all, so a fleet of 32 GiB
+    V100s reads as a fleet of unidentifiable accelerators.  The same string is
+    the spelling :func:`_pin_memory_from_label` documents as typical for a
+    Slurm feature, and it reached the memory pin for one vendor's one part.
+
+    Retrying the lookup with the size removed is a *fallback*: it runs only
+    where the exact lookup has already failed, so no token that resolves today
+    resolves differently.  The size itself is still read off the raw value by
+    :func:`_pin_memory_from_label` under all of its rules -- so a size the
+    table declares pins it (``v100-32gb`` -> 32, certain), a size it does not
+    leaves the conservative variant and ``memory_certain=False`` standing
+    (``a100-96gb`` -> 40, uncertain, which is what that function's docstring
+    already claimed and could not deliver), and a MIG spelling still vetoes
+    the pin while the model comes back.
+
+    The suffix requires the ``b`` of ``GB``/``GiB``.  A node feature list is
+    full of bare-``g`` sizes that are host RAM -- ``256g`` -- and those must
+    not be read as part of a model name.
+    """
+    spec = _BY_ALIAS.get(_normalise(value))
+    if spec is not None:
+        return spec
+    stripped = _MEMORY_SUFFIX.sub("", value.strip())
+    if not stripped or stripped == value.strip():
+        return None
+    return _BY_ALIAS.get(_normalise(stripped))
+
+
+def _identify_from_labels(
+    labels: str | list[str] | None,
+) -> tuple[AcceleratorSpec, str] | None:
+    """The spec a label set names, WITH the raw token value that named it.
+
+    The value comes back alongside the spec because the memory size may only
+    be read off the token that identified the card, never off a sibling label.
+    A node's feature list is mostly sizes that have nothing to do with the GPU
+    -- ``256g`` is host RAM -- and ``80g`` there would otherwise pin 80 GiB of
+    HBM on a 40 GiB A100.  Pairing the two keeps the size and the model coming
+    from one string, which is what made the single-label case safe.
+    """
+    if not labels:
+        return None
+    tokens = labels.split(",") if isinstance(labels, str) else list(labels)
+
+    # 2. Exact alias match on a label token.  Tried for every token before any
+    #    substring matching, so a clean "a100" always wins.
+    candidates: list[str] = []
+    for raw in tokens:
+        token = raw.strip()
+        if not token or _NON_ACCELERATOR_LABEL.match(token):
+            continue
+        # A k8s label arrives as key=value; the model is in the value.
+        value = token.split("=", 1)[1] if "=" in token else token
+        spec = _spec_for_token(value)
+        if spec is not None:
+            return spec, value
+        candidates.append(value)
+
+    # 3. Substring match, but only inside something that names a vendor.  The
+    #    marker is tested against the *normalised* value: a label written
+    #    "Intel-Data-Center-GPU-Max-1550" contains no literal "datacenter"
+    #    until the punctuation is stripped.
+    for value in candidates:
+        flat = _normalise(value)
+        if not (_VENDOR_MARKER.search(value) or _VENDOR_MARKER.search(flat)):
+            continue
+        for alias, spec in _ALIASES_BY_LENGTH:
+            if len(alias) >= 3 and alias in flat:
+                return spec, value
+    return None
+
+
 def identify_accelerator(
     resource: str | None = None,
     labels: str | list[str] | None = None,
@@ -239,46 +457,40 @@ def identify_accelerator(
 
     Returns ``None`` when the node has no accelerator, or has one whose model
     cannot be determined -- an honest "unknown" rather than a guess.
+
+    **A typed resource decides the MODEL, not the memory size on its own.**
+    The resource path used to return the moment it matched an alias, which
+    meant the memory pin was unreachable from the one form a site that bothers
+    to type its GRES actually emits: ``Gres=gpu:a100-80gb:4`` answered
+    ``(40, uncertain)`` even though the string says 80, and on a node carrying
+    both a bare ``Gres=gpu:a100:4`` and a feature ``a100-80gb`` the early
+    return threw the feature away unread.  The typed form is at least as
+    authoritative about the size as a node feature -- it is the string Slurm
+    allocates against -- so both are read and reconciled by
+    :func:`_pin_memory_from_label`, which pins only when they do not
+    contradict each other.
+
+    The label's size is consulted only when the label names the SAME model the
+    resource does.  ``Gres=gpu:a100:4`` beside a ``v100-32gb`` feature is a
+    stale feature about a different card, and 32 is not a fact about the A100.
     """
+    from_labels = _identify_from_labels(labels)
+
     # 1. A typed resource is authoritative when present.
     if resource:
         for entry in resource.split(","):
             parts = entry.strip().replace("=", ":").split(":")
             if len(parts) >= 3 and parts[0].lower() in {"gpu", "gres/gpu"}:
-                spec = _BY_ALIAS.get(_normalise(parts[1]))
+                spec = _spec_for_token(parts[1])
                 if spec is not None:
-                    return spec
+                    named = [parts[1]]
+                    if from_labels is not None and from_labels[0].model == spec.model:
+                        named.append(from_labels[1])
+                    return _pin_memory_from_label(spec, *named)
 
-    if not labels:
+    if from_labels is None:
         return None
-    tokens = labels.split(",") if isinstance(labels, str) else list(labels)
-
-    # 2. Exact alias match on a label token.  Tried for every token before any
-    #    substring matching, so a clean "a100" always wins.
-    candidates: list[str] = []
-    for raw in tokens:
-        token = raw.strip()
-        if not token or _NON_ACCELERATOR_LABEL.match(token):
-            continue
-        # A k8s label arrives as key=value; the model is in the value.
-        value = token.split("=", 1)[1] if "=" in token else token
-        spec = _BY_ALIAS.get(_normalise(value))
-        if spec is not None:
-            return spec
-        candidates.append(value)
-
-    # 3. Substring match, but only inside something that names a vendor.  The
-    #    marker is tested against the *normalised* value: a label written
-    #    "Intel-Data-Center-GPU-Max-1550" contains no literal "datacenter"
-    #    until the punctuation is stripped.
-    for value in candidates:
-        flat = _normalise(value)
-        if not (_VENDOR_MARKER.search(value) or _VENDOR_MARKER.search(flat)):
-            continue
-        for alias, spec in _ALIASES_BY_LENGTH:
-            if len(alias) >= 3 and alias in flat:
-                return spec
-    return None
+    return _pin_memory_from_label(*from_labels)
 
 
 #: Tokens that NAME a vendor accelerator product, for a card the vocabulary

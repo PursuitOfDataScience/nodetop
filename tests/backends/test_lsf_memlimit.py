@@ -15,6 +15,17 @@ already spells out why that is the worst available outcome: it "invents a blocke
 for a job that would have run". So the ceiling is filled only when it is
 comparable, and otherwise named in ``Limits.unreadable``, which exists to keep
 exactly this gap visible "without inventing a limit nobody published".
+
+The other awkward part *was* parsing, and is now handled. ``bqueues -l`` prints
+limits two ways: one label alone on its line with its value below, and a
+*combined* table where several limits share one header row. The combined form
+used to answer ``unreadable`` outright, because reading the next line's first
+size there yields ``FILELIMIT``'s value and nothing here would guess at a
+column. `_memlimit_cell` reads the character columns instead, and still answers
+``unreadable`` for any row whose cell order and column positions disagree -- so
+the layout is either read correctly or named, never misread. No cluster is
+reachable to record a sample of it, so the shapes below are built from IBM's
+documented output and from the layout rule it shows.
 """
 
 from nodetop.backends import lsf as lsfmod
@@ -34,8 +45,12 @@ MEMLIMIT
  4194304 K
 """
 
-# IBM's own documented combined table. The next line's first size is
-# FILELIMIT's, not MEMLIMIT's.
+# IBM's own documented combined table, verbatim. The next line's FIRST size is
+# FILELIMIT's, not MEMLIMIT's -- that is the wrong answer this layout invites.
+#
+# The five columns are the reason this row makes a good anchor: read as MB they
+# are 7, 9, 1, 19 and 4, all distinct, so asserting 4 rules out every other
+# column rather than merely agreeing with the right one.
 _COMBINED = """QUEUE: normal
 PARAM: PRIO NICE STATUS          MAX JL/U
        50    20  Open:Active       -    8
@@ -44,12 +59,49 @@ PARAM: PRIO NICE STATUS          MAX JL/U
     8000 K    10000 K      2000 K     20000 K     5000 K
 """
 
+# The same row with MEMLIMIT's label glued to CORELIMIT's by a single space, so
+# the two rows no longer split into the same number of cells. Nothing can place
+# the columns, so nothing may be read from them.
+_GLUED = """QUEUE: normal
+PARAM: PRIO NICE STATUS          MAX JL/U
+       50    20  Open:Active       -    8
+
+ FILELIMIT   DATALIMIT   STACKLIMIT  CORELIMIT MEMLIMIT
+    8000 K    10000 K      2000 K     20000 K   5000 K
+"""
+
 _NO_MEMLIMIT = """QUEUE: normal
 PARAM: PRIO NICE STATUS          MAX JL/U
        50    20  Open:Active       -    8
 
 RUNLIMIT
  1440.0 min
+"""
+
+
+def _combined(pairs, gutter="   "):
+    """A combined limit row laid out the way IBM's documented one reads.
+
+    Each column is as wide as the wider of its label and its value, both
+    right-aligned in it, with a gutter between. Built here rather than recorded
+    because ``tests/fixtures/lsf/bqueues_l.txt`` has no combined table at all --
+    it declares only ``RUNLIMIT``, alone on its line -- and no LSF cluster is
+    reachable to record one. So the shapes come from the layout rule, and
+    `_COMBINED` above keeps the documented row itself as the anchor.
+
+    Note this builds *exact* right edges while IBM's published row is off by up
+    to two characters. Both must read, which is why the reader tests nearest
+    column rather than equal edges.
+    """
+    cells = [(k, v, max(len(k), len(v))) for k, v in pairs]
+    header = gutter.join(k.rjust(w) for k, _v, w in cells)
+    values = gutter.join(v.rjust(w) for _k, v, w in cells)
+    return f"""QUEUE: normal
+PARAM: PRIO NICE STATUS          MAX JL/U
+       50    20  Open:Active       -    8
+
+ {header}
+ {values}
 """
 
 
@@ -97,23 +149,141 @@ def test_the_two_not_comparable_causes_read_differently(monkeypatch):
     assert _limits(bare, True, site_unit=None, monkeypatch=monkeypatch).unreadable == (
         "MEMLIMIT",
     )
-    # and so is the layout that will not be guessed at
-    assert _limits(_COMBINED, True, monkeypatch=monkeypatch).unreadable == ("MEMLIMIT",)
+    # and so is a combined row whose columns cannot be placed
+    assert _limits(_GLUED, True, monkeypatch=monkeypatch).unreadable == ("MEMLIMIT",)
 
     # the sentence a user actually sees, built the way `fit.py` builds it
     sentence = f"could not read {per_process} on lsf queue limits normal"
     assert "could not read MEMLIMIT as a job-wide ceiling" in sentence
 
 
-def test_the_combined_table_is_not_guessed_at(monkeypatch):
-    """The layout with no recorded sample: reported unreadable, not misread.
+def test_the_combined_table_reads_its_own_column(monkeypatch):
+    """IBM's documented combined row now resolves to MEMLIMIT's own cell.
 
     The specific wrong answer this rules out is FILELIMIT's 8000 K arriving as
     the memory ceiling, which is what reading the next line's first size gives.
+    5000 K is 4 MB on `_LSF_SCALE`'s binary K -- IBM's example values are toys,
+    but they are the published ones, and the five columns land on five distinct
+    MB figures so the assertion identifies the column rather than just agreeing
+    with it.
     """
     lim = _limits(_COMBINED, True, monkeypatch=monkeypatch)
-    assert "mem_mb" not in lim.per_job, "no cell may be guessed from a column layout"
-    assert lim.unreadable == ("MEMLIMIT",)
+    assert lim.per_job["mem_mb"] == 4, "MEMLIMIT's 5000 K, not another column's size"
+    assert lim.unreadable == (), "read, so nothing to name"
+    # every other column, spelled out, so a future column-off-by-one names itself
+    assert lim.per_job["mem_mb"] not in (7, 9, 1, 19), "FILE/DATA/STACK/CORELIMIT"
+
+
+def test_the_column_holds_wherever_memlimit_sits(monkeypatch):
+    """First column, last column, and a value narrower or wider than its label.
+
+    Token index cannot do this: the header row has five tokens and the value row
+    ten, because every size is ``number`` + ``unit``. These are the boundary
+    cases the layout itself produces, and each is read from the column rule, not
+    from a position that happens to work on one sample.
+    """
+    kb = ("FILELIMIT", "8000 K"), ("DATALIMIT", "10000 K")
+
+    # last column, and first, of the same limits
+    assert _limits(
+        _combined([*kb, ("MEMLIMIT", "2097152 K")]), True, monkeypatch=monkeypatch
+    ).per_job["mem_mb"] == 2048
+    assert _limits(
+        _combined([("MEMLIMIT", "2097152 K"), *kb]), True, monkeypatch=monkeypatch
+    ).per_job["mem_mb"] == 2048
+
+    # value NARROWER than its label: "1 G" under an eight-character MEMLIMIT
+    assert _limits(
+        _combined([*kb, ("MEMLIMIT", "1 G"), ("CORELIMIT", "20000 K")]),
+        True, monkeypatch=monkeypatch,
+    ).per_job["mem_mb"] == 1024
+
+    # value WIDER than its label, which pushes the column out rather than
+    # sliding the row: a ceiling this size is what a real fat node publishes
+    assert _limits(
+        _combined([*kb, ("MEMLIMIT", "1073741824 K"), ("CORELIMIT", "20000 K")]),
+        True, monkeypatch=monkeypatch,
+    ).per_job["mem_mb"] == 1024 * 1024
+
+    # an unset NEIGHBOUR must not shift the count: "-" is its own cell
+    assert _limits(
+        _combined(
+            [("FILELIMIT", "-"), ("DATALIMIT", "10000 K"), ("STACKLIMIT", "-"),
+             ("MEMLIMIT", "2097152 K")]
+        ),
+        True, monkeypatch=monkeypatch,
+    ).per_job["mem_mb"] == 2048
+
+
+def test_a_combined_row_that_cannot_be_placed_is_still_named(monkeypatch):
+    """The fallback stays. A wrong ceiling is worse than a named gap.
+
+    `_memlimit_is_per_job` says why: filling the job-wide axis from the wrong
+    figure "invents a blocker for a job that would have run". So every shape
+    where the two readings -- cell order and character columns -- disagree keeps
+    answering ``unreadable``, which is what this whole layout used to answer.
+    That is the property that makes the reader safe: it can turn "unreadable"
+    into a right number or leave it alone, never into a wrong one.
+    """
+    header = " FILELIMIT   DATALIMIT   STACKLIMIT  CORELIMIT   MEMLIMIT"
+    for name, row in [
+        # a label glued to its neighbour, so the rows do not split alike
+        ("glued label", _GLUED),
+        # cells merged by a single space: nine cells of header, four of value
+        ("merged values", f"QUEUE: normal\n\n{header}\n    8000 K 10000 K"
+                          "      2000 K     20000 K     5000 K\n"),
+        # the row ran out and the next section arrived
+        ("no value row", f"QUEUE: normal\n\n{header}\nUSERS: all users\n"),
+        # the next header arrived instead of values
+        ("next header", f"QUEUE: normal\n\n{header}\n SWAPLIMIT   THREADLIMIT\n"),
+        # right count, wrong columns: the whole row slid left
+        ("row slid", f"QUEUE: normal\n\n{header}\n"
+                     " 8000 K    10000 K      2000 K     20000 K  5000 K\n"),
+    ]:
+        lim = _limits(row, True, monkeypatch=monkeypatch)
+        assert "mem_mb" not in lim.per_job, f"{name}: no cell may be guessed"
+        assert lim.unreadable == ("MEMLIMIT",), name
+
+
+def test_an_unset_memlimit_is_no_ceiling_not_an_unreadable_one(monkeypatch):
+    """``-`` is an answer -- "no limit" -- not a field that could not be read.
+
+    It used to reach `_mem_to_mb`, which reads it as 0 = "not read", so a queue
+    whose memory limit is *unset* reported its ceiling as unreadable. That is a
+    warning about a field published perfectly clearly, and it is the same false
+    warning `test_control_a...` guards against for an absent MEMLIMIT -- LSF
+    prints ``-`` for an unset limit (the recorded fixture's ``PARAM`` row uses it
+    four times) and IBM documents the resource-limit default as infinity.
+
+    The other two backends already rule this way: `pbs._looks_present`'s
+    docstring says an attribute never printed and one printed with a no-limit
+    sentinel "are the same thing -- no ceiling, nothing to warn about".
+
+    The combined table is where it stops being hypothetical, since a row of five
+    limits usually has some of them unset.
+    """
+    for name, row in [
+        ("alone on its line", _ALONE.replace(" 4194304 K", " -")),
+        ("its own column", _combined(
+            [("FILELIMIT", "8000 K"), ("DATALIMIT", "10000 K"), ("MEMLIMIT", "-")]
+        )),
+    ]:
+        lim = _limits(row, True, monkeypatch=monkeypatch)
+        assert "mem_mb" not in lim.per_job, f"{name}: unset is not a ceiling"
+        assert lim.unreadable == (), f"{name}: nothing failed to read"
+
+
+def test_control_the_label_on_its_own_line_still_resolves(monkeypatch):
+    """CONTROL, passing with the column reader present or absent.
+
+    The layout the recorded fixture actually uses, and the one that already
+    worked. A column reader that took this path over is the regression that
+    would matter most, since it is the shape seen in the wild here.
+    """
+    lim = _limits(_ALONE, True, monkeypatch=monkeypatch)
+    assert lim.per_job["mem_mb"] == 4096, "4194304 K, read from the next line"
+    assert lim.unreadable == ()
+    assert lim.max_walltime_seconds == 1440 * 60, "the neighbouring limit still reads"
 
 
 def test_control_a_queue_declaring_no_memlimit_stays_silent(monkeypatch):

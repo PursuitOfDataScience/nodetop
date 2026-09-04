@@ -743,9 +743,44 @@ Four details make this trustworthy rather than merely clever:
   same story with `nvidia.com/gpu.product=NVIDIA-A100-SXM4-40GB`.
 - **An unidentifiable accelerator is `None`, never a guess** — and unknown is not treated
   as incapable. Only a *known* negative excludes a node.
-- **Memory is an inference and is labelled one.** `A100` alone does not say 40 GB or
-  80 GB, and no scheduler records it. The conservative variant is assumed, so the failure
-  mode is a needless warning rather than an OOM ninety minutes into a run.
+- **Memory is an inference and is labelled one — until the label states it.** `A100`
+  alone does not say 40 GiB or 80 GiB, and no scheduler records accelerator memory as a
+  *resource*. Where nothing says which, the conservative variant is assumed, so the
+  failure mode is a needless warning rather than an OOM ninety minutes into a run. But the
+  **product string** often does say, and discarding it was costing real nodes:
+  `nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB` and the Slurm feature `a100-80gb` both
+  name the size, and both used to inherit the conservative 40 — so `--gpu-mem 80` ruled out
+  every node on a cluster that had told the tool 80. A size in the label is now read back
+  when it is one the table already declares for that part; a size the table has never heard
+  of leaves the conservative default *and* the uncertainty flag in place. Selecting among
+  declared variants is not the same act as inventing a number, which is what the Ponte
+  Vecchio incident below was.
+- **The typed `Gres` states the size too, and it is read even though it decides the model
+  first.** The resource path used to return the moment it matched an alias, so the pin was
+  unreachable from `Gres=gpu:a100-80gb:4` — the form a site that bothers to type its GRES
+  emits, and the string Slurm allocates against — and the same early return threw the node's
+  features away unread, so a bare `Gres=gpu:a100:4` beside an `a100-80gb` feature answered
+  40/uncertain off a node that had said 80 twice. Both are read now. **When both name a size
+  and they disagree, nothing pins:** one of the two strings is stale and neither says which,
+  so the conservative variant and the uncertainty flag stay, which is where an untyped
+  `a100` already sits. Ranking a hand-typed GRES against a hand-typed feature would be a
+  guess wearing precedence as a costume, and the two errors are not symmetric — believing 80
+  on a 40 GiB card is an OOM ninety minutes in, while the fallback is the needless warning
+  the default exists to produce. A MIG spelling in *either* source vetoes the pin outright:
+  `Gres=gpu:a100-80gb:4` with a `…-80GB-MIG-3g.40gb` product label is an 80 GiB card handing
+  out 40 GiB thirds, so the un-vetoed source must not supply what the vetoed one refused.
+- **The unit is GiB, and that was checked rather than assumed.** The table holds the
+  vendor's figure, and for semiconductor memory the vendor's "GB" is binary — the JEDEC
+  convention (JESD100B.01: `G` is 2^30 in front of a memory capacity), the same one that
+  makes Slurm's `--mem=244G` binary. NVIDIA's MIG guide shows an `A100-SXM4-40GB`
+  reporting `0MiB / 40537MiB` of framebuffer. Decimal 40 GB is 38146 MiB (37.25 GiB), so
+  the card reports 2390 MiB *more* than the decimal reading permits; 40 × 2^30 is
+  40960 MiB, of which 40537 is all but a ~1% ECC and reserved carve-out. The same guide's
+  `mig -lgip` table heads its Memory column `GiB` and lists the eighth-of-a-card
+  `1g.5gb` profile as `4.75` — NVIDIA's own "5gb" is 5 GiB less reserve, not 4.66. So
+  `--gpu-mem 80` and a table entry of `80` are the same quantity and compare like for
+  like. Had it gone the other way, every HBM figure nodetop prints would have been 7%
+  high.
 
 ---
 
@@ -2406,7 +2441,7 @@ answers with the reading that claims *less* capacity and *less* access — never
 | a truncated node record with no state | unschedulable, not idle |
 | an unreadable resource count | zero, never negative |
 | an accelerator whose model is unidentifiable | does not satisfy a stated capability — set aside and reported |
-| a memory size that could be 40 or 80 GB | assume 40 |
+| a memory size that could be 40 or 80 GiB, with nothing saying which | assume 40 |
 | a host group that cannot be expanded | the members resolved, not the whole cluster |
 | a consumable whose total is invisible | the amount known free, not an assumed total |
 | a queue whose allowlist names nobody | nobody, not everybody |
@@ -2494,7 +2529,7 @@ Four honesty rules are enforced in code rather than left to the reader:
 
 ```bash
 pip install -e ".[dev]"
-pytest          # 4301 tests, no batch system required
+pytest          # 4491 tests, no batch system required
 ruff check src tests
 ```
 

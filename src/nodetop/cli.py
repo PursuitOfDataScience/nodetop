@@ -240,8 +240,15 @@ def _reject_broken_snapshot(cluster: Cluster, command: str) -> int:
     # `status` renders these in its own panel, so printing them again here
     # would say the same thing twice on a terminal where both streams land.
     if fatal or command != "status":
+        # The ellipsis comes from the glyph set THIS stream can encode. Left to
+        # `truncate`'s default it is U+2026, and under `LC_ALL=C` writing it
+        # raises UnicodeEncodeError -- so the line that exists to report a failed
+        # query died reporting it, but only once a message was long enough to be
+        # cut. `Glyphs.detect` says this outright: a terminal that cannot encode
+        # the glyph "would raise or print replacement characters".
+        ell = Glyphs.detect(sys.stderr).ellipsis
         for name, why in cluster.errors.items():
-            print(f"query failed: {name}: {truncate(why, 120)}", file=sys.stderr)
+            print(f"query failed: {name}: {truncate(why, 120, ell)}", file=sys.stderr)
     if fatal:
         # Two causes, and they send the reader to different places: every query
         # failing is a control plane or a PATH problem, while queries that
@@ -1375,7 +1382,7 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
 
     if cluster.errors:
         for name, why in cluster.errors.items():
-            body.append(f"{st.bad('FAILED')} {st.dim(name)}  {truncate(why, 60)}")
+            body.append(f"{st.bad('FAILED')} {st.dim(name)}  {truncate(why, 60, st.g.ellipsis)}")
 
     if not cluster.nodes:
         if args.json:
@@ -2943,7 +2950,16 @@ def _per_user_ceiling(cluster: Cluster, queue, st: Style) -> str | None:
     cpus = limits.per_user.get("cpu")
     if cpus is not None and cpus < queue.cpus_total:
         parts.append(f"{cpus} of {queue.cpus_total} cores")
-    gpus = limits.per_user.get("gres/gpu")
+    # `"gpu"`, not `"gres/gpu"`: the Slurm parser renames it on the way in.
+    # `_limit_tres` (backends/slurm.py) documents itself as producing "neutral
+    # limit keys" and maps `gres/gpu=32` to `out["gpu"]`, and `Limits` documents
+    # the vocabulary as `cpu`, `mem_mb`, `gpu`, `node`. Reading the scheduler
+    # spelling here meant the lookup never hit, so a per-user GPU ceiling was
+    # silently dropped: measured on the recorded cluster, a cap of 2 against a
+    # partition holding 8 GPUs rendered nothing at all, while the same cap
+    # written `gres/gpu` rendered "2 of 8 GPUs". Only the unreachable spelling
+    # worked -- which is why no test caught it.
+    gpus = limits.per_user.get("gpu")
     if gpus is not None and queue.gpus_total and gpus < queue.gpus_total:
         parts.append(f"{gpus} of {queue.gpus_total} GPUs")
     if not parts:
@@ -2951,6 +2967,55 @@ def _per_user_ceiling(cluster: Cluster, queue, st: Style) -> str | None:
     return (", ".join(parts)
             + st.dim(f"  (per user, from {limits.source or 'limits'} "
                      f"{limits.name})"))
+
+
+def _per_user_limits_json(cluster: Cluster, queue) -> dict[str, object] | None:
+    """The machine-readable half of :func:`_per_user_ceiling`, or ``None``.
+
+    That function's docstring names the complaint this answers: "a per-user
+    ceiling is invisible in every view that counts nodes", reported live off four
+    idle `beagle3-bigmem` nodes against `MaxTRESPerUser=cpu=64,node=2`. `zoom` is
+    a view that counts nodes, and its `--json` was one of those views -- the
+    ceiling appeared in **no** payload this tool emits, checked across all ten
+    commands, so a script sizing a request from `zoom --json` could not see the
+    number that decides whether it runs.
+
+    Beside the renderer rather than inside the payload so the two cannot answer
+    differently, and applying the SAME "only when it BINDS" rule: a ceiling at or
+    above what the queue holds is not a ceiling, and publishing it would make a
+    consumer refuse a request the scheduler would take. `None` -- not an empty
+    object -- when nothing binds, so "no ceiling here" and "a ceiling of zero"
+    stay different documents.
+    """
+    limits = cluster.limits_for(queue.name)
+    if limits is None or not limits.per_user:
+        return None
+    caps: dict[str, object] = {}
+    nodes = limits.per_user.get("node")
+    if nodes is not None and nodes < len(queue.nodes):
+        caps["nodes"] = [nodes, len(queue.nodes)]
+    cpus = limits.per_user.get("cpu")
+    if cpus is not None and cpus < queue.cpus_total:
+        caps["cpus"] = [cpus, queue.cpus_total]
+    # `"gpu"`, not `"gres/gpu"`: the Slurm parser renames it on the way in.
+    # `_limit_tres` (backends/slurm.py) documents itself as producing "neutral
+    # limit keys" and maps `gres/gpu=32` to `out["gpu"]`, and `Limits` documents
+    # the vocabulary as `cpu`, `mem_mb`, `gpu`, `node`. Reading the scheduler
+    # spelling here meant the lookup never hit, so a per-user GPU ceiling was
+    # silently dropped: measured on the recorded cluster, a cap of 2 against a
+    # partition holding 8 GPUs rendered nothing at all, while the same cap
+    # written `gres/gpu` rendered "2 of 8 GPUs". Only the unreachable spelling
+    # worked -- which is why no test caught it.
+    gpus = limits.per_user.get("gpu")
+    if gpus is not None and queue.gpus_total and gpus < queue.gpus_total:
+        caps["accelerators"] = [gpus, queue.gpus_total]
+    if not caps:
+        return None
+    # Named so a reader can go and check: the rendered line says "(per user, from
+    # slurm QOS amd)" and these are the two halves of that parenthesis.
+    caps["source"] = limits.source or "limits"
+    caps["name"] = limits.name
+    return caps
 
 
 def _wall_detail(cluster: Cluster, queue, st: Style) -> str:
@@ -3032,6 +3097,28 @@ def cmd_zoom(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                 n.effective_free_gpus for n in nodes if n.schedulable),
             "accelerators": [sum(n.gpus_free for n in nodes if n.schedulable),
                              sum(n.gpus_total for n in nodes)],
+            # The two lines the rendered header puts above the node table, which
+            # this payload did not carry: the wall limit that will bite, and the
+            # per-user ceiling. The walltime pair keeps the names `queues --json`
+            # uses -- the rule the note above states and this dict then broke for
+            # exactly these two keys -- and the ceiling was in NO payload this
+            # tool emits, checked across all ten commands (see
+            # `_per_user_limits_json`).
+            #
+            # **Keyed by queue, because `zoom` takes a comma-separated list.** The
+            # counts above are honest aggregates over the selected partitions, but
+            # a limit is not summable: `zoom amd,gpu` prints a header per
+            # partition, and publishing one scalar would have named `amd`'s
+            # ceiling as the answer for both -- the same defect one level out.
+            "limits": {
+                q.name: {
+                    "max_walltime_queue": format_duration(q.max_walltime_seconds),
+                    "max_walltime_effective": format_duration(
+                        cluster.effective_max_walltime(q.name)),
+                    "per_user": _per_user_limits_json(cluster, q),
+                }
+                for q in queues
+            },
             "members": [{
                 "name": n.name,
                 "state": n.state_raw,
@@ -3206,6 +3293,24 @@ def cmd_health(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     down = cluster.unschedulable_nodes
     if args.json:
         _print_json({
+            # The headline's denominator, which was not in here at all.
+            #
+            # The text view leads with "552 schedulable · 0 degraded · 56 out ·
+            # 608 total", and only the middle two were reachable from this
+            # payload -- they are the lengths of the two lists below. The other
+            # two were not: the payload names the UNHEALTHY nodes only, so
+            # nothing in it said how many nodes the cluster has, and a consumer
+            # of `health --json` had to call `status --json` as well to state
+            # the command's own headline. `nodes` is the name `status --json`
+            # already uses for this fact, so the two views can be compared
+            # without a mapping.
+            #
+            # `schedulable` is derivable from the two once `nodes` is here, and
+            # is published anyway for the reason the note below gives about
+            # `reason_text`: a figure the text view puts on screen should not
+            # have to be recomputed to be agreed with.
+            "nodes": len(cluster.nodes),
+            "schedulable": len(cluster.nodes) - len(down),
             # `reason` is verbatim; `reason_text` / `reason_set_by` /
             # `reason_set_at` are the same string parsed, so a consumer can
             # group by cause without reimplementing the [who@when] split -- and
@@ -3750,8 +3855,35 @@ def cmd_where(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             "hardware_incompatible": p.hardware_incompatible,
             "nodes_free": p.nodes_available,
             "nodes_capable": len(p.capacity.hardware_nodes) if p.capacity else 0,
+            # The denominator the table prints beside `right hw`, and the
+            # histogram behind the gap.  Without them this document states the
+            # strongest claim the tool can make -- `hardware_incompatible`,
+            # whose legend is "go elsewhere; waiting will not help" -- and says
+            # nothing about *what* was wrong, so a consumer cannot tell the
+            # wrong cluster from a queue where the caller excluded every node
+            # themselves.  Rendered, that is the difference between
+            #
+            #     ✗ WRONG HW  gpuq   0/1   0/2
+            #       hardware every node here is excluded by request, not by hardware
+            #         2 nodes: kept out by --exclude
+            #
+            # and `{"hardware_incompatible": true, "nodes_capable": 0}` on its
+            # own.  `capacity.EXCLUDED_REASON` is exported precisely so a
+            # consumer can make that test "without matching on a sentence", and
+            # `--json` was the one surface that never published the reason to
+            # test.  All of them, not the table's first four: a document has no
+            # width to run out of.
+            #
+            # `nodes_considered` comes along because `hardware_reasons` cannot
+            # be summed into a node count -- a node contributes several reasons
+            # -- and publishing the histogram without its denominator invites
+            # exactly the overcount `Capacity.considered` exists to prevent.
+            "nodes_considered": p.capacity.considered if p.capacity else 0,
             "nodes_unverified": (
                 len(p.capacity.unverified_nodes) if p.capacity else 0
+            ),
+            "hardware_reasons": (
+                dict(p.capacity.hardware_reasons) if p.capacity else {}
             ),
             "earliest_start": p.earliest_start.isoformat() if p.earliest_start else None,
             "start_from_scheduler": p.start_estimate_from_scheduler,
@@ -4042,6 +4174,67 @@ def cmd_exclude(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
 _CAPABILITIES = ("bf16", "fp8", "tf32", "flash_attention")
 
 
+def _group_memory(group: list) -> tuple[int, bool]:
+    """``(smallest accelerator memory in the group, is it exact)``, in GiB.
+
+    `accelerators` keys its rows on the model NAME, so a cluster running both
+    A100 sizes puts 40 GiB and 80 GiB nodes on one row.  That was harmless
+    while every A100 inherited the table's conservative 40; now that a product
+    label can pin the size, reading the row off `group[0]` reports whichever
+    node happened to sort first -- and printing its 80 without the `>=` marker
+    claims the whole row holds 80 GiB cards.
+
+    The smallest is the only figure a mixed row can promise, and it is exact
+    only when every member was pinned AND they agree.  One member short of that
+    and the row goes back to `>=`, which is what it said before any of this.
+    """
+    sizes = {n.accelerator.memory_gb for n in group if n.accelerator}
+    if not sizes:
+        return 0, False
+    pinned = all(n.accelerator.memory_certain for n in group if n.accelerator)
+    return min(sizes), pinned and len(sizes) == 1
+
+
+def _model_holders(cluster: Cluster, group: list, pick) -> list[str]:
+    """Queues holding any of ``group``, busiest first, filtered by ``pick``.
+
+    One reading of "where are these cards", shared by the text column and the
+    `--json` key, because they were two readings and they disagreed.  The
+    column answers *where you can submit*: it names only usable, shared
+    queues, marks a group's private hardware ``group-only:``, and goes EMPTY
+    when there is nowhere open at all -- a state its own docstring is careful
+    about, since a blank cell must not read as "nowhere at all".  The document
+    published one flat list of every holder, so a DOWN queue arrived under the
+    same key as a submittable one with nothing to tell them apart, and a model
+    whose only home was somebody else's private partition read as freely
+    available.
+
+    ``reverse=True`` is deliberately not used: on a ``(count, name)`` tuple it
+    reverses the NAME too, and the caller shows only the first few and counts
+    the rest as ``+N``, so which ones the reader is shown would be decided
+    backwards.  Negating the count leaves the tie-break alone.
+    """
+    held = {n.name for n in group}
+    counted = [
+        (sum(1 for n in q.nodes if n.name in held), q.name)
+        for q in cluster.queues.values()
+        if pick(q)
+    ]
+    return [
+        name for n, name in sorted(counted, key=lambda cn: (-cn[0], cn[1])) if n
+    ]
+
+
+def _is_open_queue(queue) -> bool:
+    """Somewhere the caller could actually submit: usable and not one group's."""
+    return queue.usable and not queue.is_dedicated
+
+
+def _is_group_only_queue(queue) -> bool:
+    """Usable, but it is a research group's own share -- not yours to submit to."""
+    return queue.usable and queue.is_dedicated
+
+
 def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     """Inventory by model, and how much of the cluster can do what.
 
@@ -4130,9 +4323,11 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
                     "scheduler_label": g[0].accelerator_label or None,
                     "vendor": g[0].accelerator.vendor if g[0].accelerator else None,
                     "arch": g[0].accelerator.arch if g[0].accelerator else None,
-                    "memory_gb": g[0].accelerator.memory_gb if g[0].accelerator else None,
+                    # Group minimum, and "inferred" whenever the members
+                    # disagree -- same reasoning as the text table's MEM cell.
+                    "memory_gb": _group_memory(g)[0] if g[0].accelerator else None,
                     "memory_inferred": (
-                        not g[0].accelerator.memory_certain if g[0].accelerator else None
+                        not _group_memory(g)[1] if g[0].accelerator else None
                     ),
                     "installed": totals(g)[0],
                     "free": totals(g)[1],
@@ -4143,10 +4338,23 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
                     # Where they are, not just how many: the text form grew
                     # this column because a correct inventory that cannot say
                     # which queue holds a model reads as a wrong one.
+                    #
+                    # Every holder, unqualified -- which is the right answer to
+                    # "where is this hardware" and the wrong one to "where can
+                    # I submit for it". The text column answers the second, and
+                    # marks every case the two differ; these two keys are that
+                    # marking, so the document can say the same things:
+                    # `..._open` empty beside a non-empty `partitions` is the
+                    # blank cell ("the cards are there, nowhere open to you"),
+                    # and `..._group_only` is its `group-only:` prefix.
                     f"{cluster.queue_term}s": sorted(
                         q.name for q in cluster.queues.values()
                         if any(n.name in {x.name for x in g} for n in q.nodes)
                     ),
+                    f"{cluster.queue_term}s_open": _model_holders(
+                        cluster, g, _is_open_queue),
+                    f"{cluster.queue_term}s_group_only": _model_holders(
+                        cluster, g, _is_group_only_queue),
                 }
                 for model, g in groups.items()
             },
@@ -4179,35 +4387,18 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
         sweep to answer -- and being unable to answer it is what makes a
         correct listing look wrong. Queues the caller cannot use are left out:
         this column exists to be acted on.
+
+        The reading itself is `_model_holders`, shared with `--json` so the two
+        surfaces cannot name different partitions for one model.
         """
-        held = {n.name for n in group}
-
-        def holders(pick) -> list[str]:
-            counted = [(sum(1 for n in q.nodes if n.name in held), q.name)
-                       for q in cluster.queues.values() if pick(q)]
-            # `reverse=True` on a (count, name) tuple reverses the NAME too, so
-            # partitions tied on node count came out in reverse-alphabetical order.
-            # Everywhere else in this file the count is negated instead
-            # (`key=lambda kv: -len(kv[1])`, `-totals(kv[1])[0]`) precisely so the
-            # secondary ordering is left alone. It shows because the caller prints
-            # only the first three and counts the rest as `+N`: on a cluster where a
-            # model sits in several equally-sized partitions, WHICH three the reader
-            # is shown was decided backwards, and two runs of the same command could
-            # not be compared against each other by eye.
-            return [
-                name
-                for n, name in sorted(counted, key=lambda cn: (-cn[0], cn[1]))
-                if n
-            ]
-
-        named = holders(lambda q: q.usable and not q.is_dedicated)
+        named = _model_holders(cluster, group, _is_open_queue)
         if named:
             return ", ".join(named[:3]) + (st.dim(f" +{len(named) - 3}")
                                            if len(named) > 3 else "")
         # Nowhere open: say where the hardware IS rather than leaving the cell
         # blank, which reads as "nowhere at all". Marked, because a group's own
         # partition is not somewhere the reader can submit.
-        owned = holders(lambda q: q.is_dedicated and q.usable)
+        owned = _model_holders(cluster, group, _is_group_only_queue)
         if not owned:
             return ""
         return st.dim("group-only: ") + ", ".join(owned[:2]) + (
@@ -4228,7 +4419,16 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
         # `>=`, not a bare `?`. The part ships in more than one size, the
         # smaller was assumed, and "at least 40G" is what that means -- a
         # question mark needs a legend this table has no room for.
-        mem = (st.dim(">=") if not spec.memory_certain else "") + f"{spec.memory_gb}G"
+        #
+        # Read off the whole GROUP, not off `spec` alone. Rows are keyed by
+        # model, so a cluster with both A100 sizes puts 40 GiB and 80 GiB nodes
+        # in one row; once a product label can pin the size (`_pin_memory_from_label`)
+        # `group[0]` is whichever node happened to sort first, and printing its
+        # 80 as CERTAIN for a row that also holds 40 GiB cards is the one way
+        # this table can now lie. The smallest is what the row can promise, and
+        # it is only certain when every member agrees.
+        floor, exact = _group_memory(group)
+        mem = (st.dim(">=") if not exact else "") + f"{floor}G"
         rows.append([
             st.accent(spec.model), spec.vendor, spec.arch, mem, count,
             gauge(free, total, 9, st),

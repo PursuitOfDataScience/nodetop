@@ -41,24 +41,41 @@ def test_control_the_gpu_memory_label_is_left_alone():
     """CONTROL, passing with the change present or absent.
 
     HBM was labelled GiB before the RAM fix and still is. What this pins is that
-    the RAM change did not touch it -- NOT that GiB is the right unit for HBM,
-    which is unverified and may well be wrong in the other direction.
+    the RAM change did not touch it.
 
-    The hardware table stores the VENDOR's figure (``hardware.py`` has A100=40,
-    H100=80, the numbers on the datasheets and in the Kubernetes product label
-    ``NVIDIA-A100-SXM4-40GB``), and ``DESIGN.md`` writes them "40 GB or 80 GB".
-    If those are decimal, an "A100 40GB" holds 37.25 GiB and this label is high
-    by 7%. It could not be settled from this cluster: no accelerator is reachable
-    without a billed allocation, ``nvidia-smi`` is absent on a CPU node, no
-    recorded fixture holds a device reading, and Slurm advertises only
-    ``Gres=gpu:4`` -- which is exactly what ``DESIGN.md`` means by "no scheduler
-    records it".
+    **The open question this docstring used to carry is now closed, and the
+    answer is that GiB was right.** The doubt was real: the hardware table
+    stores the VENDOR's figure (``hardware.py`` has A100=40, H100=80, the
+    numbers on the datasheets and in the Kubernetes product label
+    ``NVIDIA-A100-SXM4-40GB``), and if those were decimal an "A100 40GB" would
+    hold 37.25 GiB and this label would be high by 7%.
 
-    Contrast the RAM side, which IS measured: ``--mem=244G`` accepted and
+    They are not decimal. NVIDIA's MIG user guide shows an ``A100-SXM4-40GB``
+    reporting ``0MiB / 40537MiB`` of framebuffer. Decimal 40 GB is 38146 MiB
+    (37.25 GiB), so the card reports **2390 MiB more than the decimal reading
+    allows**; 40 x 2**30 is 40960 MiB, of which 40537 is all but a ~1% ECC and
+    reserved carve-out. The same guide's ``mig -lgip`` table heads its Memory
+    column ``GiB`` and lists the eighth-of-a-card ``1g.5gb`` profile as
+    ``4.75``, so NVIDIA's own "5gb" is 5 GiB less reserve, not 4.66. That is the
+    JEDEC convention (JESD100B.01 defines ``G`` as 2**30 in front of a
+    semiconductor memory capacity), the same one that makes Slurm's ``G``
+    binary. This repository's own fixture agrees, and is where the claim that
+    "no recorded fixture holds a device reading" went wrong:
+    ``tests/backends/test_sshpool.py`` records ``GPU=NVIDIA A100-SXM4-40GB,
+    40960`` off ``nvidia-smi --query-gpu=memory.total`` with ``nounits``, whose
+    unit is MiB -- 40 GiB exactly.
+
+    Still not measurable from this host, and it did not need to be: no
+    accelerator is reachable without a billed allocation, ``nvidia-smi`` is
+    absent on a CPU node, and Slurm advertises only ``Gres=gpu:4`` -- which is
+    what ``DESIGN.md`` means by "no scheduler records it" about the memory
+    *resource*. The product *label* is a different matter and is now read:
+    see ``test_gpu_memory_from_label.py``.
+
+    The RAM side is measured independently: ``--mem=244G`` accepted and
     ``--mem=245G`` refused on a 250000 MB node, and a GPU node reporting
-    ``RealMemory=256000`` with ``CfgTRES=mem=250G`` (250 x 1024). Two units in one
-    output line, correct for different reasons -- so do not "fix" one to match
-    the other without a device reading.
+    ``RealMemory=256000`` with ``CfgTRES=mem=250G`` (250 x 1024). Two units in
+    one output line, binary for the same reason.
     """
     text = JobShape(gpus_per_node=1, gpu_memory_gb=40, nodes=1).describe()
     assert ">=40 GiB HBM" in text, text

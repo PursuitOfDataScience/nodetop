@@ -230,7 +230,7 @@ the same instant.
 ```bash
 git clone https://github.com/PursuitOfDataScience/nodetop
 cd nodetop && pip install -e ".[dev]"
-pytest          # ~4301 tests, no batch system required
+pytest          # ~4491 tests, no batch system required
 ruff check src tests && mypy src
 ```
 

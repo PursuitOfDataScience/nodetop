@@ -664,6 +664,87 @@ def _memlimit_is_per_job() -> bool:
 #: A limit label in a ``bqueues -l`` table: ``MEMLIMIT``, ``RUNLIMIT``, ``CORELIMIT``.
 _LSF_LIMIT_LABEL = re.compile(r"[A-Z][A-Z0-9_]+")
 
+#: One cell of a ``bqueues -l`` table row: non-space runs joined by *single*
+#: spaces, ended by two or more.
+#:
+#: This is what makes a column table readable at all.  A size prints as
+#: ``number`` + one space + ``unit``, so ``5000 K`` is one cell containing a
+#: space, while cells are held apart by two or more.  Splitting on whitespace
+#: instead is precisely the trap `_memlimit_cell` documents: the five-label
+#: header row splits into ten tokens, so token index ``i`` is not column ``i``.
+_LSF_TABLE_CELL = re.compile(r"\S(?:\s?\S)*")
+
+#: Cells that publish "no ceiling" rather than a size.
+#:
+#: `pbs._looks_present` and `slurm._looks_present` already settle this for the
+#: other two backends -- an attribute never printed and one printed with an
+#: explicit no-limit sentinel "are the same thing -- no ceiling, nothing to warn
+#: about".  LSF prints ``-`` for an unset limit (the recorded ``bqueues -l``
+#: fixture's ``PARAM`` row uses it for ``MAX``, ``JL/U``, ``JL/P`` and ``JL/H``)
+#: and IBM documents the resource-limit default as infinity, so a ``-`` here is
+#: an answer, not a read failure.  The empty string is deliberately absent: that
+#: one really is "could not read", and stays `Limits.unreadable`.
+_LSF_NO_LIMIT = frozenset({"-", "unlimited", "infinite", "none", "n/a", "(null)"})
+
+
+def _lsf_table_cells(line: str) -> list[tuple[int, int]]:
+    """Character spans of the cells in one row of a ``bqueues -l`` table."""
+    return [(m.start(), m.end()) for m in _LSF_TABLE_CELL.finditer(line)]
+
+
+def _memlimit_cell(header: str, values: str, label: str = "MEMLIMIT") -> str:
+    """``label``'s own cell from a *combined* limit row, or ``""`` if unsure.
+
+    ``bqueues -l`` prints several limits under one header row, and IBM's own
+    example puts five in it::
+
+        FILELIMIT   DATALIMIT   STACKLIMIT  CORELIMIT   MEMLIMIT
+           8000 K    10000 K      2000 K     20000 K     5000 K
+
+    Two readings of that row are taken and they must agree.
+
+    **Cell order.** Both rows are split into cells on runs of two or more spaces
+    (`_LSF_TABLE_CELL`), which keeps ``5000 K`` whole, and the counts must match;
+    ``MEMLIMIT`` is then the cell at its label's index.  This is what a person
+    reads, and it survives an unset neighbour, since ``-`` is its own cell.
+
+    **Character columns.** The values are right-aligned under labels of differing
+    width, so every value cell must be *uniquely nearest* its own label by right
+    edge.  This is the reading the label order cannot supply, and it is what
+    catches a row whose cells happen to count right while sitting under the wrong
+    columns.  It is deliberately a nearest-neighbour test rather than an equality
+    one: the inter-column pitch is around twelve characters and the alignment
+    IBM's published row actually shows is within two, so demanding exact edges
+    would fail on the documented output itself.
+
+    Any disagreement -- unequal counts, a label glued to its neighbour by a
+    single space, a cell nearer some other column, a tie -- answers ``""`` and
+    lets `Limits.unreadable` take it.  That is the same answer this whole layout
+    used to give, so the rule can only turn "unreadable" into a right number or
+    leave it alone; it has no way to turn it into a wrong one.  Which is the
+    point: `_memlimit_is_per_job` already says filling the job-wide axis from the
+    wrong figure "invents a blocker for a job that would have run".
+
+    A ``LIMIT`` anywhere in the value row means the block ran out of values and
+    the next header arrived, so there is nothing to read.
+    """
+    if "LIMIT" in values:
+        return ""
+    head = _lsf_table_cells(header)
+    vals = _lsf_table_cells(values)
+    if not head or len(head) != len(vals):
+        return ""
+    column = next((i for i, (s, e) in enumerate(head) if header[s:e] == label), -1)
+    if column < 0:
+        return ""
+    for i, (_start, end) in enumerate(vals):
+        gaps = [abs(end - right) for _left, right in head]
+        nearest = min(gaps)
+        if gaps[i] != nearest or gaps.count(nearest) > 1:
+            return ""
+    start, end = vals[column]
+    return values[start:end]
+
 
 def _memlimit_text(body: str) -> str | None:
     """The ``MEMLIMIT`` cell from a ``bqueues -l`` queue block, or ``None``.
@@ -678,37 +759,36 @@ def _memlimit_text(body: str) -> str | None:
         MEMLIMIT
          4194304 K
 
-    In a *combined* table it shares a header row with its neighbours, and IBM's
-    own example has five limits in one row::
+    In a *combined* table it shares a header row with its neighbours, and reading
+    the next line's first size there returns ``FILELIMIT``'s value -- off by
+    whatever ratio separates two unrelated ceilings.  `_memlimit_cell` reads the
+    header's character columns instead, and answers ``""`` for any row it cannot
+    place, so the layout is either read correctly or still named as unreadable.
 
-        FILELIMIT   DATALIMIT   STACKLIMIT  CORELIMIT   MEMLIMIT
-           8000 K    10000 K      2000 K     20000 K     5000 K
-
-    Reading the next line's first size there returns ``8000 K`` -- ``FILELIMIT``'s
-    value, off by whatever ratio separates two unrelated ceilings.  Recovering the
-    right cell needs the header's character columns, and the values are
-    right-aligned under labels of differing width, so the column rule cannot be
-    checked without a recorded sample of that layout.  There is none: this
-    package's ``bqueues -l`` fixture declares only ``RUNLIMIT``, and no LSF
-    cluster is reachable from here to record one.
-
-    So the combined form answers ``""``.  Guessing a cell is the one outcome the
-    module rules out for this field: `_memlimit_is_per_job` already says that
-    filling the job-wide axis from the wrong figure "invents a blocker for a job
-    that would have run".  A ceiling named as unreadable keeps the gap visible;
-    a wrong one is a false denial.
+    A cell publishing no ceiling (``-``, and the sentinels `_LSF_NO_LIMIT`
+    lists) answers ``None``, the same as a queue that declares no ``MEMLIMIT``
+    at all.  It used to answer ``"-"``, which `_mem_to_mb` reads as 0 = "not
+    read", so a queue whose memory limit is *unset* reported its ceiling as
+    unreadable -- a warning about a field that was published perfectly clearly
+    and says "no limit".  The other two backends already rule the other way
+    (`pbs._looks_present`), and the combined table is where this stops being
+    hypothetical, since a row of five limits usually has some of them unset.
     """
     lines = body.splitlines()
     for i, line in enumerate(lines):
         labels = _LSF_LIMIT_LABEL.findall(line)
         if "MEMLIMIT" not in labels:
             continue
-        if len(labels) > 1:
-            return ""
+        cell = ""
         for follow in lines[i + 1:]:
             if follow.strip():
-                return follow.strip()
-        return ""
+                cell = (
+                    _memlimit_cell(line, follow) if len(labels) > 1 else follow.strip()
+                )
+                break
+        if cell.strip().lower() in _LSF_NO_LIMIT:
+            return None
+        return cell
     return None
 
 

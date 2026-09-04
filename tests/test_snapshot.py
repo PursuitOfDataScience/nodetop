@@ -407,7 +407,21 @@ class TestAFailedWriteKeepsThePreviousSnapshot:
         before = target.read_bytes()
         json.loads(before)  # a real, parseable capture
 
-        failed = self._write(target, limit=100 * 1024)
+        # The cap is DERIVED from the snapshot this environment actually
+        # produces, not fixed at 100 KiB. A fixed cap encodes an assumption about
+        # how much a cluster returns: on a CI runner with no scheduler the
+        # capture is a single empty query of roughly a kilobyte, sails under
+        # 100 KiB, exits 0, and this assertion fails for a reason that has
+        # nothing to do with the behaviour under test. It passed here only
+        # because this host is a real cluster -- the inverse of the runner
+        # `ci.yml` deliberately provides, which is where it failed on all five
+        # test jobs.
+        #
+        # Half of what was just written is guaranteed to be exceeded by writing
+        # it again, whatever the size, so the cap bites everywhere.
+        cap = len(before) // 2
+        assert cap < len(before), "the cap must be smaller than the write it should refuse"
+        failed = self._write(target, limit=cap)
         assert failed.returncode == 2, failed.stderr[-300:]
         assert "Traceback" not in failed.stderr, failed.stderr[-300:]
         assert "cannot write" in failed.stderr, failed.stderr[-300:]
@@ -420,7 +434,9 @@ class TestAFailedWriteKeepsThePreviousSnapshot:
         target = tmp_path / "snap.json"
         if self._write(target).returncode != 0:
             pytest.skip("no cluster to capture here")
-        self._write(target, limit=100 * 1024)
+        # Derived for the same reason as above: a cap the write cannot exceed
+        # tests nothing about what a failed write leaves behind.
+        self._write(target, limit=max(1, target.stat().st_size // 2))
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != "snap.json"]
         assert not leftovers, leftovers
 
