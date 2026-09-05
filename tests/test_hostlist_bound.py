@@ -37,6 +37,34 @@ from nodetop.hostlist import MAX_EXPANSION, collapse, expand
 
 #: Expressions whose unbounded expansion is between one million and 4.3 billion
 #: names. Each must return at the bound instead.
+#: The address-space ceiling each child runs under, in MiB. Comfortably above
+#: what a bounded expansion needs -- `u[1-2000]r[1-2000]` was measured at
+#: 325 MiB unbounded -- and far below what an unbounded one does.
+CEILING_MIB = 512
+
+#: Exit code a child uses to say the ceiling would not install, so the case is
+#: skipped rather than read as a failure of `expand`. Deliberately not 1, which
+#: is what an uncaught `MemoryError` gives -- the very outcome these cases exist
+#: to catch -- so the two can never be confused.
+_NO_CEILING = 99
+
+
+def _child_code(expression: str) -> str:
+    """Source for a child that expands ``expression`` under the ceiling."""
+    return (
+        "import resource, sys\n"
+        "try:\n"
+        f"    limit = {CEILING_MIB} * 1024**2\n"
+        "    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))\n"
+        "except (ValueError, OSError) as exc:\n"
+        "    sys.stderr.write('RLIMIT_AS unavailable: %s' % exc)\n"
+        f"    raise SystemExit({_NO_CEILING}) from None\n"
+        f"sys.path.insert(0, {str(_src())!r})\n"
+        "from nodetop.hostlist import expand\n"
+        f"print(len(expand({expression!r})))\n"
+    )
+
+
 PATHOLOGICAL = [
     "n[1-1000000]",
     "n[1-100000000]",
@@ -62,17 +90,16 @@ class TestThePathologicalCasesReturnAtTheBound:
 
     @pytest.mark.parametrize("expression", PATHOLOGICAL)
     def test_it_stays_within_a_memory_ceiling(self, expression):
-        code = (
-            "import resource, sys;"
-            f"resource.setrlimit(resource.RLIMIT_AS, ({512 * 1024**2}, {512 * 1024**2}));"
-            "sys.path.insert(0, %r);" % str(_src()) + "from nodetop.hostlist import expand;"
-            f"print(len(expand({expression!r})))"
-        )
         done = subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+            [sys.executable, "-c", _child_code(expression)],
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
+        if done.returncode == _NO_CEILING:
+            pytest.skip(f"the ceiling could not be installed here: {done.stderr.strip()}")
         assert done.returncode == 0, (
-            f"{expression} did not survive a 512 MiB ceiling:\n{done.stderr[-400:]}"
+            f"{expression} did not survive a {CEILING_MIB} MiB ceiling:\n{done.stderr[-400:]}"
         )
         assert int(done.stdout.strip()) <= MAX_EXPANSION
 
@@ -131,7 +158,38 @@ def _src():
     return pathlib.Path(__file__).resolve().parent.parent / "src"
 
 
-def test_the_ceiling_used_by_this_file_is_available():
-    """`RLIMIT_AS` is honoured on Linux; skip loudly elsewhere rather than pass."""
+def test_the_ceiling_is_either_installed_or_the_case_is_skipped():
+    """The ceiling is never assumed -- the child says whether it took.
+
+    `RLIMIT_AS` is honoured on Linux and is the thing that gives the six cases
+    above their teeth. It is not portable: Darwin aliases it onto `RLIMIT_RSS`
+    and refuses the call with `EINVAL`, which CPython reports as
+    `ValueError: current limit exceeds maximum limit`. Found on the macOS leg of
+    CI, where all six went red for that reason while the four Linux legs were
+    green -- a red that said nothing about `expand`, since the expansion never
+    ran.
+
+    So the child installs the ceiling under a guard and exits `_NO_CEILING`
+    when it cannot, and the case SKIPS. Skip and not pass: a bound that was
+    never enforced proves nothing about peak memory, and a green tick there
+    would be the quiet kind of wrong. Probed in the child rather than keyed off
+    `sys.platform`, so a container or a kernel that forbids the call is handled
+    the same way, and this test asserts those are the only two outcomes -- the
+    exit code is either the skip sentinel with its reason named, or a clean run
+    whose answer is right.
+    """
+    done = subprocess.run(
+        [sys.executable, "-c", _child_code("n[1-2]")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if done.returncode == _NO_CEILING:
+        assert "RLIMIT_AS" in done.stderr
+        return
+    assert done.returncode == 0, done.stderr[-400:]
+    assert int(done.stdout.strip()) == 2
+    # A ceiling this run can install is one this platform reports back, so the
+    # premise of every case above is checked here rather than assumed.
     soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
     assert soft == resource.RLIM_INFINITY or soft > 0
