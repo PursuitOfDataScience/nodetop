@@ -191,6 +191,22 @@ def _grid(
     return "\n".join([indent + st.dim(st.g.h * rule_width), *lines])
 
 
+def _named_failures(errors: dict[str, str]) -> str:
+    """``the queues query`` / ``the limits and queues queries``.
+
+    The failed queries are already named one-per-line on stderr just above, so
+    this is not new information -- it is the *summary* line agreeing with them
+    instead of generalising past what was recorded.  Sorted so the sentence is
+    stable: `errors` is filled by six threads and its order is a race.
+    """
+    names = sorted(errors)
+    joined = (
+        names[0] if len(names) == 1
+        else f"{', '.join(names[:-1])} and {names[-1]}"
+    )
+    return f"the {joined} {'query' if len(names) == 1 else 'queries'}"
+
+
 def _reject_broken_snapshot(cluster: Cluster, command: str) -> int:
     """Refuse to report numbers the control plane never supplied.
 
@@ -250,18 +266,35 @@ def _reject_broken_snapshot(cluster: Cluster, command: str) -> int:
         for name, why in cluster.errors.items():
             print(f"query failed: {name}: {truncate(why, 120, ell)}", file=sys.stderr)
     if fatal:
-        # Two causes, and they send the reader to different places: every query
-        # failing is a control plane or a PATH problem, while queries that
-        # ANSWERED and could not be read is a wrong backend or a version this
-        # parser does not know. Saying "every query failed" for the second would
-        # be false.
-        why = (
-            "every query failed"
-            if cluster.errors
-            else "the queries answered, but nothing could be read from them "
-            "-- most likely the wrong backend for this cluster, or a scheduler "
-            "version this parser does not know (try `nodetop backends`)"
-        )
+        # THREE causes, and they send the reader to different places: every
+        # query failing is a control plane or a PATH problem, ONE query failing
+        # is that one client or that one permission, while queries that ANSWERED
+        # and could not be read is a wrong backend or a version this parser does
+        # not know. Saying "every query failed" for the last would be false --
+        # and it was equally false for the middle one, which this branch used to
+        # fold into the first by testing `cluster.errors` (ANY failure) while
+        # claiming ALL of them. Measured: nodes answering with 1 node while only
+        # `scontrol show partition` timed out printed, two lines apart, "query
+        # failed: queues: CommandTimeoutError" and then "every query failed" --
+        # naming the single query that failed and immediately contradicting it.
+        #
+        # `load` labels six independent reads and `errors` records only the ones
+        # that failed, so "every" is not derivable from it. What IS provable is
+        # that both primary reads failed, which is the shape the control-plane
+        # diagnosis is actually about: every view here hangs off nodes and
+        # queues, and a partial failure that spared one of them gets named
+        # instead of quantified.
+        if not cluster.errors:
+            why = (
+                "the queries answered, but nothing could be read from them "
+                "-- most likely the wrong backend for this cluster, or a "
+                "scheduler version this parser does not know (try `nodetop "
+                "backends`)"
+            )
+        elif {"nodes", "queues"} <= set(cluster.errors):
+            why = "every query failed"
+        else:
+            why = f"{_named_failures(cluster.errors)} failed"
         print(
             f"no data: {why}, so there is nothing to report -- this is not an "
             f"empty cluster",
@@ -1322,6 +1355,7 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         funnel: dict[str, int] | None = None,
         listed: Sequence[dict[str, object]] = (),
         excluded: Sequence[tuple[str, str]] = (),
+        unconfirmed: Sequence[str] = (),
     ) -> int:
         """One schema, whichever path reaches it.
 
@@ -1342,6 +1376,31 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             },
             "listed": list(listed),
             "excluded": [{"name": name, "reason": why} for name, why in excluded],
+            # WHICH of the `listed` rows the `unconfirmed` count is about.
+            #
+            # Every other funnel term names its members: "no access",
+            # "refused", "no nodes" and "down" all append to `excluded`, and the
+            # DEAD block above was dropped on the express condition that
+            # "nothing is *hidden* by dropping them". `unconfirmed` was the one
+            # term where that did not hold. Its partitions are SHOWN, so they
+            # cannot go in `excluded` without breaking the property that the
+            # funnel's terms sum to the total -- and no other key distinguished
+            # them, so `listed` presented a measured acceptance and an unasked
+            # guess as the same row.
+            #
+            # It is the hedge that makes this matter. The count is on screen
+            # precisely to say the rows are not all verified; a consumer reading
+            # `{"shown": 30, "unconfirmed": 25}` learns that 5 of the 30 were
+            # confirmed by the control plane and cannot learn which 5, so the
+            # one thing the hedge is for -- preferring a measured partition over
+            # an assumed one -- is the thing it cannot do. Two runs whose
+            # dry-runs settled disjoint sets of partitions emitted
+            # byte-identical documents.
+            #
+            # All of them, and a list rather than a term inside `funnel`, for
+            # the two reasons this file already gives: a document has no width
+            # to run out of, and `funnel`'s values are counts that sum.
+            "unconfirmed_names": list(unconfirmed),
         })
         return 0
 
@@ -1468,6 +1527,10 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # cheap queue and tries it first everywhere after.
     refused = 0
     unsettled = 0
+    #: WHICH partitions the count above is counting, so the hedge can be acted
+    #: on rather than only totalled.  Held here rather than inside the pretest
+    #: because the "nothing was asked" branch below has to fill it too.
+    unsettled_names: list[str] = []
     #: Whether the entitlement pretest below actually ran.  Distinct from
     #: ``unsettled == 0``, which is also what a pretest that confirmed
     #: everything looks like.
@@ -1748,6 +1811,7 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # arithmetic was on screen.
     if not asked and not args.all:
         unsettled = len(with_room)
+        unsettled_names = [q.name for q in with_room]
     shown_note = f" ({unsettled} unconfirmed)" if unsettled else ""
     head_term = (f"{len(with_room)} open to you" if not args.all
                  else f"{len(with_room)} with nodes")
@@ -1793,6 +1857,8 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             } for q in sorted(with_room, key=order)],
             # Why every other partition is not in that list, by name.
             excluded=excluded,
+            # And which of the ones that ARE in it were never confirmed.
+            unconfirmed=unsettled_names,
         )
 
     def render_funnel(selected: str | None = None) -> str:
@@ -2744,6 +2810,17 @@ def cmd_queues(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             # spare" and a free-core count; `--json` carried neither, so the
             # two forms of the same command answered different questions.
             "nodes_with_room": sum(1 for n in q.nodes if n.has_room),
+            # The same rule as `nodes_with_room` above, one column over -- and this
+            # one is the table's FIRST data column. `queues` prints "nodes up",
+            # which is `len([n for n in q.nodes if n.schedulable])`, and no `--json`
+            # surface carried it: the row published idle (26), with-room (38) and
+            # total (40) for a partition the screen showed as **39/40**, with no
+            # field to derive it from. `nodes --json` cannot supply it either -- its
+            # rows have `schedulable` but no partition, so there is nothing to join
+            # on. The denominator was already here (`nodes`), which is what made the
+            # gap easy to miss. `status --json` already calls this concept
+            # `nodes_schedulable` for the cluster, so the name is borrowed.
+            "nodes_schedulable": len(q.schedulable_nodes),
             "cpus_total": q.cpus_total,
             "cpus_free_advertised": q.cpus_free,
             "effective_free_cpus": q.effective_free_cpus,
@@ -3151,14 +3228,10 @@ def cmd_zoom(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     if not nodes and all(q.routes for q in queues):
         return 0
 
-    dropped_by = [flag for flag, on in
-                  (("--gpu", args.gpu), ("--cpu", args.cpu), ("--free", args.free))
-                  if on]
-    if not nodes and dropped_by:
+    if not nodes and _excluding_filters(args):
         # "(nothing to show)" alone reads as "this queue is empty", which is a
         # different claim from "your filter excluded all of it".
-        print(section("inside", st,
-                      st.dim(f"nothing matches {' '.join(dropped_by)}")))
+        print(section("inside", st, st.dim(_nothing_matches(args))))
         return 0
 
     print(section("inside", st, f"  {st.g.sep}  ".join(facts)))
@@ -3178,6 +3251,51 @@ def cmd_zoom(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     return 0
 
 
+def _excluding_filters(
+    args: argparse.Namespace, *, with_queue: bool = False
+) -> list[str]:
+    """The node filters this invocation asked for, named as the user typed them.
+
+    One home, because `zoom` and `nodes` both have to answer "your filter
+    excluded all of it" and a fourth filter added to one listing would otherwise
+    be missing from the other's explanation.
+    """
+    named = [
+        flag
+        for flag, on in (
+            ("--gpu", getattr(args, "gpu", False)),
+            ("--cpu", getattr(args, "cpu", False)),
+            ("--free", getattr(args, "free", False)),
+        )
+        if on
+    ]
+    if with_queue:
+        # Named with its value, the way `no such partition: X` does -- an empty
+        # listing under `-q amd --gpu` is explained by the pair, not by one.
+        #
+        # Off by default because `zoom` takes its partition POSITIONALLY
+        # (`zoom amd`), so writing `-q amd` there would misname how the caller
+        # typed it. Only `nodes` has it as a flag. Caught by re-reading zoom's
+        # output after the change: it had gained a `-q amd` it never had.
+        queue = getattr(args, "queue", "") or ""
+        if queue.strip():
+            named.insert(0, f"-q {queue.strip()}")
+    return named
+
+
+def _nothing_matches(args: argparse.Namespace, *, with_queue: bool = False) -> str:
+    """`zoom`'s sentence, shared so the two listings cannot word it differently.
+
+    `--gpu --cpu` is the case that makes this more than tidiness: the pair is
+    unsatisfiable on EVERY cluster, so "(nothing to show)" is never the right
+    answer for it. `nodes` printed exactly that -- the string `zoom`'s own
+    comment calls out as the wrong claim -- while `zoom`, forty lines away,
+    already named the filters.
+    """
+    named = " ".join(_excluding_filters(args, with_queue=with_queue))
+    return f"nothing matches {named}"
+
+
 def cmd_nodes(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     nodes = cluster.nodes
     hidden_nodes = 0
@@ -3189,6 +3307,16 @@ def cmd_nodes(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             before = len(nodes)
             nodes = [n for n in nodes if n.name in reachable]
             hidden_nodes = before - len(nodes)
+    # What the funnel line below has to account for, captured HERE -- between
+    # the entitlement filter and the flag filters -- because that line reads as
+    # a funnel and `cmd_status`' funnel states the rule it borrows: "every
+    # partition on the cluster is in exactly one of these terms, so the line
+    # answers 'why five rows' by arithmetic rather than by asking the reader to
+    # trust it." Only the entitlement filter had a term. Measured on one
+    # snapshot: `--gpu --free` printed `41 of 608 ... 278 not on your
+    # allowlist`, leaving 289 nodes in no term at all -- or, read the other
+    # way, blaming the allowlist for nodes the reader's own flags removed.
+    entitled_count = len(nodes)
     if args.queue:
         wanted = {x.strip() for x in args.queue.split(",") if x.strip()}
         by_queue = {
@@ -3266,7 +3394,22 @@ def cmd_nodes(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     facts = [note, f"{gpu_nodes} with GPUs", f"{down} out"]
     if hidden_nodes:
         facts.append(st.dim(f"{hidden_nodes} not on your allowlist"))
+    # Terse on purpose, and NOT a list of the flags that did it: this file has
+    # spent several rounds removing exactly that habit ("Listing four ways to
+    # narrow the listing was 66 columns of flags"). One term, in the order the
+    # filters ran, so `shown + not-on-allowlist + filtered-out == total`.
+    narrowed = entitled_count - matched
+    if narrowed:
+        facts.append(st.dim(f"{narrowed} filtered out"))
     print(section("nodes", st, f"  {st.g.sep}  ".join(facts)))
+    if not visible and _excluding_filters(args, with_queue=True):
+        # Same rule and the same sentence as `zoom` above, for the same reason
+        # its comment gives. The funnel line already says HOW MANY were filtered
+        # out; this says WHICH filter did it, which is what makes the count
+        # actionable -- and `--gpu --cpu` cannot match anything anywhere, so a
+        # bare "(nothing to show)" would be misdescribing the cluster.
+        print("  " + st.dim(_nothing_matches(args, with_queue=True)))
+        return 0
     print(_grid(NODE_HEADS, visible, NODE_ALIGNS, st, indent="  ",
                 limits=NODE_LIMITS))
     if len(visible) < len(rows):
@@ -3442,6 +3585,83 @@ def _verdict_paint(label: str, st: Style) -> tuple[str, str]:
     return paint(getattr(st.g, glyph_name)), paint(label)
 
 
+#: The wire vocabulary of :func:`_entitlement_source`, in ladder order.
+#:
+#: One list, so the function, its docstring and the tests cannot disagree about
+#: which states exist -- and readable by a consumer that would rather enumerate
+#: them than discover them one cluster at a time.  Only ``confirmed`` and
+#: ``refused`` are statements about access; the rest say why there is no
+#: statement.
+ENTITLEMENT_SOURCES = (
+    "confirmed",
+    "refused",
+    "no durable answer",
+    "group-only",
+    "probe budget spent",
+    "declared",
+    "not asked",
+)
+
+
+def _entitlement_source(cluster: Cluster, p: Placement) -> str:
+    """Why entitlement here is settled, or why it is not -- decided ONCE.
+
+    `where` renders this twice, as the table's ACCESS cell and as the
+    ``entitlement_source`` key, and the two used to walk their own ladders. The
+    JSON one had no rung for a group's private hardware, so on a replay of this
+    cluster -- 19 partitions, 11 of them single-account -- the table said
+    ``group-only`` on those 11 while every row of the document said
+    ``declared``. Diffed field by field, a ``ssd`` row and a ``caslake`` row
+    differed only in capacity numbers, so a consumer ranking partitions had
+    nothing to tell a PI's hardware from a general queue: `declared` is
+    "there was no dry-run to run here", which is true of both.
+
+    The rungs, strongest first:
+
+    ``confirmed``
+        The control plane accepted the request itself.
+    ``refused`` / ``no durable answer``
+        It answered, and the answer either lasts or does not; see
+        :attr:`Verdict.durable`.
+    ``group-only``
+        No answer, and the queue's allowlist names one or two accounts -- see
+        :attr:`Queue.is_dedicated`. Checked BEFORE the two rungs below and
+        after all three above: a verdict outranks a heuristic, and the
+        heuristic outranks "nobody asked", which is the far less specific of
+        the two facts. Getting that order wrong is what dropped the marker on
+        every backend without a dry-run, which is where there is no probe to
+        fall back on.
+    ``probe budget spent`` / ``not asked``
+        A dry-run exists and this queue has no answer from it.
+    ``declared``
+        There is no dry-run to be had here at all -- a replay, a backend
+        without one, a missing client.
+
+    One slot, so a stronger rung hides a weaker one. The document publishes
+    ``dedicated`` alongside for that reason: unlike a table cell it has no
+    width to run out of, and a refused row should still say whose hardware it
+    was refusing.
+    """
+    if p.confirmed:
+        return "confirmed"
+    if p.verdict is not None:
+        # A refusal we could not obtain is not a refusal, exactly as
+        # `Placement.reachable` and `_verdict_label` have it.
+        if not p.verdict.allowed and p.verdict.durable:
+            return "refused"
+        return "no durable answer"
+    q = cluster.queues.get(p.queue)
+    if q is not None and q.is_dedicated:
+        return "group-only"
+    if p.probes[1] and not p.probes[0]:
+        # Asked for, and not asked: the global dry-run budget was spent on
+        # earlier queues. The budget is the actionable part.
+        return "probe budget spent"
+    if not cluster.can_probe:
+        return "declared"
+    return "not asked"
+
+
 def _verdict_label(p: Placement) -> str:
     """The single most actionable fact about one placement.
 
@@ -3524,11 +3744,13 @@ def _render_placements(
     # strongest claim the tool can make, about places the reader cannot go. See
     # Queue.is_dedicated for why the allowlist is read and the accounting
     # database is not.
+    #
+    # Both halves are read off `_entitlement_source`, which is the one place
+    # the question is decided: with no verdict anywhere, a group-owned queue is
+    # exactly the rows it returns "group-only" for.
     probed = any(p.verdict is not None for p in places)
-    dedicated = {
-        name for name, q in cluster.queues.items() if q.is_dedicated
-    }
-    show_access = probed or any(p.queue in dedicated for p in places)
+    sources = {p.queue: _entitlement_source(cluster, p) for p in places}
+    show_access = probed or "group-only" in sources.values()
 
     rows = []
     # `Capacity.hardware_nodes` holds NAMES and `Cluster.nodes` is a list, so
@@ -3549,6 +3771,11 @@ def _render_placements(
             when = format_wait(delta)
             if not p.start_estimate_from_scheduler:
                 when += st.dim("*")
+        # WHICH fact answers this cell is `_entitlement_source`'s decision, and
+        # it is the only one that used to be taken twice -- see that function
+        # for the ladder and for what the second copy of it got wrong. What is
+        # left here is presentation: the word, and its colour.
+        source = sources[p.queue]
         if p.verdict is not None:
             if p.verdict.allowed:
                 access = st.ok("confirmed")
@@ -3562,34 +3789,18 @@ def _render_placements(
                 # into a prose cell, on the two categories a reader most needs
                 # to act on.
                 access = paint(category_label(p.verdict.category))
-        elif p.queue in dedicated:
+        elif source == "group-only":
             # Somebody's own hardware. Not a refusal -- we genuinely do not know
             # -- but presenting it beside a shared partition with no distinction
             # is what made three unreachable rows read as RUN NOW.
             access = st.warn("group-only")
-        elif p.probes[1] and not p.probes[0]:
-            # Asked for, and not asked: the global dry-run budget was spent on
-            # earlier queues. "unchecked" is true of this and says nothing the
-            # reader can use; the budget is the actionable part.
+        elif source == "probe budget spent":
+            # "unchecked" is true of this and says nothing the reader can use;
+            # the budget is the actionable part.
             access = st.warn("budget spent")
-        elif not cluster.can_probe:
-            # No dry-run to be had here at all -- the backend has none, its
-            # client is missing, or this is a replay: nothing could have been
-            # confirmed.
-            #
-            # Keyed on the CLUSTER, not on the placement's own
-            # `entitlement_unconfirmed`, which is now true whenever the control
-            # plane did not settle the question. These two cells answer
-            # different halves of that: "there was no dry-run to run" and "a
-            # dry-run exists and this queue's answer is not in".
-            #
-            # Checked AFTER group ownership, not before. Both are true, the
-            # column has one slot, and "group-only" is the far more specific
-            # and actionable of the two -- while "no dry-run exists anywhere"
-            # is already stated once in the footer. Getting this order wrong
-            # silently dropped the marker on every backend without a dry-run
-            # (PBS, LSF, the ssh pool), which is precisely where there is no
-            # probe to fall back on.
+        elif source == "declared":
+            # No dry-run to be had here at all. Stated in the footer too, which
+            # is why the rung above it wins the one slot this column has.
             access = st.dim("declared")
         else:
             # A dry-run exists and this queue has no answer from it. "unchecked"
@@ -3838,19 +4049,21 @@ def cmd_where(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             "confirmed": p.confirmed,
             "entitlement_unconfirmed": p.entitlement_unconfirmed,
             # Why it is unconfirmed, so a consumer need not infer it from the
-            # absence of a verdict. `declared` is "there was no dry-run to run
-            # here at all" -- a replay, a backend without one, a missing client
-            # -- and `not asked` is "one exists and this queue has no answer
-            # from it". Only `confirmed`/`refused` are statements about access.
-            "entitlement_source": (
-                "confirmed" if p.confirmed
-                else "refused" if (p.verdict is not None
-                                   and not p.verdict.allowed
-                                   and p.verdict.durable)
-                else "no durable answer" if p.verdict is not None
-                else "probe budget spent" if (p.probes[1] and not p.probes[0])
-                else "declared" if not cluster.can_probe
-                else "not asked"
+            # absence of a verdict. From `_entitlement_source`, the same call
+            # the table's ACCESS cell renders -- this key used to walk a second
+            # copy of that ladder with the `group-only` rung missing, so on a
+            # replay of this cluster the table marked 11 of 19 partitions as one
+            # group's private hardware and every row of this document said
+            # `declared`.
+            "entitlement_source": _entitlement_source(cluster, p),
+            # Group ownership on its own key as well, because `status --json`
+            # publishes it per queue and because the line above has ONE slot: a
+            # verdict outranks the heuristic there, so a refused row would
+            # otherwise stop saying whose hardware refused it. A table cell has
+            # to choose; a document has no width to run out of.
+            "dedicated": bool(
+                (q := cluster.queues.get(p.queue)) is not None
+                and q.is_dedicated
             ),
             "hardware_incompatible": p.hardware_incompatible,
             "nodes_free": p.nodes_available,
@@ -3882,8 +4095,28 @@ def cmd_where(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             "nodes_unverified": (
                 len(p.capacity.unverified_nodes) if p.capacity else 0
             ),
+            # The count alone cannot be acted on, and the caveat beside it ends
+            # "check the node labels" -- an instruction whose target was withheld.
+            # `unverified_nodes` holds exactly those names and every read of it
+            # was `len()` or a truthiness test, so the names never reached any
+            # surface. All of them, for the reason the `hardware_reasons` note
+            # above gives: a document has no width to run out of.
+            "unverified_node_names": (
+                list(p.capacity.unverified_nodes) if p.capacity else []
+            ),
             "hardware_reasons": (
                 dict(p.capacity.hardware_reasons) if p.capacity else {}
+            ),
+            # The other half of "why not here". `hardware_reasons` answers "no
+            # node CAN take this"; this answers "the capable nodes are busy", and
+            # the two are disjoint -- for a shape no node can currently fit,
+            # `hardware_reasons` is `{}` and this holds the only explanation
+            # there is. `assess_capacity` has always ranked it (sorted by count,
+            # descending) and nothing read it. All of it, not a top slice, for
+            # the reason the note above gives: a document has no width to run
+            # out of.
+            "blocked_reasons": (
+                dict(p.capacity.blocked_reasons) if p.capacity else {}
             ),
             "earliest_start": p.earliest_start.isoformat() if p.earliest_start else None,
             "start_from_scheduler": p.start_estimate_from_scheduler,
@@ -4310,6 +4543,16 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
     if args.json:
         _print_json({
             "accelerators_installed": installed,
+            # The denominator the rendered headline prints beside that figure
+            # ("230 GPUs of 358 on the cluster"), for the reason the filter
+            # above states in its own words: "358 GPUs is true of the cluster
+            # and false of what the reader can use". Without it a consumer
+            # reading `accelerators_installed` cannot tell a whole-cluster
+            # inventory from the slice of it this account can reach -- the one
+            # decision the rendered surface makes for the human. Equal to
+            # `accelerators_installed` when nothing is filtered out, which is
+            # exactly when the headline drops the phrase.
+            "accelerators_on_cluster": cluster_total,
             "accelerators_identified": identified,
             "accelerators_unidentifiable": unknown,
             "models": {
@@ -4518,10 +4761,20 @@ def cmd_snapshot(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     runner = cluster.capture
     # One guard, not two: this condition was tested twice in a row with two
     # different messages, so the second could never run and nobody had ever seen
-    # its wording. `main()` sets `cluster.capture` before dispatch, which is why
-    # both were marked no-cover -- an unreachable branch is easy to duplicate
-    # precisely because no test exercises it.
-    if runner is None:  # pragma: no cover - set by main() before dispatch
+    # its wording -- an unreachable branch is easy to duplicate precisely because
+    # no test exercises it.
+    #
+    # And it is NOT unreachable, which is what that comment used to claim ("set
+    # by `main()` before dispatch, which is why both were marked no-cover").
+    # `main()` sets `cluster.capture` on the LIVE path only; a replay reaches
+    # this function through `COMMANDS` with nothing captured, so
+    # `nodetop --replay snap.json snapshot` lands here every time. Measured: it
+    # prints this line and exits 2. Re-recording a recording is the right thing
+    # to refuse -- the capture holds the command output a live run produced, and
+    # a replay ran no commands -- so the behaviour stays and only the claim about
+    # it changes. The `no cover` came off with it, because excluding a reachable
+    # branch is how the duplicate above survived.
+    if runner is None:
         print("snapshot needs a capturing runner; nothing was captured",
               file=sys.stderr)
         return 2

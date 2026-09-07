@@ -163,9 +163,13 @@ autodetection and `--replay snap.json` works from a saved snapshot ·
 `--static`, `--no-color`, `--ascii` for pipes and dumb terminals.
 
 `--json` works on every command and carries everything the text does, caveats
-included. Exit status is usable in a pipeline: `where` and `check` return 0 only
-when somewhere could actually take the job, 1 when nothing can, 2 when the system
-has no dry-run to ask, and 3 when the queries themselves failed.
+included. Exit status is usable in a pipeline: `where` and `check` return 0 when
+somewhere could take the job and 1 when nothing can. `check` also returns 2 when
+there is no dry-run to ask — a replayed snapshot, or a system with no probe — and
+says so; `where` answers from the declared ACLs instead, which is what `check`
+itself points you to in that case, so it returns 0 or 1 there like anywhere else.
+Any command returns 2 for a usage error, 3 when no batch system is usable, and
+130 on Ctrl-C.
 
 The vocabulary follows the system — `partition` on Slurm, `queue` on PBS/LSF/SGE,
 `namespace` on Kubernetes — and `-p` is accepted everywhere as an alias for `-q`.
@@ -230,7 +234,7 @@ the same instant.
 ```bash
 git clone https://github.com/PursuitOfDataScience/nodetop
 cd nodetop && pip install -e ".[dev]"
-pytest          # ~4491 tests, no batch system required
+pytest          # ~4855 tests, no batch system required
 ruff check src tests && mypy src
 ```
 

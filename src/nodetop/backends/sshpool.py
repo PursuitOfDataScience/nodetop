@@ -116,7 +116,21 @@ class SshPoolBackend:
                         (parts[0], _i(parts[1]), _i(parts[2]), _i(parts[3]))
                     )
             elif line.startswith("ROCM="):
-                gpus.append((line[5:].strip(), 0, 0, 0))
+                # `-1`, not `0`, for the three figures: the probe runs
+                # `rocm-smi --showproductname`, which reports a NAME and nothing
+                # else, so no memory reading for this card EXISTS. Zero is not
+                # that -- `busy` below reads it as "holds no memory", i.e. free.
+                #
+                # Measured before this: two `ROCM=` cards gave
+                # `gpus_total=2, gpus_alloc=0`, so every ROCm card reported free
+                # however much was running on it. That is the collision the
+                # comment on `busy` warns about in as many words ("treating that
+                # as free is how two jobs collide"), and the opposite of the
+                # direction this module states twice -- `cpus_alloc` rounds load
+                # UP because "understating occupancy overstates free capacity,
+                # which is the direction that gets two jobs started on the same
+                # cores". An unmeasured card is counted the same way: occupied.
+                gpus.append((line[5:].strip(), -1, -1, -1))
             elif "=" in line:
                 key, _, value = line.partition("=")
                 fields[key] = value.strip()
@@ -129,7 +143,10 @@ class SshPoolBackend:
         # A GPU counts as busy when it holds memory, not when its utilisation
         # is high: a job between kernels reads 0% util while still owning the
         # card, and treating that as free is how two jobs collide.
-        busy = sum(1 for _, _, used, _ in gpus if used > 512)
+        # `used < 0` marks a card whose memory was never measured (the `ROCM=`
+        # branch above). It counts as busy, because the only safe reading of an
+        # unknown is the one that does not hand the card to a second job.
+        busy = sum(1 for _, _, used, _ in gpus if used > 512 or used < 0)
         model = gpus[0][0] if gpus else ""
 
         return Node(

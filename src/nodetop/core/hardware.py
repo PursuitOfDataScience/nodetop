@@ -519,10 +519,51 @@ def identify_accelerator(
 #: now in the vocabulary above.
 _GPU_NAME_SHAPED = re.compile(
     r"""^(?:
-        (?:nvidia|geforce|gtx|rtx|quadro|titan|tesla)[a-z0-9]{1,12}
-      | (?:radeon|instinct|firepro)[a-z0-9]{1,12}
+        # `{1,24}`, not `{1,12}`: the cap was measured against real
+        # `nvidia-smi --query-gpu=name` output and it cut real cards off.
+        # `nvidiaa10080gbpcie` is exactly 12 after the vendor and squeezed
+        # through; `nvidiageforcertx4090` is 14 and did not, so
+        # `NVIDIA GeForce RTX 4090` was refused a name at all. Widening is safe
+        # for THIS alternation specifically because NVIDIA ships no CPUs, so
+        # there is no product-name class here to confuse a card with -- and a
+        # driver string is still refused by `_DRIVER_LABEL` below.
+        (?:nvidia|geforce|gtx|rtx|quadro|titan|tesla)[a-z0-9]{1,24}
+      # `amd` is an OPTIONAL prefix on a family, never a prefix on its own.
+      # `nvidia` is accepted bare above because NVIDIA ships no CPUs; AMD does,
+      # and `_NON_ACCELERATOR_LABEL` only refuses the `amd[-_]epyc` spellings --
+      # measured, it passes the SPACE-separated product names, so
+      # `_normalise("AMD EPYC 7763")` is `amdepyc7763` and a bare `amd[a-z0-9]+`
+      # shape would have named a CPU as this node's accelerator. `AMD Opteron
+      # 6376` the same. That is the "wrong name is worse than the shrug it
+      # replaces" failure this block was narrowed to avoid, so the prefix is
+      # admitted only in front of a family already listed here.
+      #
+      # What it fixes: `rocm-smi --showproductname` answers with the full
+      # product name, so `SshPoolBackend.parse_host` handed this
+      # `AMD Instinct MI250X` -- which normalises to `amdinstinctmi250x` and
+      # matched nothing, because the alternation started at `instinct`. The name
+      # was dropped and `accelerator_label` came out empty, though this
+      # function's own docstring says it reports the name "vocabulary or not"
+      # and that it is "a fact the node record already carries and which a
+      # report has no reason to throw away".
+      | (?:amd)?(?:radeon|instinct|firepro)[a-z0-9]{1,12}
+      # Intel is admitted ONLY in these two exact forms, never as a bare
+      # prefix -- Intel ships CPUs and `_NON_ACCELERATOR_LABEL` refuses only the
+      # `intel[-_]xeon` spellings, so (measured) `Intel Xeon Gold 6248` and
+      # `Intel(R) Xeon(R) Platinum 8360Y` reach here unrejected and a bare
+      # `intel[a-z0-9]+` shape would have named a CPU as the accelerator. Same
+      # reasoning as the `amd` prefix above.
+      #
+      # `intelr?datacentergpumax\d*` is what `Intel(R) Data Center GPU Max 1550`
+      # normalises to, and that card IS in the vocabulary as PVC1550 --
+      # `identify_accelerator` resolved it while this function returned None,
+      # which is the companion disagreement `name_accelerator`'s docstring
+      # forbids ("a fact the node record already carries and which a report has
+      # no reason to throw away").
+      | intel r? datacentergpumax \d{0,6}
+      | intel arc [a-z0-9]{1,20}
       | gaudi\d*
-      | mi\d{2,3}x?
+      | (?:amd)?mi\d{2,3}x?
     )$""",
     re.IGNORECASE | re.VERBOSE,
 )

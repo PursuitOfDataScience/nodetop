@@ -318,10 +318,22 @@ class PbsBackend:
             if not path:
                 continue
             for other in ("slurm", "lsf", "sge", "gridengine"):
-                # A path COMPONENT, so a queue directory called `/data/slurm`
-                # cannot be mistaken for an install prefix.
-                if other in path.lower().split("/"):
-                    return other  # pragma: no cover - subsumed below
+                # A path COMPONENT and not a substring, so `/data/slurmqueue` is
+                # not read as an install prefix.
+                #
+                # ONE condition, not two. There used to be a separate
+                # `if other in path.lower().split("/")` immediately above this,
+                # carrying `# pragma: no cover - subsumed below`. Both halves of
+                # that were wrong: it is not subsumed (it ran FIRST, so it was the
+                # one that answered, and `test_only_a_whole_component_names_a_
+                # wrapper`'s `slurm/bin` row executes it), and excluding it hid
+                # that it duplicated the `c.lower() == other` disjunct below --
+                # lowering before or after splitting on "/" is the same test.
+                # Collapsed rather than re-commented, because two conditions that
+                # agree today are what the `no cover` marker was papering over.
+                # Behaviour is unchanged, checked against every existing row.
+                #
+                # The second form it also accepts:
                 # `/software/slurm-23.02-el7-x86_64/bin/qstat` -- the version is
                 # in the directory name, which is how these are laid out.
                 #

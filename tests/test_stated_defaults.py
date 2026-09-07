@@ -7,11 +7,19 @@ the value needs a gloss, as `--top`'s "20; --all for every one" does), but it is
 a copy, and a copy drifts silently: change the keyword and the sentence beside
 it still says the old number. Nothing checked them.
 
-A sibling package sidesteps this by interpolating everywhere, and two others
-state only prose defaults, so this is the one package where the check has
-anything to bite on. Verified at the time of writing: 13 value defaults agree,
-and the three prose ones (`--accounts`, "all of yours") are skipped deliberately
--- see `_stated_value`.
+A sibling package sidesteps this by interpolating everywhere -- rapidu's seven
+stated defaults are all `%(default)s` and so cannot drift. Verified at the time
+of writing: 13 value defaults agree here, and the three prose ones
+(`--accounts`, "all of yours") are skipped deliberately -- see `_stated_value`.
+
+**This file used to add "and two others state only prose defaults, so this is
+the one package where the check has anything to bite on". That was wrong.**
+Measured 2026-09-06: slurmpast states three COMPARABLE values --
+`(default: now-7days)`, `(default: hang)`, `(default: cost)` -- so the check
+bites there too, and it now has its own copy. The two that genuinely cannot be
+scanned this way are slurmate (no `cli` module to import a parser from) and
+slurmwatch (its `cli` exposes no `build_parser`); for those the help text is
+the only surface, which is a different probe.
 """
 
 from __future__ import annotations

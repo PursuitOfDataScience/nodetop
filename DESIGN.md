@@ -478,6 +478,17 @@ so the row you can act on comes first. `tests/test_check.py` records the blind s
 executable test, so the heuristic can never quietly be mistaken for a substitute for
 `--check`.
 
+Both surfaces of `where` say it, off one call. `cli._entitlement_source` decides which
+fact answers the question for a placement — a verdict, then group ownership, then "the
+probe budget ran out", then "there was no dry-run" — and the table's ACCESS cell and
+`--json`'s `entitlement_source` each render that one answer. They used to walk separate
+ladders and the JSON's had no rung for group ownership at all, so on a replay of this
+cluster the table marked 11 of 19 partitions `group-only` and every row of the document
+said `declared`. The document additionally carries a `dedicated` boolean, because the
+cell has one slot and a verdict wins it: a *refused* row should still say whose hardware
+refused, and unlike a table a document has no width to run out of. `status --json`
+publishes the same boolean per queue.
+
 ### 2. Entitlement that is declared but never verified
 
 Three of the six systems have a real verify-only mode. Three do not:
@@ -2529,7 +2540,7 @@ Four honesty rules are enforced in code rather than left to the reader:
 
 ```bash
 pip install -e ".[dev]"
-pytest          # 4491 tests, no batch system required
+pytest          # 4855 tests, no batch system required
 ruff check src tests
 ```
 

@@ -499,6 +499,14 @@ def _depth() -> int:
     if os.environ.get("NO_COLOR"):
         return 0
     forced = os.environ.get("FORCE_COLOR")
+    # `FORCE_COLOR=0` asks for NO colour, and used to get the most there is: any
+    # value other than `1`/`true` was read as "some other level" and mapped to 24
+    # below, so `FORCE_COLOR=0` -- and `false` -- came back TRUECOLOR. A value
+    # naming zero cannot select the top of a ladder whose zero this docstring
+    # defines as "no colour". Treated like `NO_COLOR`, and spelled with the same
+    # `false`/`true` vocabulary the level mapping already uses.
+    if forced in ("0", "false"):
+        return 0
     if not forced and not sys.stdout.isatty():
         return 0
     term = os.environ.get("TERM", "")
@@ -728,6 +736,25 @@ def bar(
     already ranked a whole column with :func:`heat_steps` and wants the bar to
     match the number beside it.  ``role`` overrides the colour entirely, for
     the rare bar that genuinely is a verdict.
+
+    **A meter drawn completely full means the whole of it, and nothing less.**
+    Every caller prints an EXACT ratio beside the bar -- ``5115/5120``,
+    ``231/232``, ``88/176 gpu`` -- so unlike the family's percentage gauges
+    there is no rounded label to agree with: the only fullness the number
+    admits is numerator == denominator.  Both draw paths reached full early
+    anyway, because both round.  Measured before this, at ``NODETOP_ASCII`` and
+    without: ASCII drew ``########`` for 96.6% of 8 cells and
+    ``##################`` for 98% of 18; Unicode drew a solid ``████████``
+    from 99.4% of 8 cells and a solid 18 from 99.9%.  A partition with 5115 of
+    5120 cores free therefore rendered as *every core free*, which is the one
+    thing the ``cores free`` column exists to distinguish.  So the last eighth
+    is withheld until ``fraction`` reaches 1.0 -- the eighth, not the whole
+    cell, because sub-cell resolution is this meter's stated point and one
+    eighth of one cell is all it takes for the tip to stop being ``█``.  The
+    siblings settled the same invariant the same way: ``slurmwatch.tui``
+    reserves the final eighth in ``_color_bar`` and the final cell in
+    ``_bar_cells``, and ``slurmpast.render.bar_cells`` reserves the final whole
+    cell on the two paths that have no eighths to spare.
     """
     style = style or Style()
     g = style.g
@@ -739,8 +766,16 @@ def bar(
     # block arithmetic and two `paint` calls per bar. Keyed on the *rounded*
     # numbers the body actually uses, both of them, so a hit is the same string
     # the miss would have built rather than one that merely looks like it.
+    #
+    # `whole` is in the key for exactly that reason. The rounded eighths cannot
+    # tell 0.999 from 1.0 at size 8 -- both round to 64 -- and since the reserve
+    # below keys on the UNROUNDED fraction, the two now draw different pictures.
+    # Without this term the first of the pair to be drawn would be handed back
+    # for the other, which is how a 5115/5120 row would inherit a solid bar from
+    # the 5120/5120 row above it.
+    whole = fraction >= 1.0
     key = (int(round(fraction * size * 8)), int(round(fraction * size)),
-           size, role, tone)
+           size, role, tone, whole)
     hit = style._bars.get(key)
     if hit is not None:
         return hit
@@ -752,9 +787,17 @@ def bar(
 
     if not g.unicode:
         filled = int(round(fraction * size))
+        # Short of the whole, keep one cell of trough: ASCII has no partial
+        # block to spend, so the cell is the smallest reserve there is.
+        if not whole:
+            filled = min(filled, max(0, size - 1))
         drawn = painted(g.blocks * filled, g.empty * (size - filled))
     else:
         total_eighths = int(round(fraction * size * 8))
+        # Short of the whole, keep one eighth back, so the tip is `▉` and not
+        # `█`. See the reserve paragraph in the docstring.
+        if not whole:
+            total_eighths = min(total_eighths, max(0, size * 8 - 1))
         full, remainder = divmod(total_eighths, 8)
         fill = g.blocks[-1] * full
         if remainder:

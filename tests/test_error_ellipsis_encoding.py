@@ -1,21 +1,28 @@
-"""The line that reports a failed query crashed reporting it, on an ASCII stderr.
+"""An unfolded U+2026 crashes on an ASCII **stdout**, and litters an ASCII stderr.
 
 `truncate`'s `ellipsis` defaults to U+2026, and twelve of its fourteen call sites
 pass a glyph from the detected set instead. The two that did not were both error
-paths, and one writes to stderr with no `Style` in scope:
+paths: one inside `cmd_status` (stdout) and one writing to stderr with no `Style`
+in scope. Both now take the mark from a glyph set -- `st.g.ellipsis` and
+`Glyphs.detect(sys.stderr)` respectively.
 
-    print(f"query failed: {name}: {truncate(why, 120)}", file=sys.stderr)
+**The two streams behave differently, and an earlier version of this file had it
+backwards.** Measured with the handlers CPython actually installs under an ASCII
+locale (`LC_ALL=C`, UTF-8 mode off):
 
-Under `LC_ALL=C` that raises `UnicodeEncodeError` -- but only once a message is
-long enough to be cut, so a short failure reported fine and a verbose one killed
-the reporter. `Glyphs.detect` had already written down why: a terminal that cannot
-encode the glyph "would raise or print replacement characters; ASCII is strictly
-better than either."
+    stdout   ascii / surrogateescape    -> UnicodeEncodeError
+    stderr   ascii / backslashreplace   -> succeeds, emits the text `\u2026`
 
-Both sites now take the mark from a glyph set -- `Glyphs.detect(sys.stderr)` for
-the stderr line, `st.g.ellipsis` for the one inside `cmd_status`, which already
-holds the `Style` that owns them. `truncate`'s own default is deliberately
-unchanged; see `TestControls`.
+So the **stdout** site is the real crash, and the stderr one is cosmetic: the
+reader gets `query failed: queues: ...\u2026` instead of an ellipsis. Python has
+guaranteed `backslashreplace` on stderr since 3.5, so a `UnicodeEncodeError` there
+is not reachable at all -- the earlier claim that it was came from a harness that
+forced `errors="strict"`, which no real stream uses.
+
+Both halves are still worth fixing, and `Glyphs.detect` says why in one line: a
+terminal that cannot encode the glyph "would raise or print replacement
+characters; ASCII is strictly better than either." `truncate`'s own default is
+deliberately unchanged; see `TestControls`.
 """
 
 import io
@@ -51,9 +58,15 @@ def _stderr_bytes(why, encoding):
 
     A `StringIO` cannot show this defect: it accepts any str. The encoding has to
     be enforced at write time, which is what a terminal does.
+
+    `errors="backslashreplace"` because that is what CPython installs on stderr,
+    not `"strict"`. Forcing strict here is what made an earlier version of this
+    file report a crash that cannot happen.
     """
     raw = io.BytesIO()
-    stream = io.TextIOWrapper(raw, encoding=encoding, errors="strict", write_through=True)
+    stream = io.TextIOWrapper(
+        raw, encoding=encoding, errors="backslashreplace", write_through=True
+    )
     saved = sys.stderr
     sys.stderr = stream
     try:
@@ -65,30 +78,48 @@ def _stderr_bytes(why, encoding):
 
 
 class TestTheReporterSurvivesAnAsciiTerminal:
-    def test_a_long_failure_no_longer_raises_on_an_ascii_stderr(self):
+    def test_an_ascii_stderr_gets_a_readable_mark_not_an_escape(self):
+        """stderr cannot raise, so what is at stake here is legibility.
+
+        Without the fix this line reads `...\u2026` -- the escape CPython's
+        `backslashreplace` produces -- which is noise in the one message that
+        exists to explain a failed query.
+        """
         rc, text = _stderr_bytes(LONG_WHY, "ascii")
         assert rc == 3
         assert "query failed: queues" in text, text
         assert "..." in text, text
+        assert "\\u2026" not in text, text
 
     def test_a_utf8_terminal_still_gets_the_nicer_mark(self):
         """The fix is per-stream detection, not a downgrade for everyone."""
         _rc, text = _stderr_bytes(LONG_WHY, "utf-8")
         assert "…" in text, text
 
-    def test_the_status_panel_row_folds_with_its_style(self):
+    def test_the_status_panel_does_not_crash_on_an_ascii_stdout(self):
+        """The real crash, on a REAL encoded stream.
+
+        stdout gets `surrogateescape`, which raises on a character it cannot
+        encode -- unlike stderr. A `StringIO` accepts any `str`, so the earlier
+        version of this test could only see the glyph, never the exception it
+        matters for.
+        """
         args = build_parser().parse_args(["status"])
         style = Style(enabled=False, glyphs=Glyphs.ascii())
-        buf = io.StringIO()
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(
+            raw, encoding="ascii", errors="surrogateescape", write_through=True
+        )
         saved = sys.stdout
-        sys.stdout = buf
+        sys.stdout = stream
         try:
             cmd_status(_cluster(LONG_WHY, with_queues=True), args, style)
         finally:
             sys.stdout = saved
-        out = buf.getvalue()
+            stream.flush()
+        out = raw.getvalue().decode("ascii")
         assert "FAILED" in out, out
-        assert "…" not in out, [c for c in out if not c.isascii()]
+        assert "\u2026" not in out, out
 
 
 class TestControls:
