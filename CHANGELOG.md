@@ -12,6 +12,15 @@ test and a control verified in both states.
 
 ### Fixed
 
+- **`snapshot` was the one command that recorded a cluster-wide outage in
+  silence.** Every other command names each failed query on stderr and, when the
+  snapshot is empty as well, refuses to print numbers and exits 3. `snapshot` is
+  deliberately exempt from that guard — a recording of a broken cluster is a
+  legitimate artifact, `errors` is a field of it, and replaying it *is* rejected —
+  but it said nothing at the time, so a recording made during a controller outage
+  looked like any other and exited 0. It now names each failed query on stderr,
+  like the rest, leaving stdout (and `-o -`) untouched.
+
 - **A meter drawn completely full did not mean full.** Every caller prints an exact
   ratio beside `render.bar` — `cores free` shows `5115/5120`, the feature table
   `231/232`, `render.gauge` `88/176 gpu` — so unlike this family's percentage

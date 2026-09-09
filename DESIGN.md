@@ -21,6 +21,24 @@ scheduler-independent, so it lives in `nodetop.core`, which imports no backend a
 what no scheduler is. Only *acquiring* the facts differs, and that lives in one adapter
 per system.
 
+That claim is now read by a test rather than only asserted here:
+`tests/test_core_imports_no_backend.py` scans every `core/*.py` for an import naming a
+scheduler-specific backend — statically **and** dynamically — and separately probes what
+importing core actually loads. The dynamic half was added after tabulating the static
+one: `ast.Import`/`ast.ImportFrom` cover the two spellings a linter thinks about, while
+`importlib.import_module("nodetop.backends.slurm")`, its relative form and
+`__import__(...)` are none of them. That is not a hypothetical form here —
+`core/access.py` writes `__import__("contextlib")` twice, so it is already idiomatic in
+the directory being guarded, and because both sit inside functions such an import would
+also be invisible to the runtime probe, which only sees what module import pulls in. Both
+halves are needed. A concrete import at a core module's top level is already caught by
+Python — it makes `nodetop.backends.base` a partially initialised circular import and
+collection stops — but the same import *inside a function* breaks nothing, executes never,
+and would have passed every gate. The two backend references core is allowed are
+whitelisted by name: the annotation-only `..backends.base` under `TYPE_CHECKING`, and the
+lazy `..backends` behind `snapshot(backend=None)` that calls the scheduler-agnostic
+`detect()`.
+
 ```
 nodetop/
   core/       model · hardware · capacity · fit · duration   ← knows nothing about schedulers
@@ -343,10 +361,24 @@ whether something is wrong, and during a total outage it said nothing was. And t
 --unschedulable)` submits with no exclusions while the script believes it has them.
 Only `status` mentioned the failures at all.
 
-One guard at dispatch now covers every command: if queries failed and the snapshot is
-empty, nothing is printed to stdout, each failed query is named on stderr, and the exit
-status is **3** — the same code as "no batch system here", because both mean the tool
-could not do its job. Deliberately not 1, which means "nothing fits" and is a real
+One guard at dispatch covers every command that reports on the cluster: if queries
+failed and the snapshot is empty, nothing is printed to stdout, each failed query is
+named on stderr, and the exit status is **3** — the same code as "no batch system here",
+because both mean the tool could not do its job.
+
+**Two of the eleven commands are exempt, and the exemptions are now named in the code
+(`_GUARD_EXEMPT`) rather than left implicit in the shape of two early returns.** Measured
+by spying on the guard while running every command: nine reach it, `backends` and
+`snapshot` do not. `backends` answers *which batch systems are usable here*, so it is the
+one command whose job is to reply when nothing was detected — guarding it would suppress
+the answer the reader came for. `snapshot` records the queries for later analysis, and a
+recording of a broken cluster is a legitimate artifact: `errors` is a field of it, and
+replaying it *is* rejected by the guard. It was, however, the one command that recorded an
+outage in silence, so it now names each failed query on stderr like every other command.
+
+This paragraph used to read "every command", which was false for those two and had nothing
+reading it — the same shape as the bug the section is about. A test now classifies every
+command the parser offers, so a new one has to be declared guarded or exempt. Deliberately not 1, which means "nothing fits" and is a real
 answer. A *partial* failure still exits 0 with the report intact and the missing query
 named, because that report is usable.
 
@@ -2037,6 +2069,17 @@ Grid Engine used to *patch* accelerator counts in place after parsing `qhost`
 and now rebuilds with `dataclasses.replace`, which yields a fresh object with an
 empty cache. And a test walks the AST of every source file looking for an
 assignment to any Node field; it fails with the file and line if one appears.
+
+That scan was widened once the claim was checked against crafted snippets: it looked at
+`ast.Assign`/`ast.AugAssign` targets that were directly an `ast.Attribute`, and **six
+plain-Python forms went straight through it** — `n.f, n.g = v, w`, `[n.f, x] = ...`,
+`n.f, *rest = ...`, `n.f: int = v`, `setattr(n, "f", v)` and `n.__dict__["f"] = v`. A
+tuple target is an `ast.Tuple`, so the whole statement missed the `isinstance` check;
+`setattr` is the one that matters in practice, because a dynamic patch-up path is
+precisely the shape Grid Engine used to have. The source was clean under the wider scan
+(0 hits across 25 files), so nothing was stale — the guard simply was not guarding what
+this paragraph says it does. Each form now has its own test, and each is verified to fail
+when its branch of the scan is removed.
 Queue-level aggregates are deliberately left uncached: `Queue.nodes` is wired up
 after construction and four backends patch `node_names` later still, so a cache
 there would be a cache of an unfinished object.

@@ -52,8 +52,20 @@ nt = "nodetop.cli:main"
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff>=0.3",
-    "mypy>=1.8",
+    # Both bounded on purpose. `[tool.ruff.lint] select` here names whole rule
+    # FAMILIES -- E, F, W, I, N, UP, B, SIM, ARG, C4, T20 -- not individual
+    # codes, so a minor ruff release that adds a rule to any of them starts
+    # failing `ruff check src tests` on code nobody touched, and the failure
+    # lands on somebody else's push with no change to blame. Two siblings pin
+    # for exactly this: slurmpast's comment records "a minor ruff release
+    # changing its rule defaults is exactly what broke the first CI run here",
+    # and rapidu bounds the formatter on the same reasoning. mypy gets a ceiling
+    # too, because its new checks also arrive in minor releases. Measured: CI
+    # resolves ruff 0.16.6 and mypy 2.3.1 on a green run, and locally 0.15.18 /
+    # 2.1.0 leave `ruff check src tests` and `mypy src` clean -- so the range is
+    # verified at both of its ends, not just declared.
+    "ruff>=0.15,<0.17",
+    "mypy>=1.8,<3",
     "build>=1.0",
     "twine>=4.0",
 ]

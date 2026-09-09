@@ -207,6 +207,45 @@ def _named_failures(errors: dict[str, str]) -> str:
     return f"the {joined} {'query' if len(names) == 1 else 'queries'}"
 
 
+#: The two commands that do NOT pass through :func:`_reject_broken_snapshot`,
+#: with the reason each is exempt. Measured by spying on the guard while running
+#: every command in the parser: nine of the eleven reach it, these two do not.
+#:
+#: * ``backends`` -- reports which batch systems are usable here, so it is the
+#:   one command whose job is to answer when nothing was detected. Guarding it
+#:   would silence the answer the reader came for.
+#: * ``snapshot`` -- records the queries for later analysis, and a recording of a
+#:   broken cluster is a legitimate artifact: ``errors`` is a field of it, and a
+#:   replay of it IS rejected by the guard. It names each failed query on stderr
+#:   so the reader is told at the time.
+#:
+#: Named rather than left implicit in the shape of two early returns, because
+#: DESIGN.md claimed "one guard at dispatch now covers every command" and nothing
+#: read that claim -- a command added after those returns would inherit the exact
+#: confidently-wrong-answer bug the guard exists to prevent.
+_GUARD_EXEMPT = frozenset({"backends", "snapshot"})
+
+
+def _name_failed_queries(cluster: Cluster) -> None:
+    """Name each failed query on stderr, one line apiece.
+
+    stderr and not stdout, so a report that is still usable stays pipeable --
+    the rule :func:`_reject_broken_snapshot` states as "the missing query is
+    named on stderr so stdout stays pipeable".
+
+    The ellipsis comes from ``Glyphs.detect`` rather than ``truncate``'s default
+    U+2026: under ``LC_ALL=C`` writing that raises ``UnicodeEncodeError``, so the
+    line that exists to report a failed query died reporting it -- but only once a
+    message was long enough to be cut.
+
+    A function rather than the loop it replaced, because a second caller needed
+    the identical behaviour and a copy is how the two would have drifted.
+    """
+    ell = Glyphs.detect(sys.stderr).ellipsis
+    for name, why in cluster.errors.items():
+        print(f"query failed: {name}: {truncate(why, 120, ell)}", file=sys.stderr)
+
+
 def _reject_broken_snapshot(cluster: Cluster, command: str) -> int:
     """Refuse to report numbers the control plane never supplied.
 
@@ -262,9 +301,7 @@ def _reject_broken_snapshot(cluster: Cluster, command: str) -> int:
         # query died reporting it, but only once a message was long enough to be
         # cut. `Glyphs.detect` says this outright: a terminal that cannot encode
         # the glyph "would raise or print replacement characters".
-        ell = Glyphs.detect(sys.stderr).ellipsis
-        for name, why in cluster.errors.items():
-            print(f"query failed: {name}: {truncate(why, 120, ell)}", file=sys.stderr)
+        _name_failed_queries(cluster)
     if fatal:
         # THREE causes, and they send the reader to different places: every
         # query failing is a control plane or a PATH problem, ONE query failing
@@ -4778,6 +4815,16 @@ def cmd_snapshot(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         print("snapshot needs a capturing runner; nothing was captured",
               file=sys.stderr)
         return 2
+    # `snapshot` does not pass through `_reject_broken_snapshot` -- it is one of
+    # the two commands exempt from it (see `_GUARD_EXEMPT`) -- so without this it
+    # was the ONE command that recorded an outage in silence: every other command
+    # names each failed query on stderr, while this one wrote them into the
+    # document and exited 0. The recording is honest either way, since `errors`
+    # is a field of it and a replay is rejected by the guard; what was missing is
+    # the reader being told, at the time, that they were recording a cluster the
+    # queries could not describe. stderr, so a `-o -` payload on stdout stays
+    # machine-readable.
+    _name_failed_queries(cluster)
     payload = {
         "nodetop": VERSION,
         "backend": cluster.backend_name,

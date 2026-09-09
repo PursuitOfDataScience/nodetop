@@ -21,6 +21,96 @@ from nodetop.core.model import (
 )
 
 
+def node_field_writes(source, filename):
+    """``(line, description)`` for every write to a ``Node`` field in ``source``.
+
+    Extracted from the scan below so the forms it recognises can be asserted
+    against crafted snippets. That matters because the docstring's claim is
+    "no assignment to a Node's fields anywhere in the source", and the original
+    scan looked only at `ast.Assign`/`ast.AugAssign` targets that were directly
+    `ast.Attribute`. Measured against ten snippets, **six plain-Python
+    assignment forms were invisible to it**:
+
+    ==============================  =========
+    form                            was
+    ==============================  =========
+    ``n.f = v``                     caught
+    ``n.f += v``                    caught
+    ``n.f, n.g = v, w``             MISSED
+    ``[n.f, x] = [v, w]``           MISSED
+    ``n.f, *rest = seq``            MISSED
+    ``n.f: int = v``                MISSED
+    ``setattr(n, "f", v)``          MISSED
+    ``n.__dict__["f"] = v``         MISSED
+    ==============================  =========
+
+    A tuple target is an `ast.Tuple`, not an `ast.Attribute`, so the whole
+    statement fell through the `isinstance` check; the other three are node
+    types and a call shape the scan never looked at. `setattr` is the one that
+    matters most in practice, because it is how a dynamic patch-up path writes a
+    field -- which is exactly what Grid Engine used to do.
+
+    The source is clean under the wider scan today (0 hits across 25 files), so
+    this closes the guard rather than fixing a live staleness bug.
+    """
+    import ast
+    import dataclasses
+
+    from nodetop.core.model import Node
+
+    fields = {f.name for f in dataclasses.fields(Node)}
+    found = []
+
+    def targets_of(target):
+        """Flatten tuple/list/starred targets down to the real ones."""
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                yield from targets_of(element)
+        elif isinstance(target, ast.Starred):
+            yield from targets_of(target.value)
+        else:
+            yield target
+
+    for node in ast.walk(ast.parse(source)):
+        assigned = []
+        if isinstance(node, ast.Assign):
+            assigned = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            assigned = [node.target]
+        for outer in assigned:
+            for target in targets_of(outer):
+                if isinstance(target, ast.Attribute) and target.attr in fields:
+                    # `self.x = ...` inside the model's own dataclasses is
+                    # construction, not editing.
+                    if (
+                        filename == "model.py"
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "self"
+                    ):
+                        continue
+                    found.append((node.lineno, f".{target.attr}"))
+                # `n.__dict__["cpus_alloc"] = ...` reaches the same slot a
+                # `cached_property` writes its answer into.
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Attribute)
+                    and target.value.attr == "__dict__"
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value in fields
+                ):
+                    found.append((node.lineno, f'.__dict__[{target.slice.value!r}]'))
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "setattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value in fields
+        ):
+            found.append((node.lineno, f"setattr(.., {node.args[1].value!r})"))
+    return found
+
+
 class TestNodeAvailability:
     @pytest.mark.parametrize("conditions", [
         {"DOWN"}, {"DRAIN"}, {"MAINT"}, {"FAIL"}, {"UNKNOWN"},
@@ -131,32 +221,12 @@ class TestANodeIsOneReadingAndIsNotEdited:
         backend. Grid Engine did exactly that (accelerator counts from
         `qconf -se`, patched in place) and is why this test exists.
         """
-        import ast
-        import dataclasses
-
-        from nodetop.core.model import Node
-
-        fields = {f.name for f in dataclasses.fields(Node)}
         root = pathlib.Path(__file__).resolve().parent.parent / "src" / "nodetop"
-        offenders = []
-        for path in sorted(root.rglob("*.py")):
-            tree = ast.parse(path.read_text())
-            for node in ast.walk(tree):
-                targets = []
-                if isinstance(node, ast.Assign):
-                    targets = node.targets
-                elif isinstance(node, ast.AugAssign):
-                    targets = [node.target]
-                for target in targets:
-                    if isinstance(target, ast.Attribute) and target.attr in fields:
-                        # `self.x = ...` inside the model's own dataclasses is
-                        # construction, not editing.
-                        if path.name == "model.py" and isinstance(
-                                target.value, ast.Name) and target.value.id == "self":
-                            continue
-                        offenders.append(
-                            f"{path.relative_to(root)}:{node.lineno} "
-                            f"-> .{target.attr}")
+        offenders = [
+            f"{path.relative_to(root)}:{line} -> {what}"
+            for path in sorted(root.rglob("*.py"))
+            for line, what in node_field_writes(path.read_text(), path.name)
+        ]
         assert not offenders, "a Node field is written after construction: " + \
             "; ".join(offenders)
 
@@ -760,3 +830,68 @@ class TestDegradedCatchesTheFailuresAGpuClusterActuallyHas:
                     conditions=frozenset({"DOWN"}))
         assert not node.schedulable
         assert not node.degraded
+
+
+class TestTheNodeFieldScanSeesEveryAssignmentForm:
+    """The guard's claim is "anywhere in the source", so the forms matter.
+
+    `node_field_writes` is what makes the six `cached_property` answers on
+    `Node` safe: they are only correct while a Node is written once, and the
+    scan is the only thing enforcing that (a stale cache is silent, and shows up
+    on one backend only). Its original version looked at `ast.Assign` and
+    `ast.AugAssign` targets that were directly an `ast.Attribute`, which let six
+    plain-Python forms through — a tuple target is an `ast.Tuple`, so the whole
+    statement missed the `isinstance` check.
+
+    Asserted against crafted snippets rather than by planting code in `src/`,
+    so each form has its own deterministic failure.
+    """
+
+    ALREADY_CAUGHT = {
+        "plain": "n.cpus_alloc = 4\n",
+        "augmented": "n.cpus_alloc += 4\n",
+    }
+    NEWLY_CAUGHT = {
+        "tuple unpack": "n.cpus_alloc, n.memory_alloc_mb = 4, 400\n",
+        "list unpack": "[n.cpus_alloc, x] = [4, 5]\n",
+        "starred unpack": "n.cpus_alloc, *rest = [4, 5]\n",
+        "annotated": "n.cpus_alloc: int = 4\n",
+        "setattr": "setattr(n, 'cpus_alloc', 4)\n",
+        "dunder dict": "n.__dict__['cpus_alloc'] = 4\n",
+    }
+
+    @pytest.mark.parametrize("form", sorted(NEWLY_CAUGHT))
+    def test_a_form_that_used_to_escape_is_caught(self, form):
+        assert node_field_writes(self.NEWLY_CAUGHT[form], "backends/sge.py"), form
+
+    @pytest.mark.parametrize("form", sorted(ALREADY_CAUGHT))
+    def test_the_forms_that_were_always_caught_still_are(self, form):
+        # The control on the widening: it must not have replaced the original
+        # two cases, only added to them.
+        assert node_field_writes(self.ALREADY_CAUGHT[form], "backends/sge.py"), form
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "n.not_a_node_field = 4\n",  # an attribute that is not a Node field
+            "cpus_alloc = 4\n",  # a local that merely shares the name
+            "x = n.cpus_alloc\n",  # a READ, which is the whole point of the cache
+            "setattr(n, 'not_a_node_field', 4)\n",  # setattr, wrong name
+            "n.__dict__['not_a_node_field'] = 4\n",  # dict write, wrong key
+            "d['cpus_alloc'] = 4\n",  # a plain dict that is not `__dict__`
+        ],
+    )
+    def test_it_does_not_cry_wolf(self, source):
+        assert node_field_writes(source, "backends/sge.py") == [], source
+
+    def test_construction_inside_the_model_is_still_exempt(self):
+        # `self.x = ...` in model.py is a dataclass building itself, and the
+        # exemption is keyed on the filename, so it must not leak to others.
+        assert node_field_writes("self.cpus_alloc = 4\n", "model.py") == []
+        assert node_field_writes("self.cpus_alloc = 4\n", "backends/sge.py")
+
+    def test_the_line_number_reaches_the_caller(self):
+        # The assertion message names file and line; a form caught without one
+        # sends the reader hunting.
+        found = node_field_writes("x = 1\nn.cpus_alloc, y = 4, 5\n", "backends/sge.py")
+        assert [line for line, _ in found] == [2], found
