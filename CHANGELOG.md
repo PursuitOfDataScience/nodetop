@@ -5,10 +5,11 @@ All notable changes to nodetop are documented here, newest first.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.5.2] — 2026-09-09
 
-Covers the working tree since 0.5.1. Every entry below shipped with a regression
-test and a control verified in both states.
+Polish and bugfix work on top of 0.5.1 — no API changes, so a patch release.
+Every entry below shipped with a regression test and a control verified in both
+states.
 
 ### Fixed
 
