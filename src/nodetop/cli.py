@@ -30,6 +30,7 @@ from .core.duration import (
     format_duration,
     format_wait,
     parse_timestamp,
+    understood,
 )
 from .core.fit import (
     PROBE_WORKERS,
@@ -40,7 +41,7 @@ from .core.fit import (
     rank,
     unsettled,
 )
-from .core.hardware import supports
+from .core.hardware import CAPABILITIES, supports
 from .core.model import (
     Allocation,
     JobShape,
@@ -849,6 +850,54 @@ def _at_least(minimum: int, noun: str):
     return parse
 
 
+def walltime(text: str) -> str:
+    """A walltime this tool can read, or an argparse error.
+
+    `--time` had no `type=`, and `parse_duration` answers `None` both for the
+    sentinels ("unlimited", "n/a", "0") and for anything it cannot read. Every
+    ceiling check downstream skips when the wanted walltime is `None`, so a
+    typo did not fail -- it silently removed the check. Measured before this:
+    `--time garbage`, `--time 1w` (weeks are not a unit), `--time 1h30`
+    (missing the second unit) and `--time 1.5h` (no floats) all disabled every
+    `MAX_WALLTIME` comparison, which inverts the tool's purpose on that axis.
+
+    `--mem` has always rejected bad input this way (:func:`memory_gb`); this is
+    the same treatment for the other half of a job shape. The sentinels are
+    still accepted, because "no limit" is a real thing to ask for --
+    :func:`duration.understood` is what tells the two apart.
+    """
+    if understood(text):
+        return text
+    raise argparse.ArgumentTypeError(
+        f"{text!r} is not a walltime -- try 4:00:00, 2-00:00:00, 90m, 36h, "
+        f"a bare number of minutes, or 'unlimited'"
+    )
+
+
+def capabilities(text: str) -> str:
+    """Comma-separated capability names, checked against what `supports` knows.
+
+    An unknown requirement made :func:`hardware.supports` answer `None`, and
+    `capability_gap` records only an explicit `False`, so the node matched.
+    A misspelled filter therefore matched EVERY node -- measured on an A100
+    spec, `hardware_ok(node, JobShape(requires=("bf16typo",)))` -> `(True, ())`
+    -- which is the opposite of what a filter is for. Validated here rather
+    than in the model, because the tri-state `None` from `supports` is
+    deliberate and load-bearing for "we do not know what this node is".
+    """
+    unknown = [
+        token
+        for token in (piece.strip() for piece in (text or "").split(","))
+        if token and token.lower() not in CAPABILITIES
+    ]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown capability {unknown[0]!r} -- known: "
+            f"{', '.join(sorted(CAPABILITIES))}"
+        )
+    return text
+
+
 def memory_gb(text: str) -> float:
     """Parse a memory size to GiB, accepting the scheduler's own spellings.
 
@@ -1004,7 +1053,7 @@ def _add_shape_args(p: argparse.ArgumentParser, *, dry_run_only: bool = False) -
                    help="tasks per node (default: 1)")
     g.add_argument("--mem", type=memory_gb, default=0.0, metavar="SIZE",
                    help="host memory per node: 64, 64G, 64GB or 65536M")
-    g.add_argument("-t", "--time", default="01:00:00", metavar="WALLTIME",
+    g.add_argument("-t", "--time", type=walltime, default="01:00:00", metavar="WALLTIME",
                    help="walltime: 4:00:00, 2-00:00:00, 90m, 36h "
                         "(a bare number is minutes)")
     if dry_run_only:
@@ -1025,7 +1074,8 @@ def _add_shape_args(p: argparse.ArgumentParser, *, dry_run_only: bool = False) -
         needs_help = "comma-separated capabilities: bf16,fp8,tf32,flash"
     g.add_argument("--gpu-mem", type=memory_gb, default=0.0, metavar="SIZE",
                    help=gpu_mem_help)
-    g.add_argument("--needs", default="", metavar="CAPS", help=needs_help)
+    g.add_argument("--needs", type=capabilities, default="", metavar="CAPS",
+                   help=needs_help)
     g.add_argument("--exclude", default="", metavar="NODES",
                    help="nodes to keep out of consideration")
     g.add_argument("--tolerates", default="", metavar="TAINTS",
@@ -1155,7 +1205,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="every queue, not only the ones you may use")
 
     z = sub.add_parser("zoom", aliases=["in"],
-                       help=f"open one {'partition'} up: its gates, then its nodes")
+                       # Not the literal "partition": this help is the one place
+                       # the queue vocabulary was hardcoded, so `zoom --help` said
+                       # "partition" on a PBS or Kubernetes cluster where every
+                       # other surface says "queue" or "namespace". The parser is
+                       # built before a backend is detected, so the term cannot be
+                       # interpolated here -- the neutral word is the honest one.
+                       help="open one queue/partition up: its gates, then its nodes")
     _add_global_args(z, suppress=True)
     # Stored as `queue` on purpose: the unknown-name guard in main() reads that
     # attribute, so naming it anything else would silently opt this command out
@@ -1481,6 +1537,22 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
             body.append(f"{st.bad('FAILED')} {st.dim(name)}  {truncate(why, 60, st.g.ellipsis)}")
 
     if not cluster.nodes:
+        # Unreachable through `main()`, which computes `fatal = not cluster.nodes
+        # or ...` in `_reject_broken_snapshot` and returns **3** before dispatch.
+        # This arm is for a DIRECT caller -- the library entry points the README
+        # documents -- and it deliberately answers 0 rather than 3.
+        #
+        # That difference was undocumented and untested, which is what made it a
+        # trap: read on its own, "no nodes: wrong backend, or the control plane
+        # is down" answering "success" looks like a bug. It is not, because 3 is
+        # a code `main()` owns: every `cmd_*` returns 0/1/2 and nothing else,
+        # which `test_degenerate.py::test_it_does_not_raise` asserts for every
+        # shape. Widening this one function's domain to 3 would break that
+        # contract for a case `main()` already handles.
+        #
+        # `test_exit_codes_and_wire_contract.py` pins both halves: this arm
+        # returns 0 and still emits the whole document, while the same cluster
+        # through `main()` exits 3.
         if args.json:
             return status_json()
         body.append(st.warn(
@@ -4166,6 +4238,12 @@ def cmd_where(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                 "reason": p.verdict.reason,
                 "filter_verdict": p.verdict.filter_verdict,
                 "effective_qos": p.verdict.effective_qos,
+                # Was the question ANSWERED? The text surface distinguishes
+                # `BLOCKED` from `NO ANSWER`, and a `--json` consumer could
+                # only reproduce that by vendoring `TRANSIENT_CATEGORIES` --
+                # a wire vocabulary that cannot say "this refusal is real"
+                # forces every consumer to copy the table.
+                "durable": p.verdict.durable,
             },
             "caveats": p.caveats,
             "submit_flags": cluster.submit_flags(p.queue, shape),
@@ -4421,7 +4499,16 @@ def cmd_exclude(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                           "nodes": sorted(picked)})
         return 0
     if not nodelist:
-        print(st.dim("(no matching nodes)"))
+        # NOTHING on stdout. This command exists to be substituted --
+        # `sbatch --exclude=$(nodetop exclude --unschedulable)` -- so a
+        # sentence here is handed to the scheduler as a node name, and with a
+        # tty it arrives wrapped in the ANSI of `st.dim`. The `--json` path
+        # above already answers the empty case honestly with
+        # `{"count": 0, "nodelist": ""}`; the two surfaces disagreed.
+        # DESIGN.md 1c is about exactly this shape: `exclude` returning
+        # something unusable is worse than returning nothing, because the
+        # caller believes it has exclusions.
+        print("(no matching nodes)", file=sys.stderr)
         return 0
     print(nodelist)
     # A scattered set does not compress, and a scheduler will reject an

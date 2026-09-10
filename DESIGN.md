@@ -864,8 +864,8 @@ Exit status is meaningful, so `nodetop check … && sbatch …` behaves: `where`
 `check` return 0 only when somewhere could actually take the job, 1 when
 nothing can, and `check` returns 2 when the system has no dry-run to ask.
 
-`--all` widens `status`, `queues` and `where` to include what they would otherwise
-filter out — on `where` that means the ruled-out queues with their blockers attached,
+`--all` widens `status`, `queues`, `zoom`, `nodes`, `where` and `accelerators` to
+include what they would otherwise filter out — on `where` that means the ruled-out queues with their blockers attached,
 which is what you want when the question is "why can nothing run anywhere?".
 `--tolerates` declares the node restrictions a job accepts; on Kubernetes that is how a
 tainted node becomes eligible, and nothing else can express it.
@@ -885,8 +885,11 @@ funnel nor a single partition row. `queues --json` carried no core figures at al
 its text form printed two. Both now emit from the same population the text does, which
 means `status --json` pays for the same dry-runs the panel pays for; `--declared` skips
 them for both forms alike. One name per quantity, too: `effective_free_cpus` means the
-same thing in `status`, `queues`, `nodes` and `zoom`, and sums across them. The vocabulary follows the system — `partition` on Slurm, `queue` on PBS/LSF/SGE, `pool` with no
-scheduler — and `-p/--partition` is accepted everywhere as an alias for `-q/--queue`.
+same thing in `status`, `queues`, `nodes` and `zoom`, and sums across them. The vocabulary follows the system — `partition` on Slurm, `queue` on PBS/LSF/SGE,
+`namespace` on Kubernetes, `pool` with no scheduler — and `-p/--partition` is an alias
+for `-q/--queue` on every command that names a queue: `queues`, `nodes`, `where`,
+`check`, `exclude` and `accelerators`. `status`, `zoom`, `health`, `backends` and
+`snapshot` take neither, so "everywhere" was never true of it.
 
 Two worth knowing:
 
@@ -2583,7 +2586,7 @@ Four honesty rules are enforced in code rather than left to the reader:
 
 ```bash
 pip install -e ".[dev]"
-pytest          # 4855 tests, no batch system required
+pytest          # 4945 tests, no batch system required
 ruff check src tests
 ```
 

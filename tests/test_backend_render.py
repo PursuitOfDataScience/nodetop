@@ -75,9 +75,20 @@ class TestEveryBackendFitsTheTerminal:
     ):
         # Guards the guard: a command that silently produced nothing would sail
         # through the width check above.
+        #
+        # Both streams, not just stdout. `exclude` with a selector that matches
+        # nothing writes nothing to stdout ON PURPOSE -- its output is
+        # substituted into `sbatch --exclude=$(nodetop exclude ...)`, so a
+        # sentence there is handed to the scheduler as a node name, and the note
+        # for the human goes to stderr instead. Four of the backend fixtures
+        # have no degraded nodes, so `exclude --degraded` is exactly that case.
+        # Asserting on stdout alone pinned the old behaviour, which is the
+        # defect; the guard's actual point -- that a command cannot produce
+        # nothing at all -- is unchanged.
         monkeypatch.setenv("COLUMNS", str(size))
         fn(any_cluster, _args(argv), PLAIN)
-        assert capsys.readouterr().out.strip()
+        captured = capsys.readouterr()
+        assert captured.out.strip() or captured.err.strip()
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)

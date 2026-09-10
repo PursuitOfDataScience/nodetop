@@ -106,10 +106,18 @@ def _expand_range_body(body: str) -> list[str]:
             if not (lo_s.isdigit() and hi_s.isdigit()):
                 out.append(piece)
                 continue
-            width = len(lo_s)
             lo, hi = int(lo_s), int(hi_s)
             if hi < lo:
+                # Swap the SPELLINGS too, because the width comes from the low
+                # endpoint as written and it has just changed which one that is.
+                # Taken before the swap, `n[10-1]` padded to `len("10")` and
+                # produced `n01 ... n10` -- exactly the names this docstring
+                # says no cluster has, and the reason `n[1-10]` was fixed to
+                # give `n1 ... n10`. A reversed range a person typed excluded
+                # nothing.
                 lo, hi = hi, lo
+                lo_s, hi_s = hi_s, lo_s
+            width = len(lo_s)
             room = MAX_EXPANSION - len(out)
             if room <= 0:
                 break

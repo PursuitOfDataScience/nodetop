@@ -157,10 +157,11 @@ nodetop snapshot -o snap.json && nodetop --replay snap.json status
 ### Flags worth knowing
 
 `--json` on every command · `--all` widens a view from what you can use to the
-whole cluster, `--detail` unfolds the reasoning behind a verdict · `--needs bf16`
+whole cluster (`status`, `queues`, `zoom`, `nodes`, `where`, `accelerators`),
+`--detail` unfolds the reasoning behind a verdict (`queues`) · `--needs bf16`
 requires a capability, `--tolerates` waives one · `--backend slurm` skips
 autodetection and `--replay snap.json` works from a saved snapshot ·
-`--static`, `--no-color`, `--ascii` for pipes and dumb terminals.
+`--static` (`status`), `--no-color`, `--ascii` for pipes and dumb terminals.
 
 `--json` works on every command and carries everything the text does, caveats
 included. Exit status is usable in a pipeline: `where` and `check` return 0 when
@@ -172,7 +173,10 @@ Any command returns 2 for a usage error, 3 when no batch system is usable, and
 130 on Ctrl-C.
 
 The vocabulary follows the system — `partition` on Slurm, `queue` on PBS/LSF/SGE,
-`namespace` on Kubernetes — and `-p` is accepted everywhere as an alias for `-q`.
+`namespace` on Kubernetes, `pool` on an ssh pool — and `-p` is an alias for `-q` on
+every command that takes one: `queues`, `nodes`, `where`, `check`, `exclude` and
+`accelerators`. The commands that do not name a single queue (`status`, `zoom`,
+`health`, `backends`, `snapshot`) take neither.
 
 ## Why it exists
 
@@ -234,7 +238,7 @@ the same instant.
 ```bash
 git clone https://github.com/PursuitOfDataScience/nodetop
 cd nodetop && pip install -e ".[dev]"
-pytest          # ~4855 tests, no batch system required
+pytest          # ~4945 tests, no batch system required
 ruff check src tests && mypy src
 ```
 

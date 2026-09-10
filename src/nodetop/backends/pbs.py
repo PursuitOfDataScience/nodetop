@@ -108,11 +108,19 @@ def _mem_to_mb(text: str | None) -> int:
     """
     if not text:
         return 0
-    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([kmgtp]?)([bw]?)\s*$", str(text), re.IGNORECASE)
+    # The `i` of `GiB`/`MiB` is its own optional slot. Without it the whole
+    # match failed and the size read as 0 -- "not read" -- because `[bw]?`
+    # cannot absorb `iB`. Measured before this: `10GiB` and `10Gib` both gave
+    # 0 while `10gb`, `10g`, `1.5gb` and `10 gb` were all correct. PBS sites
+    # increasingly emit the IEC spelling, and the suffixes here are already
+    # binary, so `GiB` and `GB` mean the same thing to this parser.
+    m = re.match(
+        r"^\s*(\d+(?:\.\d+)?)\s*([kmgtp]?)(i?)([bw]?)\s*$", str(text), re.IGNORECASE
+    )
     if not m:
         return 0
     value = float(m.group(1))
-    if m.group(3).lower() == "w":
+    if m.group(4).lower() == "w":
         value *= _PBS_WORD_BYTES
     # `p` is in PBS's documented suffix list and was missing here, so `1pb`
     # fell out as 0 -- a node with no memory, and a ceiling of nothing.

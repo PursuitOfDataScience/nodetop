@@ -636,6 +636,32 @@ def name_accelerator(
     return (named or shaped)[0]
 
 
+#: Capability name -> the :class:`AcceleratorSpec` attribute that answers it.
+#: `rocm` is absent because it is derived from the vendor rather than stored.
+#:
+#: A mapping rather than a literal table inside :func:`supports`, so that
+#: :data:`CAPABILITIES` cannot drift from what `supports` actually understands.
+#: The CLI validates `--needs` against that set: an unknown requirement makes
+#: `supports` answer `None`, `capability_gap` records only `is False`, and the
+#: node therefore matched -- so `--needs bf16typo` silently matched EVERY node
+#: instead of failing. Measured on an A100 spec before this:
+#: `hardware_ok(node, JobShape(requires=("bf16typo",)))` -> `(True, ())`.
+_CAPABILITY_ATTR = {
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp8": "fp8",
+    "float8": "fp8",
+    "tf32": "tf32",
+    "flash": "flash_attention",
+    "flash_attention": "flash_attention",
+    "cuda": "cuda",
+}
+
+#: Every capability name :func:`supports` understands, for callers that need to
+#: validate one before asking.
+CAPABILITIES = frozenset(_CAPABILITY_ATTR) | {"rocm"}
+
+
 def supports(spec: AcceleratorSpec | None, requirement: str) -> bool | None:
     """Check one named capability, returning ``None`` when unknown.
 
@@ -645,15 +671,8 @@ def supports(spec: AcceleratorSpec | None, requirement: str) -> bool | None:
     """
     if spec is None:
         return None
-    table = {
-        "bf16": spec.bf16,
-        "bfloat16": spec.bf16,
-        "fp8": spec.fp8,
-        "float8": spec.fp8,
-        "tf32": spec.tf32,
-        "flash": spec.flash_attention,
-        "flash_attention": spec.flash_attention,
-        "cuda": spec.cuda,
-        "rocm": spec.vendor == "AMD",
-    }
-    return table.get(requirement.strip().lower())
+    name = requirement.strip().lower()
+    if name == "rocm":
+        return spec.vendor == "AMD"
+    attribute = _CAPABILITY_ATTR.get(name)
+    return None if attribute is None else bool(getattr(spec, attribute))

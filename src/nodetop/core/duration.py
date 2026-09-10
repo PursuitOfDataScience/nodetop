@@ -101,6 +101,28 @@ def parse_duration(text: str | int | None) -> int | None:
     return days * 86400 + sum(v * u for v, u in zip(fields, units, strict=True))
 
 
+def understood(text: str | int | None) -> bool:
+    """Is ``text`` a walltime spelling this module recognises at all?
+
+    :func:`parse_duration` answers ``None`` for two different things -- "no
+    limit" (`UNLIMITED`, `n/a`, `0`) and "I could not read that" -- and every
+    caller downstream treats the second as the first. So a typo'd walltime
+    disables the ceiling check it was meant to tighten: `--time 1w` (weeks are
+    not a unit here), `--time 1h30` (missing the second unit) and
+    `--time 1.5h` (no floats) all read as "unlimited" rather than as errors.
+
+    This does not change what :func:`parse_duration` returns -- callers that
+    want "seconds or nothing" are unaffected -- it just makes the distinction
+    askable, so a front end can reject the typo and keep honouring the
+    sentinels.
+    """
+    if text is None:
+        return False
+    if isinstance(text, int):
+        return True
+    return str(text).strip().lower() in _SENTINELS or parse_duration(text) is not None
+
+
 def format_duration(seconds: int | None) -> str:
     """Render seconds as ``D-HH:MM:SS`` / ``H:MM:SS``.
 
