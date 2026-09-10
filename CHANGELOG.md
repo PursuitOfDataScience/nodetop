@@ -5,6 +5,96 @@ All notable changes to nodetop are documented here, newest first.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.0] — 2026-09-10
+
+An audit of 0.5.2, each finding reproduced by running it before it was fixed.
+Two new public helpers, one new `--json` key, and input that used to be accepted
+is now refused — so a minor bump rather than a patch. Every entry below shipped
+with a regression test and a control verified in both states.
+
+The five behavioural fixes share a shape: **bad input did not fail, it quietly
+removed a check.**
+
+### Fixed
+
+- **`exclude` printed a sentence nothing could substitute.** With no matching
+  nodes the command wrote `(no matching nodes)` — ANSI-wrapped on a tty — to
+  **stdout**, while `--json` answered `{"count": 0, "nodelist": ""}`. The whole
+  point of the command is to be substituted, so
+  `sbatch --exclude=$(nodetop exclude --unschedulable)` handed that sentence to
+  the scheduler as a node name, escape codes included. Nothing goes to stdout
+  now; the note goes to stderr and the two surfaces agree. DESIGN.md 1c is about
+  exactly this shape — returning something unusable is worse than returning
+  nothing, because the caller believes it has exclusions.
+
+- **`--needs bf16typo` matched EVERY node.** `hardware.supports` answers `None`
+  for a capability it does not know, and `capability_gap` records only an
+  explicit `False`, so an unknown requirement passed the filter instead of
+  failing it. Measured on an A100 spec:
+  `hardware_ok(node, JobShape(requires=("bf16typo",)))` returned `(True, ())` —
+  the opposite of what a filter is for. The capability names are now a single
+  mapping that `supports` reads and `CAPABILITIES` exposes, so the two cannot
+  drift, and the CLI refuses an unknown name with exit 2. The tri-state `None`
+  is deliberate and stays: it means "we do not know what this node is".
+
+- **`--time garbage` silently meant "unlimited".** `-t/--time` had no `type=`,
+  and `parse_duration` answers `None` both for the sentinels (`unlimited`,
+  `n/a`, `0`) and for anything it cannot read, while every ceiling check
+  downstream skips a `None`. So `1w` (weeks are not a unit here), `1h30`
+  (missing the second unit) and `1.5h` (no floats) each disabled the
+  `MAX_WALLTIME` comparison they were meant to tighten. `--mem` has always
+  rejected bad input this way; `--time` now does too, and the sentinels are
+  still accepted because "no limit" is a real thing to ask for.
+
+- **PBS reported `10GiB` as a node with no memory.** `_mem_to_mb` had no slot
+  for the `i` of the IEC spelling, so the match failed outright and the size
+  read `0` — "not read" — and a memory ceiling of nothing. `10GiB` and `10Gib`
+  both gave 0 while `10gb`, `10g`, `1.5gb` and `10 gb` were correct. Sites
+  increasingly emit the IEC form, and these suffixes are already binary, so
+  `GiB` and `GB` mean the same thing to this parser.
+
+- **A reversed hostlist range excluded nothing.** `expand("n[10-1]")` returned
+  `n01 … n10`: the endpoints were swapped but the zero-pad width was still taken
+  from the endpoint *as written*. `n01` is a different node from `n1` — which is
+  the whole reason `n[1-10]` was fixed to answer `n1 … n10` — so a range typed
+  backwards by hand named ten nodes that do not exist.
+
+### Added
+
+- **`where --json` verdicts carry `durable`.** The text surface distinguishes
+  `BLOCKED` from `NO ANSWER`; a `--json` consumer could only reproduce that by
+  vendoring `TRANSIENT_CATEGORIES`. A wire vocabulary that cannot say "this
+  refusal is real" forces every consumer to copy the table.
+- **`duration.understood(text)`** — is this a walltime spelling the module
+  recognises at all? Separates "no limit" from "could not read that" without
+  changing what `parse_duration` returns, so existing callers are unaffected.
+- **`hardware.CAPABILITIES`** — every capability name `supports` understands,
+  for callers that need to validate one before asking.
+
+### Changed
+
+- `-t/--time` and `--needs` now exit **2** on input they previously accepted
+  and ignored. That is the point of the change, but it is a behaviour change:
+  a script passing a walltime this tool cannot parse used to get an unlimited
+  ceiling, and now gets an error naming the spellings that work.
+
+### Documentation
+
+- `-p` was described as "accepted everywhere as an alias for `-q`" in both
+  README and DESIGN.md. It is on six of eleven commands. The flag-to-command
+  table is now measured from the parser and the prose is checked against it.
+- DESIGN.md's `--all` list omitted `zoom`, `nodes` and `accelerators`; README
+  listed `--all`/`--detail`/`--static` unqualified; each doc was missing the
+  other's backend vocabulary (`pool`, `namespace`).
+- `zoom --help` hardcoded "partition", so it said the wrong word on every
+  non-Slurm backend. The parser is built before a backend is detected, so the
+  neutral "queue/partition" is the honest spelling.
+- **`status` answering exit 0 on an empty cluster is documented and pinned.**
+  Through `main()` that input exits 3; the direct library call returns 0,
+  because 3 is a code `main()` owns and every `cmd_*` returns 0/1/2. The
+  difference was undocumented and untested, which is what made it look like a
+  bug. Both halves are now asserted from both ends.
+
 ## [0.5.2] — 2026-09-09
 
 Polish and bugfix work on top of 0.5.1 — no API changes, so a patch release.
