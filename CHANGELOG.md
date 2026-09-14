@@ -5,6 +5,383 @@ All notable changes to nodetop are documented here, newest first.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.0] — 2026-09-14
+
+Two changes, neither of which alters what nodetop reports. The colour system was
+rebuilt against the colour-science literature after a reader said the bars made no
+sense, and the tool learned to serve itself to an AI agent. The first changes how a
+report is drawn; the second changes who can ask for one.
+
+### Added
+
+- **`nodetop mcp` — the same reports, served to an AI agent over MCP.** Seven
+  read-only tools on stdin/stdout, and no new dependency: a tools-only server
+  needs four JSON-RPC methods, so it is standard library like everything else
+  here. Depending on the official SDK would have pulled in pydantic, anyio,
+  httpx and starlette and broken the rule pyproject.toml states with a reason.
+
+  **It adds no data, and that is the point.** An agent with a shell could
+  already run `nodetop where -g 4 --json`; what it could not do is know the
+  flag. `--gpu` is an ambiguous prefix of `--gpus` and `--gpu-mem`, so the
+  obvious spelling of the commonest question is a usage error — one a model
+  reads as "no capacity" rather than as "wrong flag". A schema with
+  `gpus: integer` deletes that class of failure. Clients with no shell at all
+  are the second reason.
+
+  **Nothing is re-derived.** There is one JSON view per command, built inside
+  that command, so rather than assemble those dictionaries a second time for
+  the protocol, `_print_json` grew a collector and a tool call runs the real
+  command through `main()`. Every guard comes with it — backend detection, the
+  broken-snapshot refusal, the unknown-queue check, the exit code. A report
+  that disagrees with the CLI is something a reader can see; a tool result that
+  disagrees is something a model repeats with confidence.
+
+  Three things follow from a server outliving the state it describes. Each call
+  takes its own reading, because serving a remembered answer would be this
+  tool's cardinal sin committed by its newest surface. `sys.stdout` is pointed
+  at stderr for the session and the real descriptor is kept for framing alone —
+  one stray `print` out of the package's 111 would corrupt the stream. And
+  dry-runs are throttled: a person types `where` a few times an hour, an agent
+  in a loop will call it fifty times a minute at somebody else's controller, so
+  a probing call within ten seconds of the last is answered from the declared
+  allowlists and carries a second content block saying so. The payload itself
+  stays byte-identical to `--json`; a caveat belongs beside the answer, not
+  smuggled into it.
+
+  `snapshot`, `exclude`, `backends` and `check` are deliberately not exposed —
+  the first writes a file, the second emits shell input, the third answers about
+  this host rather than the cluster, and the fourth exists only to spend probes
+  that `where` already reports.
+
+### Changed
+
+- **The palette was rebuilt against the colour-science literature, because it
+  was confusing to read.** Three defects produced that, and each is now a test.
+
+  *Hue was carrying an ordered quantity.* The twelve-step heat ramp ran blue →
+  cyan → green with its brightest step in the **middle** — L\* climbed to 91 at
+  cyan and fell back to 76 at the green end, six lightness reversals — so a
+  mid-range value drew the loudest row on the screen and the true extreme read
+  as mid-range. That is the jet-colormap failure mode. The ramp is now a path
+  through OKLCH from blue to turquoise resampled at twelve points of **equal
+  ΔE2000 arc length**: monotonic in lightness, steps 4.3–5.1 apart instead of
+  2.8–15.3, and every step clears WCAG AA 4.5:1 on a dark terminal.
+
+  *Steps collapsed onto each other.* Four of the top five were one green (ΔE
+  2.8, 6.4, 4.8, 4.7 apart), so two partitions an order of magnitude apart came
+  out the same colour. On a 256-colour terminal steps 1 and 2 were literally
+  the same index; at sixteen colours the twelve became six.
+
+  *Verdicts and quantities shared hues.* `ok` green was ΔE 8 from the ramp's
+  top step, so an idle node's green dot and its green core count were one
+  colour by accident. The ramp now stops at turquoise and every verdict is at
+  least ΔE 18 from all of it — and the verdicts are separated in **lightness**
+  as well as hue, which is what survives red–green colour vision deficiency.
+  `accent` moved from terracotta to magenta: it was ΔE 9.1 from `bad`, so the
+  colour for "this is what you asked about" was a near-match for the colour for
+  "this is broken". At sixteen colours `accent` no longer shares SGR 33 with
+  `warn`, nor `text` 37 with `muted`.
+
+- **Hue is no longer spent on identifiers.** Partition names, node names and
+  job ids are plain. Painting a name on the heat ramp spends the one channel
+  the eye reads as identity on a quantity the row already states twice — and on
+  a real cluster fourteen of twenty-two partition names came out the same blue,
+  so the column that says *which row this is* read as a rainbow with repeats.
+
+- **Column headings are labels, not values.** They were painted in ramp steps 2
+  and 9, so `cores free` wore the colour of a mid-sized core count and the two
+  accelerator headings were indistinguishable from each other. All headings are
+  now the label grey, bold on the column the table is sorted by.
+
+- **A meter's length and its colour measure the same thing.** In `queues` the
+  bar drew each queue's share of its own capacity while its tone was that
+  queue's rank against the list, so `amd-hm` drew a *full* bar in the coldest
+  tone (all of one node) under `amd` drawing a half bar in the warmest (half of
+  eighty). The bar now draws the column the table is sorted by, as `where`
+  already did. In `nodes`, core counts were ranked across the listing while
+  memory and accelerators were coloured by each node's own share — two scales
+  drawn from one set of twelve colours, with nothing on screen to say which was
+  which. The whole table now uses the share.
+
+- **The panel frame left the data's hues.** Its gradient swept light cyan
+  through aqua, which is the ramp's own territory: a cyan border around a cyan
+  column. It now runs periwinkle to light orchid, at least ΔE 21 from every
+  ramp step and every verdict.
+
+- **`--help` placeholders are no longer amber.** `NAME` in `--backend NAME` wore
+  the colour this tool uses for a degraded node and a blocked queue. They take
+  the identity magenta instead, and `info` — every flag and sub-command on the
+  page — moved from a muddy slate to a legible periwinkle.
+
+- **The `status` funnel counted one answer as two.** It printed
+  "66 no access · 11 refused": two terms for two *filters* — what the queue
+  declares (none of your accounts in its `AllowAccounts`/`AllowGroups`, read
+  off the queue, free) versus what the scheduler did when a dry-run was
+  actually submitted to a queue whose declared list named you. The distinction
+  is real; naming it on the headline was wrong anyway. It answers a question
+  nobody asked: a reader looking at that line wants to know why the table has
+  eight rows, and both groups answer it the same way.
+
+  Every wording tried for the second term failed differently — `refused` and
+  `denied` read as synonyms of the first, `not listed` named a Slurm field the
+  reader has never seen, `didn't work` invited the one question a four-word
+  label cannot answer. So it is now **one term, `no access`**, and the note
+  under it carries the only part a reader could not have guessed — that some of
+  those look open on paper and a test job could not get in — plus where the
+  per-queue answer lives.
+
+  The split survives where someone asked for it. Opening the term lists each
+  partition with its own reason — `no account` or `tried, no luck` — and the
+  `--json` `excluded[].reason` codes are unchanged. Wire codes and screen
+  wording are now separate things (`_EXCLUSION_LABELS`, `_REASON_LABELS`).
+
+- **The output stopped saying `refused`.** `refused`, `denied` and `rejected`
+  describe the cluster doing something *to* the reader; they carry nothing the
+  plain words do not, and a screen that says them five times reads as an
+  accusation rather than as a status. `where`'s header, its `access` column
+  (`NOT_ENTITLED`) and three `fit` caveats were reworded. Two tests guard it,
+  and a second pair rejects any label that needs inside knowledge to read.
+
+- **The header line had four numbers and two denominators.** It read
+  `330 of 608 nodes, 324 up  ·  230 of 358 GPUs, 58 free`, and nothing on it
+  said which total each count belonged to: `324 up` is 324 of the **330**, not
+  of the 608 printed beside it, and `58 free` is 58 of the **230**. The two
+  cluster totals were therefore the denominators of nothing on the line, while
+  the real denominators stayed implicit — so the natural reading was the wrong
+  one. "why 330 of 608 nodes? what does it mean? why 324 up? are the rest of
+  them down? why 58 free? what are the rest of them?"
+
+  The cluster totals are gone: they answered "how much of this machine can I
+  touch", which the funnel directly below already accounts for partition by
+  partition, and which `nodetop gpus` states outright. What is left names its
+  own denominator — `324 of 330 nodes up  ·  57 of 230 GPUs free`.
+
+  No possessive either. An intermediate version said `324 of your 330 nodes
+  up`, which claims something untrue: these are somebody else's nodes the
+  reader is permitted to submit to. "i don't own these gpus or nodes. why are
+  they mine?"
+
+- **No prose annotating the funnel.** A note was tried under it — "11 look open
+  on paper; a test job could not get in. check -q says why" — to carry the one
+  thing the merged `no access` term cannot say, that some of its members passed
+  the first filter. It was the longest line on the screen and a footnote in the
+  middle of the answer. The fact stays reachable rather than displayed: opening
+  the term names each partition's own reason, and `--json` carries both codes.
+
+- **The header stopped naming the backend on every line.** `nodetop · slurm ·
+  youzhi` spent a word on a per-machine constant: autodetection found exactly
+  one batch system, and the reader could neither act on that nor have changed
+  it. It is still named when it was *not* autodetected — `--backend` overrode
+  the detection, or `--replay` is reading a file — because then it says which
+  world the numbers came from. `nodetop backends` answers the question on
+  purpose.
+
+### Fixed
+
+- **`status` shows memory free per partition, beside the wholly-idle nodes.**
+  Memory is the gate the table was not naming: 45 of caslake's 183 usable
+  nodes have no allocatable memory left while the partition still advertises
+  ~800 free cores. `effective_free_cpus` already knew — it is why the figure
+  beside it is not raw `cpus_free` — but nothing on the row said what had
+  eaten the difference.
+
+  A partition **total**, in the same `free/total` shape as the cores beside it,
+  so the row does not switch to a per-node figure halfway across. It is
+  therefore *not* more exact: it carries the same fragmentation caveat the core
+  count carries, and answers "is there memory here" rather than "will one node
+  take my job". `zoom` is per node and `where --mem` does the fit.
+
+  It replaced `nodes idle` for one round — that column reads 0 in seven of this
+  account's eight partitions, by its own definition, since a node counts only
+  when WHOLLY free — and then sat down next to it. The question it answers has
+  no other short answer: work wanting a whole machine needs that number and
+  cannot get it from a core count. It is just not the column to read first,
+  which it no longer has to be.
+
+  GB on both sides, always. A switch to TB above four figures was tried and is
+  wrong twice: it took the unit from one side and the number from the other
+  (`5390/32.2G`), and even corrected it would make the column incomparable down
+  its own length. GB is also the unit `--mem` is written in.
+
+- **The header row is a tier again, and an even one.** `cores free` was bold
+  white among grey headings to mark the sorted column: a heading that differs
+  from the ones either side reads as a different kind of thing, and the sort
+  was already stated twice by the data (the rows descend by it, and so does
+  the meter). Levelling them all to the label grey then went too far the other
+  way — that grey is `muted`, which is what the `/9033G` denominators wear, so
+  the headings joined the table. Every heading is now bold `text`: one step up
+  in weight and lightness from anything below it, the same step for every
+  column, no hue spent.
+
+- **`status` had no accent colour in it at all.** Counted: 71 of the roughly
+  100 painted runs on the screen were one of the four greys, and the palette's
+  identity hue appeared zero times — fallout from dropping `· slurm ·`, the
+  possessive and the funnel note, each of which took a coloured element with
+  it. Two places had it coming anyway: `gpu model` was `muted` here and
+  `accent` in both `nodes --gpu` and `accelerators`, so one fact wore
+  different colours in three views of one cluster; and `nodetop` names itself
+  in the identity colour, which it did until the backend name carrying accent
+  was removed.
+
+- **The meter draws one composite figure and the list is ordered by it.** It
+  drew each partition's free cores against the *largest* free-core count in the
+  list — a denominator that appeared nowhere on the row it sat in, so the column
+  needed a heading to explain a number the table did not contain. It briefly
+  got one, `vs roomiest`, which is not a thing a reader should have to be told:
+  "no vs or anything."
+
+  The bar is now **`usable`**: the fraction of that partition which can
+  actually be had, and the rows run most free to least. It is the *minimum* of
+  the core and memory shares, not the average — a partition is only as free as
+  its scarcest resource, and 800 idle cores on nodes with a gigabyte of memory
+  left between them run nothing, which a mean would report as half free.
+
+  The heading took three tries. `free share` needed a fourth word (share of
+  what?); `% usable` answered that but put a symbol in a column of plain words
+  and digits. One word does it: a bar drawn against a visible empty track
+  already reads as a proportion, so what it was missing was never a number but
+  a name for what the proportion is *of*. "usable" rather than "free" because
+  the fraction is deliberately smaller than the free-core ratio beside it —
+  `amd` has a quarter of its cores free and a sixth of it usable, memory being
+  the binding constraint — and "free" against `1479/5120` would read as an
+  arithmetic error.
+
+  Two exclusions, both deliberate. The wholly-idle **node count** is out: a
+  partition with no completely empty machine is not 0% free, and folding that
+  in would zero almost every row. **Accelerators** are out too, which is the
+  closer call — a GPU partition whose cards are all taken can still run CPU
+  work, and including them ranked `gpu` below a partition that simply has none,
+  comparing a scarcity against an absence. Both keep their own columns.
+
+  A share ranking does put small partitions near the top: `build` leads at 72%
+  of one node while `amd` sits sixth at 13% of forty. The three absolute
+  columns beside the bar are what keep that honest — `42/48` against
+  `1354/5120` says how much each fraction is worth. The sort key falls back to
+  absolute cores, then accelerators, then name, so an all-idle cluster does not
+  come out alphabetical.
+
+- **`gpu free` counted devices and did not say so.** "when you say gpu free, is
+  it gpu nodes free or gpu free?" — `beagle3` is 44 nodes carrying 176
+  accelerators, so `36/176` is cards, and the only thing on the row indicating
+  that was the denominator being too large to be a node count. It is `gpus
+  free` in all three tables now, plural, which parallels the `nodes idle`
+  column two along that really does count nodes.
+
+- **`cores free` is no longer tinted.** Its colour came from `core_heat[i]`,
+  which is exactly what the bar beside it draws — in its length *and* in its
+  fill — so one variable was encoded three times in adjacent cells, the same
+  waste the partition names were guilty of. Colour is the channel to drop:
+  Cleveland & McGill rank position and length well above hue and saturation for
+  judging quantity, so the cell that can only offer colour should not be the
+  one carrying it. The number now states an exact count over its own capacity
+  and the bar states how it compares to the list — two denominators, two
+  questions. `mem free` and `gpu free` keep their tint; they have no meter, so
+  there colour is the only proportional cue available.
+
+- **The meter is capped at 20 cells, not 40.** Above twenty it buys nothing —
+  a bar is read by its proportion of the track, and forty cells resolve 1/320
+  with eighths for an eye that cannot see past about a twentieth — while
+  taking width from the columns that carry digits. Below the width where the
+  digits and a ten-cell bar both fit it is dropped entirely rather than
+  squeezed: it draws the number printed immediately to its left, so losing it
+  costs a picture of a figure still on the row. Handing `table` the real width
+  with `fit=True` was tried instead and is worse; it shrinks every column, so
+  a narrow terminal rendered `1423/903…` and a truncated bar as well.
+
+- **The layout takes the terminal's full width.** It was capped at 100 columns,
+  so the tool sat in a box off to the left of a wide window: "i think the app
+  should take the entire hortizontal space. the current one looks so squeezed
+  and unnatural." Frames, tables and the interactive browse now span whatever
+  the window is, static and interactive alike, so a redirected report and a
+  browsed one are the same shape.
+
+  **The meter absorbs the extra room**, without which the width would only
+  move the border and leave the same rows huddled at the left of a bigger box.
+  Every other cell is sized by its text and cannot use spare columns; a bar is
+  a proportion, so more cells is strictly more resolution. It runs 10 cells at
+  80 columns to 40 at 112 and above — bounded at both ends, because below ten
+  the sub-cell eighths stop separating a nearly-empty queue from an empty one,
+  and past forty a bar reads as a rule across the screen rather than as a
+  quantity.
+
+  Two widths, not one. `MAX_WIDTH` is now a sanity bound (400) rather than a
+  design measure, `FALLBACK_WIDTH` (100) is what a pipe with no window gets —
+  inheriting the cap there would have set every redirected table to four
+  hundred columns — and prose keeps its own `PROSE_WIDTH` (96), because tables
+  taking the whole window is no reason for paragraphs to.
+
+- **`table()` padded a final left-aligned cell for nothing.** A column sized to
+  `V100, RTX6000` padded the heading `gpu model` out by four spaces. Invisible
+  to a reader, and not invisible to anything that *measured* the table:
+  `status` draws its rule at `max(width(...))`, so the rule came out 97 columns
+  for content ending at 79. Nothing follows a last cell to align against, so
+  the padding is no longer added. Not fixed with `rstrip`, which was tried and
+  is wrong — a padded cell keeps its spaces *inside* the styled run, so the
+  plain line loses them and the coloured twin does not, which breaks the one
+  property `TestLayoutStability` exists to protect.
+
+- **Two blocks inside the frame wrapped to the terminal, not to the frame.**
+  A drained node's `Reason` and a job's detail pairs both sized themselves
+  from `term_width()` while being drawn inside a narrower box, so the panel
+  truncated the overflow — an ellipsis through the full reason text, which is
+  the one thing that view exists to show whole. Only visible once the frame
+  stopped being as wide as the window. Both wrap to the frame now, as the
+  funnel's note already did.
+
+- **Every run pushed a dozen lines of terminal history off the screen.** The
+  interactive frame is padded to one height so the box does not jump as you
+  move between levels — that part was asked for and is right. The height was
+  wrong: it was the whole window, up to 30 rows, and this cluster's overview
+  is 16. So `nodetop` drew fourteen blank rows inside its own border and
+  scrolled fourteen lines of the reader's scrollback away to make room for
+  them, on every single invocation. The height is now the overview's, clamped
+  to what the window can hold — still one number for every level, so nothing
+  jumps, and deeper levels page inside it exactly as they already paged inside
+  the larger one. 31 rows → 19 on this cluster; 23 → 13 for a four-partition
+  listing on a 24-row terminal.
+
+- **Quitting destroyed the report.** `q` erased the block on the way out, so
+  the tool printed an answer, waited, and took it away again: "when i exit it
+  ... everything shown before is gone." The erase exists so each nested level
+  replaces the last instead of appending a transcript of screens — right for
+  stepping between levels, wrong for leaving, where nothing replaces those
+  rows. The final frame now stays where it can be read, scrolled back to and
+  copied out of, with the cursor already on the line below it.
+
+- **The screen went blank for over a second just after `status` opened.**
+  A reload — `r`, the idle timer, or the background access re-check landing —
+  left `select` through a path that *erased* the block, and the new frame was
+  only drawn once a full re-read of the cluster came back, 1.4s later on this
+  cluster. So the report painted, sat there, vanished, and returned. It is the
+  same erase-then-write defect `paint` already fixed for keypresses, except the
+  gap is a scheduler query rather than a few microseconds. A reload now leaves
+  its frame standing and hands the row count to the next one, which winds back
+  and overwrites in place; nothing is ever blank. It showed up most on the
+  *second* run, where a warm access cache paints instantly and the background
+  re-check then triggers exactly this reload — which is why it read as a
+  start-up glitch rather than as a refresh.
+
+- **A note inside a panel lost its last words.** `_note` wrapped prose to the
+  window while a panel is four columns narrower than that — two of border, two
+  of padding — so the final line of a framed note overran by exactly four and
+  the panel truncated it. Silently, and only at the narrow terminal sizes where
+  the sentence had least room to spare. `_note` now takes the width it is
+  wrapping into.
+
+- **The first 1.68 seconds showed nothing at all.** Cold on a 607-node cluster
+  that is how long `Cluster.load` spends in `sinfo`/`squeue`/`scontrol` before
+  anything reaches the terminal, so typing `nodetop` left the shell history on
+  screen for the better part of two seconds. The probe phase after it already
+  announces itself, for the stated reason that a silent wait is
+  indistinguishable from a hang; the phase a reader meets *first* did not. It
+  now prints `reading <backend>` on stderr and clears it. First byte: 1.68s →
+  0.08s.
+
+- **`health` painted a clean result in alarm colours.** `0 degraded` was amber
+  and `0 out` red, so a cluster with nothing wrong drew the two loudest colours
+  in the palette on its headline. A count of a bad thing takes its verdict
+  colour only when the count is not zero.
+
 ## [0.6.0] — 2026-09-10
 
 An audit of 0.5.2, each finding reproduced by running it before it was fixed.
