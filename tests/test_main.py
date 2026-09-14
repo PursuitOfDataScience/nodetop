@@ -456,14 +456,17 @@ class TestABrowseCanAskForFresherNumbers:
         """
         import nodetop.cli as cli
         import nodetop.interactive as inter
-        from nodetop.cli import _TURNAROUND
+        from nodetop.cli import _REFRESH_COST_LIMIT, _TURNAROUND
 
         monkeypatch.setenv("NODETOP_ACCESS_TTL", "0")   # no remembered answer
         real = cli.rank
 
+        # Paced off the policy, not off a number copied out of it. This slept
+        # 1.2s against a cutoff that was 1.0 and then became 3.0, so the test
+        # passed for the wrong reason and then failed for the right one.
         def slow(cluster, shape, **kw):
             if kw.get("use_probe"):
-                time.sleep(1.2)
+                time.sleep(_REFRESH_COST_LIMIT + 0.3)
             return real(cluster, shape, **kw)
 
         monkeypatch.setattr(cli, "rank", slow)

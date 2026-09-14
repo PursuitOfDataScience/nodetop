@@ -1,4 +1,4 @@
-"""DESIGN.md said the outage guard covers *every* command. It covers nine of eleven.
+"""DESIGN.md said the outage guard covers *every* command. It covers nine of twelve.
 
 Section 1c is the tool's own account of the failure mode it exists to catch: with
 every Slurm command failing, four commands printed clean, confident, wrong
@@ -8,12 +8,14 @@ whether something is wrong — reported a perfectly healthy cluster. The remedy 
 covers every command".
 
 Measured by spying on the guard while running every command the parser offers:
-**nine reach it, `backends` and `snapshot` do not** — both return before the loop
-the guard sits in. Neither is a bug in itself. `backends` answers *which batch
-systems are usable here*, so it is the one command whose job is to reply when
-nothing was detected. `snapshot` records the queries for analysis after the fact,
-and a recording of a broken cluster is a legitimate artifact — `errors` is a field
-of it, and replaying it *is* rejected by the guard.
+**nine reach it, `backends`, `snapshot` and `mcp` do not** — all three return
+before the loop the guard sits in. None is a bug in itself. `backends` answers
+*which batch systems are usable here*, so it is the one command whose job is to
+reply when nothing was detected. `snapshot` records the queries for analysis after
+the fact, and a recording of a broken cluster is a legitimate artifact — `errors`
+is a field of it, and replaying it *is* rejected by the guard. `mcp` reads nothing
+at all: it serves, and every tool call it serves goes through `main()` and meets
+the guard there — once per call, rather than once per process.
 
 What was wrong is that the exemption lived only in the shape of two early returns,
 with a document asserting the opposite and nothing reading either. A command added

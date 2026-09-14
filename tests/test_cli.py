@@ -8,6 +8,8 @@ import os
 import pytest
 
 from nodetop.cli import (
+    _EXCLUSION_LABELS,
+    _REASON_LABELS,
     STATUS_ROWS,
     _node_rows,
     build_parser,
@@ -23,6 +25,11 @@ from nodetop.cli import (
 )
 from nodetop.core.model import JobShape
 from nodetop.render import Style, table, width
+
+#: The words the funnel puts on screen, which are deliberately not the wire
+#: codes underneath them -- see `_EXCLUSION_LABELS`. Both access codes map to
+#: one term, on purpose.
+NO_ACCESS = _EXCLUSION_LABELS["no access"]
 
 PLAIN = Style(enabled=False)
 #: Colour on, because the interactive cursor is inverse video and a test that
@@ -690,9 +697,13 @@ class TestMovingTheCursorDoesNotRebuildTheRows:
 
         widths = []
 
-        def counting(ns, style):
+        # `*rest` so the double keeps working when the real signature grows --
+        # it gained a `cluster` argument for the per-node job counts, and a
+        # double that pins the arity fails on a change that has nothing to do
+        # with what it is measuring (how many times the rows are rebuilt).
+        def counting(ns, style, *rest):
             widths.append(width_of())
-            return _node_rows(ns, style)      # the real one, imported above
+            return _node_rows(ns, style, *rest)   # the real one, imported above
 
         monkeypatch.setattr(cli_mod, "_node_rows", counting)
         frames, answers = [], iter(replies)
@@ -1104,13 +1115,34 @@ class TestTheInteractiveFrameFitsTheScreen:
         sizes = {(len(f), width(f[0])) for f in frames}
         assert len(sizes) == 1, sizes
 
-    def test_a_short_view_is_padded_not_shrunk(self, monkeypatch, capsys):
-        # Four partitions do not fill a 24-row frame, and the border must not
-        # close early to meet them.
-        frames = self._frames(monkeypatch, capsys, 4, rows=24)
-        for frame in frames:
+    def test_a_short_view_does_not_fill_the_window(self, monkeypatch, capsys):
+        """The frame is as tall as the answer, not as tall as the terminal.
+
+        It used to pad out to the window: four partitions drew a 23-row frame
+        on a 24-row terminal, so ten rows inside the border were blank and ten
+        lines of the reader's scrollback were pushed off the top to make room
+        for them -- every run, for nothing. "closing removing all the terminal
+        history."
+
+        The height is still ONE number for every level of a browse, which is
+        the property `test_every_frame_is_the_same_size` guards and which was
+        asked for directly; it is just the overview's number now rather than
+        the window's. Four partitions come out at 13 rows on a 24-row terminal
+        and at 13 on a 40-row one -- the terminal does not enter into it until
+        the content is too tall to fit, which the next test covers.
+        """
+        for rows in (24, 40):
+            frames = self._frames(monkeypatch, capsys, 4, rows=rows)
+            for frame in frames:
+                assert 8 <= len(frame) < 20, (rows, len(frame))
+
+    def test_a_long_view_is_still_capped_by_the_window(self, monkeypatch,
+                                                      capsys):
+        # The cap is what stops the repaint being destructive -- a frame taller
+        # than the screen cannot be wound back over. Sixty partitions want far
+        # more than 24 rows and get exactly what fits.
+        for frame in self._frames(monkeypatch, capsys, 60, rows=24):
             assert len(frame) == 23
-            assert frame[-2].strip("│ ") == ""    # padding, then the border
 
     def test_headings_are_never_dropped_to_fit(self, monkeypatch, capsys):
         # They are the frame of reference for the row you are looking at.
@@ -1181,15 +1213,19 @@ class TestZoomEdgeCases:
         assert "44/48" in row                     # the claim is still shown
         assert "0/0G" in row                      # and so is the reason
 
-    def test_a_node_with_memory_to_spare_still_draws_its_meter(self, capsys):
+    def test_a_node_with_memory_to_spare_states_its_free_cores(self, capsys):
+        # It drew a meter. Meters are gone from every view -- see
+        # `TestNodesIsCappedAndMetered` -- so the property left is that the
+        # figure itself is there and is the effective one.
         cluster = self._cluster([self._node(
             "roomy", state_raw="MIXED", cpus_total=48, cpus_alloc=4)])
         row = [x for x in self._out(cluster, capsys).splitlines()
                if "roomy" in x][0]
-        assert PLAIN.g.blocks[-1] in row
+        assert "44/48" in row, row
+        assert PLAIN.g.blocks[-1] not in row, row
 
     def test_a_node_with_no_accelerator_says_so_with_a_dash(self, capsys):
-        # `·` is this tool's empty cell, and in a column headed "gpu free" it
+        # `·` is this tool's empty cell, and in a column headed "gpus free" it
         # answers a question the node is not being asked: "the . in the gpu
         # column is a very confusing thing ... putting a dot there means
         # nothing". A dash reads as not-applicable with colour off and in ASCII.
@@ -1218,11 +1254,15 @@ class TestZoomEdgeCases:
         cluster = self._cluster([self._node("gpu1", state_raw="IDLE",
                                             cpus_total=8, gpus_total=4)])
         out = self._out(cluster, capsys)
-        for head in ("cpu free", "mem free", "gpu free"):
+        # `gpus` plural: the column counts accelerator DEVICES, and the
+        # singular read as either those or the nodes carrying them.
+        for head in ("cpu free", "mem free", "gpus free"):
             assert head in out, head
-        # And the meter follows the number it draws, as in the overview.
+        # Each column carries its own fraction, and only that -- the meter
+        # that used to follow the CPU figure is gone from every view.
         row = next(ln for ln in out.splitlines() if "gpu1" in ln)
-        assert row.index("8/8") < row.index(PLAIN.g.blocks[-1])
+        assert "8/8" in row and "4/4" in row, row
+        assert PLAIN.g.blocks[-1] not in row, row
 
     def test_a_down_node_shows_why_it_is_down(self, capsys):
         """The reason, in full, and the state beside it.
@@ -2607,19 +2647,37 @@ class TestStatusIsNotFramedAroundGpus:
         assert "nodes" in head and " up" in head
         assert head.index("nodes") < head.index("GPU")
 
-    def test_every_row_has_a_meaningful_meter(self, capsys):
-        # The point of the change: the bar measures free NODES, so a wholly
-        # free CPU partition draws a full one. Asserting only that some meter
-        # character is present is vacuous -- a GPU-share meter on a CPU
-        # partition is all trough, and "░" is still a meter character.
+    def test_the_overview_draws_no_meter(self, capsys):
+        """The bar is gone, and must not creep back.
+
+        It was here for a long time and cost more than it returned every
+        time: it drew the wrong quantity twice -- the row's rank against the
+        list, then a core/memory composite -- took forty columns at one
+        point, sat unlabelled, and then wore three headings none of which
+        could be defended. Once the layout took the whole terminal there was
+        no argument left for it: every fraction fits in full, and a number a
+        reader can read needs no picture of itself.
+
+        The property it was asserted for -- that the metered quantity is the
+        one that matters, and not GPU share on a cluster where most
+        partitions have none -- is now carried by the columns themselves, in
+        `test_a_cpu_partition_says_the_question_does_not_arise` and by the
+        accelerator pair sitting last.
+        """
+        out = self._out(capsys)
+        rows = [ln for ln in out.splitlines()
+                if any(q in ln for q in ("cpuq", "bigq"))]
+        assert rows
+        for row in rows:
+            assert "█" not in row and "░" not in row, row
+
+    def test_every_row_states_its_fractions_in_full(self, capsys):
+        # What replaced the meter: the figures themselves, untruncated.
         out = self._out(capsys)
         cpu = next(ln for ln in out.splitlines() if "cpuq" in ln)
-        assert "█" * 10 in cpu, "a fully free partition should read as full"
-
-        gpu = next(ln for ln in out.splitlines() if "bigq" in ln)
-        # 1 of 8 nodes free: mostly trough, but not empty.
-        assert "░" in gpu
-        assert "█" * 10 not in gpu
+        # Wholly free: nodes, cores and memory all read as full ratios.
+        assert "3/3" in cpu and "24/24" in cpu and "46/46G" in cpu, cpu
+        assert PLAIN.g.ellipsis not in cpu, cpu
 
     def test_a_cpu_partition_says_the_question_does_not_arise(self, capsys):
         # A dash, and not a blank. The column is headed `gpu free`, so it asks
@@ -2667,18 +2725,26 @@ class TestStatusIsNotFramedAroundGpus:
         cells = [c for c in re.split(r"\s{2,}", header.strip("│ ")) if c]
         assert "free" not in cells, cells
         assert "share" not in cells
-        for want in ("nodes idle", "cores free", "gpu free"):
+        # `mem free` where `nodes idle` used to be: that column read zero in
+        # seven of this account's eight partitions, by its own definition --
+        # a node counts only when WHOLLY free -- while memory was the gate
+        # actually turning jobs away. See `_memory_cell`.
+        for want in ("mem free", "cores free", "gpus free"):
             assert want in cells, (want, cells)
         # And the numbers under them are fractions, not lone counts.
         rows = [ln for ln in out.splitlines()
                 if any(q in ln for q in ("bigq", "cpuq"))]
         assert rows
         for row in rows:
+            # `G` optional: the memory cell carries its unit, which is what
+            # makes `46/46G` readable without the header -- it is still a
+            # fraction, and still says which side is free by sitting under a
+            # header that names the numerator.
             fractions = [tok for tok in row.split()
-                         if re.fullmatch(r"\d+/\d+", tok)]
-            # `nodes idle` and `cores free` always; `gpu free` only where there
-            # are accelerators to count.
-            assert 2 <= len(fractions) <= 3, (row, fractions)
+                         if re.fullmatch(r"\d+/\d+G?", tok)]
+            # `nodes idle`, `mem free` and `cores free` always; `gpu free`
+            # only where there are accelerators to count.
+            assert 3 <= len(fractions) <= 4, (row, fractions)
 
 
 class TestQueuesIsNotFramedAroundGpus:
@@ -2709,10 +2775,13 @@ class TestQueuesIsNotFramedAroundGpus:
         out = capsys.readouterr().out
         return next(ln for ln in out.splitlines() if name in ln)
 
-    def test_a_cpu_partition_gets_a_full_meter_when_free(self, capsys):
-        # It is entirely free; the bar should say so rather than sit empty
-        # because the partition has no GPUs.
-        assert "█" * 8 in self._row(capsys, "cpuq")
+    def test_this_listing_draws_no_meter_either(self, capsys):
+        # Same removal as the overview, and for the same reasons -- see
+        # `TestStatusIsNotFramedAroundGpus.test_the_overview_draws_no_meter`.
+        # The free figure is stated instead, in full.
+        row = self._row(capsys, "cpuq")
+        assert "█" not in row and "░" not in row, row
+        assert "8" in row, row
 
     def test_a_cpu_partition_has_no_gpu_figure(self, capsys):
         row = self._row(capsys, "cpuq")
@@ -2728,11 +2797,19 @@ class TestQueuesIsNotFramedAroundGpus:
 
 
 class TestNodesIsCappedAndMetered:
-    """The last unbounded dump, and the last table without a meter.
+    """The last unbounded dump. The meter it gained has since gone again.
 
     `nodetop nodes` answered "how are my 607 nodes doing" with 607 rows, which
-    is not an answer -- it is the raw data again. And it was the only table left
-    with no meter, so scanning it meant reading `0/32` against `24/32` as text.
+    is not an answer -- it is the raw data again. The cap is the part that
+    stuck.
+
+    It also gained a CPU meter, on the argument that scanning the table meant
+    reading `0/32` against `24/32` as text. That argument lost: a forty-row
+    listing spends a column on a picture of a number the eye has already read,
+    and the eighth-block glyphs lay texture down every row of a table whose job
+    is to be scanned. Bars are now gone from every view -- "can you just remove
+    it once and for all?" -- so what is asserted here is that the figures are
+    present, correct, and unaccompanied.
     """
 
     @staticmethod
@@ -2785,19 +2862,20 @@ class TestNodesIsCappedAndMetered:
         out = capsys.readouterr().out
         assert "more" not in out
 
-    def test_every_row_has_a_cpu_meter(self, capsys):
+    def test_no_row_draws_a_meter(self, capsys):
         _out, rows = self._rows(capsys)
+        assert rows
         for row in rows:
-            assert "█" in row or "░" in row
+            assert "█" not in row and "░" not in row, row
 
-    def test_the_meter_tracks_cpu_availability(self, capsys):
-        # n000 has every core free, so its meter is full; n008 has 0 free.
+    def test_every_row_states_its_cpu_figure(self, capsys):
+        # What the meter was drawing, in the form the meter was drawn from:
+        # n000 has every core free, n001 has none.
         _out, rows = self._rows(capsys, ("nodes", "--all"))
         full = next(r for r in rows if "n000" in r)
-        assert "█" * 8 in full
+        assert "32/32" in full, full
         empty = next(r for r in rows if "n001" in r)
-        assert "█" not in empty
-        assert "░" * 8 in empty
+        assert "0/32" in empty, empty
 
 
 class TestStatusFiltersToWhatWillTakeTheJob:
@@ -2881,14 +2959,45 @@ class TestStatusFiltersToWhatWillTakeTheJob:
     def test_the_accepting_one_survives(self, capsys):
         assert "yes-q" in self._out(capsys)
 
-    def test_both_filters_are_counted_separately(self, capsys):
+    def test_both_filters_are_counted_in_one_access_term(self, capsys):
+        # Two filters, two wire codes, ONE number on the headline. They were
+        # two terms for a while, and every pair of words tried for the second
+        # one read either as a synonym of the first (`refused`, `denied`), as
+        # jargon (`not listed`), or as a question the line could not answer
+        # (`didn't work` -- "why do they not work?"). Both answer "why is this
+        # partition not in the table" the same way.
         out = " ".join(self._out(capsys).split())
-        assert "1 no access" in out
-        assert "1 refused" in out
-        # And the two are not conflated into one number: the reader can tell an
-        # allowlist that excludes them from a dry-run that refused them, which
-        # are different problems with different remedies.
-        assert "2 refused" not in out
+        assert f"2 {NO_ACCESS}" in out
+
+    def test_the_funnel_is_not_annotated_with_prose(self, capsys):
+        """No sentence under the line explaining one of its counts.
+
+        One was tried -- "1 look open on paper; a test job could not get in.
+        check -q says why" -- to carry the thing the merged `no access` term
+        cannot say, that some of its members passed the first filter. It was
+        the longest line on the screen and a footnote in the middle of the
+        answer. The fact is still reachable: opening the term names each
+        partition's own reason, and `--json` carries both codes.
+        """
+        out = " ".join(self._out(capsys).split())
+        assert "look open on paper" not in out
+        assert "check -q" not in out
+
+    def test_the_funnel_uses_no_hostile_words(self, capsys):
+        # "refused", "denied", "rejected", "blocked" describe the cluster doing
+        # something to the reader, and carry nothing the plain words do not.
+        out = self._out(capsys).lower()
+        for word in ("refus", "denie", "reject", "blocked"):
+            assert word not in out, word
+
+    def test_no_label_needs_inside_knowledge_to_read(self):
+        # "not listed" was tried and withdrawn: the list it named is a Slurm
+        # `AllowAccounts` field the reader has never seen, so the label meant
+        # nothing to the only person it was for.
+        for label in _EXCLUSION_LABELS.values():
+            for word in ("listed", "allowlist", "acl", "entitle"):
+                assert word not in label.lower(), label
+
 
     def test_the_funnel_accounts_for_every_partition(self, capsys):
         # The one question this view has been asked twice: "it says 87
@@ -2898,8 +3007,7 @@ class TestStatusFiltersToWhatWillTakeTheJob:
         out = " ".join(self._out(capsys).split())
         assert "3 partitions" in out
         assert "1 open to you" in out
-        assert "1 no access" in out
-        assert "1 refused" in out
+        assert f"2 {NO_ACCESS}" in out
 
     def test_declared_skips_only_the_dry_run(self, capsys):
         out = self._out(capsys, ("status", "--declared"))
@@ -2924,7 +3032,7 @@ class TestStatusFiltersToWhatWillTakeTheJob:
         # An honest empty answer says so in the funnel rather than by going
         # blank: nothing open to you, and every partition accounted for.
         assert "0 open to you" in joined
-        assert "refused" in joined
+        assert NO_ACCESS in joined
 
 
 class TestEveryListingFiltersByAccess:
@@ -3151,8 +3259,8 @@ class TestFreeMeansReachableAndFree:
 class TestEachFunnelLabelIsItsOwnTarget:
     """"i want to hit enter myself to each of the labels."
 
-    The counts on the funnel line -- `65 no access`, `11 refused`, `3 down` --
-    are each a set of partitions the reader can be shown. They share one body
+    The counts on the funnel line -- `76 no access`, `3 down` -- are each a
+    set of partitions the reader can be shown. They share one body
     row, so the cursor cannot tell them apart by position: the selected term is
     the one drawn in the accent colour, and entering it opens that reason's
     partitions rather than all of them.
@@ -3217,11 +3325,12 @@ class TestEachFunnelLabelIsItsOwnTarget:
         # exclusion reason is 2.
         frames = self._walk(monkeypatch, capsys, [2])
         opened = "\n".join(frames[1])
-        # The header names the reason, and every row shares it.
-        reasons = {"no access", "down", "no nodes", "refused"}
-        named = [r for r in reasons if r in opened]
-        assert named, opened
-        assert opened.count(named[0]) >= 2
+        # Two vocabularies, on purpose. The heading names the funnel's term --
+        # the count the reader just pressed Enter on, so it has to be the same
+        # words they pressed. The rows name the SPECIFIC reason, which is why
+        # anyone opens this level at all.
+        assert f"1 {NO_ACCESS}" in opened, opened
+        assert _REASON_LABELS["no access"] in opened, opened
 
     def test_the_selected_label_is_marked_without_moving_the_line(self,
                                                                  monkeypatch,
@@ -3264,7 +3373,8 @@ class TestEachFunnelLabelIsItsOwnTarget:
         for name in ("open", "private", "broken"):
             assert name in opened, name
         # And each carries the word that put it there.
-        assert "open" in opened and "no access" in opened and "down" in opened
+        assert ("open" in opened and _REASON_LABELS["no access"] in opened
+                and _REASON_LABELS["down"] in opened)
 
     def test_a_cluster_with_nothing_excluded_has_no_labels(self, monkeypatch,
                                                            capsys):

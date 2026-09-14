@@ -1247,7 +1247,11 @@ class VerdictCategory:
 #: exactly the leak this table exists to close.
 CATEGORY_LABELS: dict[str, str] = {
     "OK": "confirmed",
-    "NOT_ENTITLED": "refused",
+    # "no access", not "refused": the same word the `status` funnel stopped
+    # using, for the same reason. It sat one column from "denied" and
+    # "group denied", added nothing either of them had not already said, and
+    # was the harshest thing on the screen while saying the least.
+    "NOT_ENTITLED": "no access",
     "ACCOUNT_MISMATCH": "wrong account",
     "NO_ACCOUNT": "needs an account",
     "ACCESS_DENIED": "denied",

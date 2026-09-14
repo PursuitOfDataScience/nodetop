@@ -33,7 +33,9 @@ __all__ = [
     "Glyphs",
     "sanitize",
     "colorize_help",
+    "FALLBACK_WIDTH",
     "MIN_WIDTH",
+    "PROSE_WIDTH",
     "RAMP_STEPS",
     "Style",
     "badge",
@@ -56,7 +58,30 @@ __all__ = [
     "wrap_indent",
 ]
 
-MAX_WIDTH = 100
+#: Columns the layout will use. **The terminal's, not a fixed measure.**
+#:
+#: It was 100, so a frame stopped at column 100 however wide the window was
+#: and the tool sat in a box off to the left of a wide terminal: "i think the
+#: app should take the entire hortizontal space. the current one looks so
+#: squeezed and unnatural." The cap existed to stop a box being ruled out well
+#: past its content -- which is a real failure, and the answer to it is for the
+#: CONTENT to use the room (see the meter in `status`), not for the window to
+#: be pretended smaller than it is.
+#:
+#: The ceiling is a sanity bound rather than a design one: a terminal claiming
+#: tens of thousands of columns is a terminal lying, and every cell of every
+#: table is padded to whatever this returns.
+MAX_WIDTH = 400
+
+#: Columns *prose* wraps to, whatever the window is doing.
+#:
+#: Tables and frames take the terminal; sentences do not. A paragraph set 300
+#: columns wide is measurably harder to read than the same paragraph at 90 --
+#: the eye loses the line it was on when it sweeps back -- and typography has
+#: settled this at roughly 45-90 characters for long enough that a terminal is
+#: not going to overturn it. So the two are separate numbers, and this one is
+#: also a cap and not a width: a narrow window still wins.
+PROSE_WIDTH = 96
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +286,12 @@ class Glyphs:
     bad: str = "✗"
     warn: str = "▲"
     arrow: str = "→"
+    #: For the key hints in a browse footer: the pair a reader presses to move
+    #: between rows, and the one that steps back out. Glyphs rather than the
+    #: words "up/down arrow" because the footer has to fit on one line beside
+    #: four other hints, and because the shape IS the key.
+    arrow_pair: str = "↑↓"
+    arrow_back: str = "←"
     #: A SEPARATOR, and only ever that.
     #:
     #: It kept being reached for as an empty table cell, where it means nothing
@@ -289,7 +320,8 @@ class Glyphs:
             branch="|-", last="`-", pipe="| ",
             sort_down="v", cursor=">", bullet="*", ok="o", partial="%", off=".", bad="x",
             warn="!",
-            arrow="->", sep="-", ellipsis="...", dash="--",
+            arrow="->", arrow_pair="up/dn", arrow_back="<-",
+            sep="-", ellipsis="...", dash="--",
             blocks="#", empty=".", spark="_.-=+*#%",
             unicode=False,
         )
@@ -316,26 +348,59 @@ class Glyphs:
 # colour
 # ---------------------------------------------------------------------------
 #: (truecolor rgb, 256-colour index, 16-colour SGR) for each semantic role.
+#:
+#: **A role is a category, so it is told apart by HUE; a magnitude is an order,
+#: so the ramp below is told apart by LIGHTNESS.** Mixing the two is what made
+#: this palette unreadable: the old ramp ended in the same green ``ok`` is
+#: painted in, so a row could show an ``ok`` dot, a ramp-green core count and a
+#: ramp-green memory figure side by side in three greens nobody could separate
+#: -- "several same colors go together". The ramp now stops at turquoise and
+#: never enters the green, amber, red or magenta that carry meaning, so a
+#: colour on this screen is either a verdict or a quantity and never ambiguous.
+#:
+#: Measured, not eyeballed. Against a ``#0d1016`` terminal every role clears
+#: WCAG AA 4.5:1 (``track`` excepted -- it is a meter's empty channel, which
+#: must recede), and no two verdict colours are closer than dE2000 28. The
+#: verdict trio is additionally separated in LIGHTNESS (``ok`` L* 79,
+#: ``warn`` L* 69, ``bad`` L* 56), because deuteranopia and protanopia collapse
+#: green/amber/red toward one hue and lightness is what survives -- which is
+#: also why each one is spoken with a glyph and a word, never colour alone.
+#:
 #: Picked so the same intent survives all three depths rather than only the
-#: richest one.
+#: richest one. At sixteen colours the only remaining collision is
+#: ``dim``/``track``, two roles that both mean "recede"; ``accent`` used to
+#: share SGR 33 with ``warn`` -- brand indistinguishable from warning -- and
+#: ``text`` used to share 37 with ``muted``.
 _PALETTE: dict[str, tuple[tuple[int, int, int], int, int]] = {
-    "accent": ((217, 119, 87), 173, 33),
-    "ok": ((110, 205, 130), 114, 32),
-    "warn": ((225, 175, 70), 214, 33),
-    "bad": ((235, 110, 105), 203, 31),
-    "info": ((130, 170, 225), 111, 34),
-    "dim": ((128, 132, 140), 244, 90),
-    "text": ((215, 215, 215), 252, 37),
+    # Identity: the backend's name, an accelerator model, the submit line.
+    # Magenta, because it was terracotta -- dE2000 9.1 from `bad`, i.e. the
+    # colour for "this is what you are looking at" was a near-match for the
+    # colour for "this is broken". Nothing else on screen is in this family.
+    "accent": ((242, 132, 200), 212, 95),
+    "ok": ((114, 218, 104), 77, 92),
+    "warn": ((236, 151, 0), 172, 33),
+    "bad": ((233, 82, 60), 196, 91),
+    # A neutral notice -- a routing arrow, a node with no room left -- and
+    # the colour of everything you can type in `--help`: flags, sub-commands,
+    # example commands. It is a periwinkle rather than a ramp blue, and it
+    # sits a full 17 points of L* above the ramp's coldest step, which is what
+    # keeps a flag from reading as a small number. At sixteen colours it is
+    # bright blue and not plain: navy on a dark terminal is a rumour.
+    "info": ((144, 166, 247), 111, 94),
+    "dim": ((119, 124, 131), 244, 90),
+    "text": ((217, 219, 221), 253, 97),
     # Secondary *content* -- a real measurement that is not the one the view
     # was ranked by. Distinct from "dim", which means context rather than
     # content: a snapshot age, a caveat, a hint. A free-core count is content
     # even when the bar beside it is what the eye goes to first, and painting
     # the two the same grey is what makes a numeric column read as furniture.
-    "muted": ((170, 173, 180), 247, 37),
+    # The four greys are an evenly spaced L* ladder -- 87, 69, 52, 26 -- so
+    # they rank by brightness alone, with colour vision or without it.
+    "muted": ((163, 168, 174), 248, 37),
     # The unfilled part of a meter. A reference mark for "all of it", not
     # content at all, so it drops below "dim" to a near-background grey: it
     # should frame the bar without competing with it.
-    "track": ((62, 65, 70), 238, 90),
+    "track": ((55, 62, 69), 237, 90),
 }
 
 
@@ -344,7 +409,8 @@ _PALETTE: dict[str, tuple[tuple[int, int, int], int, int]] = {
 # ---------------------------------------------------------------------------
 #
 # A meter's fill is coloured by the size of what it measures, on one ordered
-# ramp from deep blue through cyan and green to amber.
+# ramp -- and the ramp is ordered by LIGHTNESS, which is the only visual
+# channel the eye reads as a quantity without being taught to.
 #
 # This replaces a flat single-colour fill, which was chosen after an earlier
 # version painted bars green above half and amber below.  That version deserved
@@ -359,10 +425,31 @@ _PALETTE: dict[str, tuple[tuple[int, int, int], int, int]] = {
 # left to mean what it means everywhere else in this tool: something is
 # actually wrong, said with a glyph and a word.
 #
-# Twelve steps, not more.  The xterm cube has little perceptual room between
-# 5fff5f and 87ff5f, so a finer ramp spends several of its steps inside one
-# green and produces exactly the "these rows look the same" complaint it was
-# meant to fix.
+# **The previous ramp was a rainbow, and rainbows lie about order.**  It ran
+# blue -> cyan -> green with its brightest step in the MIDDLE: L* climbed to
+# 91 at cyan and fell back to 76 at the green end, six reversals in twelve
+# steps.  That is the defect that got jet retired from scientific plotting --
+# a mid-range value reads as the extreme because it is the brightest thing on
+# screen, and the true extreme reads as mid-range.  Worse, its steps were
+# spaced between dE2000 2.8 and 15.3, a 5.5x spread, so four of the top five
+# were one green: steps 7, 8, 9 and 10 sat 2.8, 6.4, 4.8 and 4.7 apart and
+# a reader comparing two rows could not tell which was larger.  On a
+# 256-colour terminal steps 1 and 2 were literally the same index, and at
+# sixteen colours the twelve collapsed into six.
+#
+# This ramp is built the way a perceptually uniform colormap is built: a path
+# through OKLCH from blue (L 0.60) through cyan to turquoise (L 0.87),
+# resampled at twelve points of EQUAL dE2000 arc length.  The result is
+# monotonic in lightness with steps 4.3-5.1 apart -- a 1.18x spread instead of
+# 5.5x -- so adjacent rows differ by a visible, constant amount and distant
+# rows cannot be confused.  Every step clears 4.5:1 against a dark terminal,
+# so the coldest count is still readable rather than merely present.
+#
+# **It stops at turquoise and does not reach green.** Green belongs to `ok`,
+# and the old ramp's top step was dE2000 8 from it -- an idle node's dot and
+# its core count were the same colour by accident. The gap is now 23, and the
+# ramp's whole span sits at least 36 from `warn`, `bad` and `accent`. So the
+# question "is this colour a verdict or a quantity?" has an answer.
 #
 # Each step has a darker twin, used for bar *fill*.  A bar is a slab and text
 # is a line: the colour that reads as bright in a number reads as shouting
@@ -372,31 +459,36 @@ _PALETTE: dict[str, tuple[tuple[int, int, int], int, int]] = {
 # would have produced anyway.
 _Tone = tuple[tuple[int, int, int], int, int]
 
-#: Text tones, least first. **The warm end was wrong and has been removed.**
+#: Text tones, least first. Monotonic in lightness, evenly spaced in dE2000.
 #:
-#: The ramp used to run blue -> cyan -> green -> yellow -> amber, on the
-#: reasoning that any ordered sweep reads as a scale. It does not, because these
-#: numbers are *availability*: the top of the ramp is the emptiest node, and
-#: amber is read as heat -- "why use the orange colour to denote an unoccupied
-#: cpu?" A fully idle machine drew the most alarming colour on the screen.
+#: **The warm end was removed first, and the green end after it.** The ramp
+#: once ran blue -> cyan -> green -> yellow -> amber, on the reasoning that any
+#: ordered sweep reads as a scale. It does not, because these numbers are
+#: *availability*: the top of the ramp is the emptiest node, and amber is read
+#: as heat -- "why use the orange colour to denote an unoccupied cpu?" A fully
+#: idle machine drew the most alarming colour on the screen.
 #:
-#: So the sweep ends in green, which everything from a traffic light to a disk
-#: gauge already agrees means "go", and starts in the deep blue that reads as
-#: "nearly nothing". Amber and gold are gone entirely -- they are back to being
-#: warning colours, which is what a reader assumes they are.
+#: Ending in green fixed that and introduced a quieter version of the same
+#: problem: green is this tool's word for "fine", so the scale and the verdict
+#: spoke with one voice. The sweep now ends in turquoise -- still the brightest
+#: step, still unmistakably the top of the scale, and no longer a claim.
+#:
+#: The 256-colour column is not a nearest-match: nearest-match reintroduces
+#: lightness reversals, because the xterm cube is sparse through blue-cyan.
+#: It is the closest sequence that is still monotonic in L*.
 _RAMP: tuple[_Tone, ...] = (
-    ((0, 130, 205), 32, 34),     # blue        -- least free
-    ((0, 155, 225), 39, 94),     # bright blue
-    ((0, 175, 255), 39, 94),     # azure
-    ((0, 215, 255), 45, 94),     # sky
-    ((0, 255, 255), 51, 36),     # cyan
-    ((0, 255, 215), 50, 96),     # turquoise
-    ((0, 255, 175), 49, 96),     # spring
-    ((95, 255, 175), 85, 96),    # aquamarine
-    ((95, 255, 135), 84, 92),    # mint
-    ((95, 255, 95), 83, 92),     # light green
-    ((0, 255, 0), 46, 92),       # green
-    ((0, 215, 95), 41, 32),      # deep green  -- most free
+    ((55, 126, 227), 33, 34),    # blue        -- least free
+    ((39, 136, 230), 33, 34),
+    ((13, 146, 231), 33, 94),
+    ((0, 156, 228), 39, 94),
+    ((0, 166, 225), 39, 94),
+    ((0, 177, 223), 39, 36),
+    ((0, 187, 222), 45, 36),
+    ((0, 198, 223), 45, 36),
+    ((0, 210, 224), 80, 96),
+    ((0, 222, 225), 80, 96),
+    ((0, 233, 224), 51, 96),
+    ((0, 245, 222), 86, 96),     # turquoise   -- most free
 )
 
 #: Fill tones: the same hue, darker, one per step of :data:`_RAMP`.  At 16
@@ -411,18 +503,18 @@ _RAMP: tuple[_Tone, ...] = (
 #: present than the fill. A meter whose two halves swap roles at the bottom of
 #: its range is worse than no meter.
 _WASH: tuple[_Tone, ...] = (
-    ((0, 90, 145), 24, 34),      # blue
-    ((0, 110, 165), 25, 94),
-    ((0, 135, 175), 31, 94),
-    ((0, 135, 215), 32, 94),
-    ((0, 175, 175), 37, 36),
-    ((0, 175, 155), 36, 96),
-    ((0, 175, 135), 36, 96),
-    ((0, 175, 115), 35, 96),
-    ((0, 175, 95), 35, 92),
-    ((0, 155, 75), 29, 92),
-    ((0, 135, 0), 28, 92),
-    ((0, 115, 55), 22, 32),      # deep green
+    ((26, 82, 161), 25, 34),     # blue
+    ((4, 90, 163), 25, 34),
+    ((0, 99, 159), 25, 94),
+    ((0, 107, 155), 25, 94),
+    ((0, 115, 154), 31, 94),
+    ((0, 122, 153), 31, 36),
+    ((0, 131, 153), 31, 36),
+    ((0, 138, 154), 31, 36),
+    ((0, 145, 155), 37, 96),
+    ((0, 153, 156), 37, 96),
+    ((0, 162, 156), 37, 96),
+    ((0, 171, 155), 37, 96),     # turquoise
 )
 
 RAMP_STEPS = len(_RAMP)
@@ -681,9 +773,17 @@ def plural(count: int, word: str, suffix: str = "s") -> str:
     return f"{count} {word}" if count == 1 else f"{count} {word}{suffix}"
 
 
+#: Columns to assume when there is no terminal to ask -- a pipe, a file, a CI
+#: log. Not :data:`MAX_WIDTH`: the cap is what a *window* may be, and a pipe
+#: has no window, so inheriting the cap would set every redirected table to
+#: four hundred columns.
+FALLBACK_WIDTH = 100
+
+
 def term_width(cap: int = MAX_WIDTH) -> int:
     """Usable width, clamped to a range the layout can actually work in."""
-    return max(MIN_WIDTH, min(shutil.get_terminal_size((cap, 24)).columns, cap))
+    columns = shutil.get_terminal_size((FALLBACK_WIDTH, 24)).columns
+    return max(MIN_WIDTH, min(columns, cap))
 
 
 #: Rows a full-screen frame may occupy, before the window is consulted.
@@ -709,7 +809,7 @@ def term_height(cap: int = MAX_HEIGHT) -> int:
     the box stays put as the reader moves between levels instead of shrinking
     to fit whatever is inside it.
     """
-    lines = shutil.get_terminal_size((MAX_WIDTH, 24)).lines
+    lines = shutil.get_terminal_size((FALLBACK_WIDTH, 24)).lines
     return max(MIN_HEIGHT, min(lines - 1, cap))
 
 
@@ -896,22 +996,30 @@ def rule(title: str = "", style: Style | None = None, size: int | None = None) -
 # the visible band is not a gradient with a subtle end, it is one that is broken
 # for half its length.
 #
-# So the sweep moves in *hue* and stays put in brightness: light cyan through
-# aqua and periwinkle to light violet. Every step is legible against black,
-# none is legible as data -- nothing in any table is ever this pale -- and the
-# bottom border has the same weight as the top.
-_FRAME_ANCHORS = ((140, 233, 255), (94, 234, 212), (129, 199, 255), (167, 160, 255))
+# So the sweep moves in *hue* and stays put in brightness. It used to move
+# through light cyan and aqua, **which is the data ramp's own territory**: the
+# border of a table was drawn in the colours of the numbers inside it, a cyan
+# frame around a cyan column, and the chrome competed with the content it was
+# supposed to contain. The sweep now runs periwinkle -> lilac -> light orchid,
+# at least dE2000 21 from every step of the ramp and from `ok`, `warn` and
+# `bad`. Nothing in any table is ever this pale, and now nothing in any table
+# is this hue either, so a frame reads as a frame at a glance.
+_FRAME_ANCHORS = ((195, 209, 246), (200, 194, 246), (215, 183, 234), (230, 190, 222))
 
 #: The same sweep on the xterm-256 cube, held to the same rule: nothing below
-#: the bright band, or the bottom border vanishes.
-_FRAME_256 = (123, 87, 80, 74, 75, 111, 147, 141, 177, 183)
+#: the bright band, or the bottom border vanishes. The cube is thin on pale
+#: violets, so this is three tones rather than ten -- which is what a frame
+#: needs, the gradient being a texture and not a scale.
+_FRAME_256 = (189, 189, 189, 189, 183, 183, 182, 182, 182, 182)
 
 #: Sixteen colours, which is what ``TERM=screen`` and most tmux defaults
 #: advertise, and the depth with no room to be clever. Bright variants only:
 #: plain blue at this depth is a murky navy that disappears against a dark
 #: background, and because the sweep runs diagonally that is exactly where the
 #: bottom border lands. Two bright tones read as a deliberate two-tone frame.
-_FRAME_16 = (96, 94)
+#: Bright cyan is gone from the pair for the reason above -- at sixteen colours
+#: it is also ramp step eight.
+_FRAME_16 = (94, 95)
 
 #: Steps to quantise the truecolor sweep into: fine enough that the bands are
 #: invisible, coarse enough that runs of equal colour still group into one
@@ -1163,6 +1271,37 @@ def kv(
     return "\n".join(out)
 
 
+def _cell(text: str, i: int, sizes: Sequence[int], aligns: Sequence[str],
+          have: int | None = None) -> str:
+    """One padded cell -- except the last, when nothing follows it.
+
+    **The trailing padding on a final left-aligned cell is the widest thing
+    this module produces, and nobody can see it.** A column sized to
+    `V100, RTX6000` pads the heading `gpu model` out by four spaces; the reader
+    sees a heading.
+
+    It stops being invisible the moment anything *measures* the table. `status`
+    draws its rule at ``max(width(x) for x in out)``, so the rule came out 97
+    columns for content that ended at 79, and the interactive frame was then
+    held open to the rule -- eighteen columns of empty box at every level,
+    traceable to spaces after a heading.
+
+    Not fixed with ``rstrip``, which was tried and is wrong: a padded cell
+    keeps its spaces INSIDE the styled run, so ``ESC[38;5;248mgpu
+    moduleESC[0m`` loses them and the coloured twin does not. That makes the
+    line a different width with colour on than off, which is the one property
+    :class:`TestLayoutStability` exists to protect -- argparse and every table
+    here lay out with `len()`. So the padding is never added instead.
+
+    Only the last column, and only left-aligned: a right-aligned cell pads on
+    the LEFT, which is what puts its digits under the ones above them.
+    """
+    if i == len(sizes) - 1 and aligns[i] == "left":
+        return text
+    return pad(text, sizes[i], aligns[i],
+               **({} if have is None else {"have": have}))
+
+
 def table(
     headers: Sequence[str],
     rows: Iterable[Sequence[object]],
@@ -1171,6 +1310,7 @@ def table(
     indent: str = "",
     limits: Sequence[int] | None = None,
     fit: bool = True,
+    atomic: Sequence[bool] | None = None,
     size: int | None = None,
     keep: int = 2,
     drop_empty: bool = True,
@@ -1256,6 +1396,25 @@ def table(
     if fit:
         window = size or term_width()
         floors = [min(width(h), 6) if width(h) else 3 for h in headers]
+        # **A column the caller calls atomic does not shrink at all.**
+        #
+        # The floor above is derived from the HEADER, so a column headed
+        # `cores free` may be squeezed to six columns -- and six columns of
+        # `1744/2000G` is `1744/…`, a fraction with its denominator eaten.
+        # That is not a smaller version of the fact, it is a different and
+        # false one, and the reader cannot tell which digits went.
+        #
+        # Only the caller knows which cells are indivisible. A list of
+        # accelerator models shortens usefully; a ratio, a duration and a node
+        # shape do not. Marked ones floor at their own content width, so the
+        # loop below spends the squeeze on the columns that can take it and
+        # the drop-from-the-right path handles a window that genuinely cannot
+        # hold them all -- which at least says `N more columns (widen, or
+        # --json)` instead of mangling four numbers in silence.
+        if atomic:
+            for i, fixed in enumerate(atomic[:ncol]):
+                if fixed:
+                    floors[i] = max(floors[i], sizes[i])
         # Drop from the right while even the floors cannot fit, never going
         # below `keep` columns -- the row has to stay identifiable.
         while ncol > max(1, keep):
@@ -1313,7 +1472,7 @@ def table(
             return wear(text)
 
         lines.append(indent + "  ".join(
-            dress(i, pad(h, sizes[i], aligns[i])) for i, h in enumerate(headers)
+            dress(i, _cell(h, i, sizes, aligns)) for i, h in enumerate(headers)
         ))
         if underline:
             lines.append(
@@ -1321,8 +1480,8 @@ def table(
                                    for i in range(ncol)))
     for r, w in zip(body, wide, strict=True):
         cells = [
-            pad(r[i] if i < len(r) else "", sizes[i], aligns[i],
-                have=w[i] if i < len(w) else 0)
+            _cell(r[i] if i < len(r) else "", i, sizes, aligns,
+                  have=w[i] if i < len(w) else 0)
             for i in range(ncol)
         ]
         lines.append((indent + "  ".join(cells)).rstrip())
@@ -1409,7 +1568,11 @@ def wrap_indent(
     """
     import textwrap
 
-    size = size or term_width()
+    # Prose, so `PROSE_WIDTH` and not the window. A sentence set to the full
+    # width of a wide terminal is harder to read than the same sentence at
+    # ninety columns, and tables taking the whole window is no reason for
+    # paragraphs to. See `PROSE_WIDTH`.
+    size = size or min(term_width(), PROSE_WIDTH)
     if first is not None:
         # Pad whichever is narrower so the block lines up in both glyph sets.
         pad_to = max(width(first), width(indent))
@@ -1469,7 +1632,8 @@ _HELP_SPANS = re.compile(
     r"|(?P<flag>(?<![\w-])--?[a-zA-Z][\w-]*)"
     r"|(?P<caps>\b[A-Z][A-Z_]{2,}\b)"
 )
-_HELP_TONES = {"default": "dim", "code": "info", "flag": "info", "caps": "warn"}
+_HELP_TONES = {"default": "dim", "code": "info", "flag": "info",
+               "caps": "accent"}
 _HELP_METAVAR = re.compile(r"^[A-Z][A-Z_]*$")
 
 
@@ -1487,8 +1651,8 @@ def _is_invocation(line: str) -> bool:
 def _metavars(text: str) -> frozenset[str]:
     """The placeholders this parser actually declares.
 
-    Amber has to mean "you substitute this", so it is spent only on words the
-    invocation column proves are placeholders.  A blanket all-caps rule paints
+    The placeholder tone has to mean "you substitute this", so it is spent only
+    on words the invocation column proves are placeholders.  A blanket all-caps rule paints
     ``GPU`` and ``QOS`` -- prose nouns, and this tool's prose is full of them --
     the same colour as ``FILE``, which drains the colour of its meaning.
     """
@@ -1548,12 +1712,18 @@ def _paint_words(text: str, style: Style, first: bool = False) -> str:
     index 1: a leading space makes those different, and that is how the
     program's own name came out painted as a placeholder.
 
-    A bare word is amber only when it follows a flag, because that is what makes
-    it an argument to one.  A sub-command follows the program name instead, so it
+    A bare word takes the placeholder tone only when it follows a flag, because
+    that is what makes it an argument to one.  A sub-command follows the program name instead, so it
     stays the literal-text tone and matches the same word where it appears in the
     invocation list -- ``queues`` painted blue in one place and amber in the
     other is worse than either choice on its own.  (A flag that takes no value
     would fool this; none of the examples has a bare literal after one.)
+
+    The placeholder tone is `accent`, and it used to be `warn`.  Amber is this
+    tool's warning colour -- a degraded node, a queue that will not take your
+    job -- and spending it on ``NAME`` in ``--backend NAME`` put the loudest
+    thing in the palette on a piece of syntax.  A help page full of amber is a
+    help page that has taught the reader amber means nothing.
     """
     out = []
     seen = False
@@ -1570,7 +1740,7 @@ def _paint_words(text: str, style: Style, first: bool = False) -> str:
             seen = True
             continue
         elif after_flag:
-            out.append(style.paint("warn", tok))
+            out.append(style.paint("accent", tok))
         else:
             out.append(style.paint("info", tok))
         seen = True
@@ -1598,13 +1768,14 @@ def _paint_invocation(line: str, style: Style,
             continue
         if set(tok) <= {",", " "}:
             # The separator between two spellings of the same option. Dim, not
-            # amber: it is punctuation, and painting it as a value is what made
-            # "-h, --help" look like a flag taking an argument.
+            # the placeholder tone: it is punctuation, and painting it as a
+            # value is what made "-h, --help" look like a flag taking an
+            # argument.
             parts.append(style.dim(tok))
         elif tok.startswith("-"):
             parts.append(style.paint("info", tok))
         elif _HELP_METAVAR.match(tok):
-            parts.append(style.paint("warn", tok))  # you substitute this
+            parts.append(style.paint("accent", tok))  # you substitute this
         else:
             # A sub-command, or an alias list beside one. Literal text you
             # type, so it wears the same tone as a flag.
@@ -1619,8 +1790,9 @@ def _paint_prose(text: str, style: Style,
 
     def paint(match: re.Match) -> str:
         word = match.group(0)
-        # An all-caps word earns amber by being a declared placeholder, or by
-        # having the shape of an environment variable (NO_COLOR).
+        # An all-caps word earns the placeholder tone by being a declared
+        # placeholder, or by having the shape of an environment variable
+        # (NO_COLOR).
         if match.lastgroup == "caps" and word not in names and "_" not in word:
             return word
         return style.paint(_HELP_TONES[match.lastgroup or "flag"], word)

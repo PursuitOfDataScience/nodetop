@@ -371,6 +371,34 @@ def raw_session() -> _RawMode:
     return _RawMode()
 
 
+#: Rows of a block left standing on screen by a `select` that exited to be
+#: reloaded, for the next `select` to overwrite in place.
+#:
+#: **The blank second at startup lived here.** A reload is a full re-read of
+#: the cluster, and the block was erased on the way out of `select` and only
+#: redrawn once that read came back -- 1.4 seconds later on this cluster. So
+#: `status` painted, sat there, vanished, and came back: "when the app starts,
+#: it will disappear for 1 second or so from the terminal and it will appear."
+#: It is the same defect `paint` fixed for keypresses -- erase-then-write with
+#: a gap in between -- except the gap is a scheduler query rather than a few
+#: microseconds, which is why this one was seconds long and impossible to miss.
+#:
+#: It bites hardest on the *second* run, which is the one that feels like a
+#: startup glitch rather than a refresh: with the access cache warm the first
+#: frame paints immediately from it, a background re-probe confirms a moment
+#: later, and that confirmation triggers exactly this reload.
+#:
+#: So a reload does not erase. It records what is on screen and leaves it
+#: there, and the next `select` adopts that count as its own previous block --
+#: `paint` then winds back over it and overwrites it line by line, which it
+#: already knows how to do, tail-trimming included. Nothing is ever blank.
+#:
+#: Module state because the frame outlives the call that drew it: that is the
+#: whole point. Reset on adoption so a `select` that is genuinely the first
+#: thing on screen does not wind back over rows it does not own.
+_STANDING = [0]
+
+
 def select(
     render: Callable[[int], Sequence[str]],
     count: int,
@@ -454,7 +482,16 @@ def select(
     pending = pending or input_pending
     wait = wait or key_ready
     index = max(0, min(initial, count - 1))
-    painted = 0
+    # Rows a previous frame left standing for this one to overwrite. Claimed,
+    # not shared: two `select`s must never both think they own the block.
+    painted = _STANDING[0]
+    _STANDING[0] = 0
+    #: Set at the two exits that mean "re-read and come back", which hand the
+    #: block over to the next frame instead of erasing it.
+    reloading = False
+    #: Set at the exits that mean "we are done" -- which must leave the frame
+    #: ON SCREEN. See the `finally` below.
+    leaving = False
     # Entry -> display row, and the entries on each row in order. A flat list
     # behaves as one entry per row, which is the old behaviour exactly.
     at_row = list(rows) if rows is not None else list(range(count))
@@ -512,6 +549,7 @@ def select(
             # being true a minute ago.
             if idle is not None and not wait(idle):
                 if on_idle is None or on_idle():
+                    reloading = True
                     return Key.RELOAD
                 # The caller looked and said "not yet". Back to waiting, which
                 # is the difference between polling and refreshing.
@@ -519,10 +557,13 @@ def select(
             try:
                 key = keys()
             except KeyboardInterrupt:
+                leaving = True
                 return Key.QUIT
             if key == Key.RELOAD:
+                reloading = True
                 return key
             if key == Key.QUIT:
+                leaving = True
                 return key
             if key == Key.ENTER and openable:
                 return index
@@ -565,7 +606,27 @@ def select(
             skipped = 0
             paint()
     finally:
-        if erase and painted:
+        if painted and leaving:
+            # **Leave it on the screen.** Quitting used to erase the block, so
+            # `nodetop` printed a report, waited, and then took it away again:
+            # "when i exit it ... everything shown before is gone." Every
+            # other command-line tool leaves its output where you can read it
+            # after the shell prompt comes back, scroll up to it, and copy out
+            # of it; a reader who pressed `q` wanted to stop looking at a live
+            # view, not to destroy the answer.
+            #
+            # Nothing to write. `paint` leaves the cursor one line below the
+            # block, which is exactly where the shell should put its prompt.
+            pass
+        elif painted and reloading:
+            # Leave it standing. The caller is about to re-read the cluster and
+            # come back with a new frame for the same rows; erasing here is
+            # what put a blank screen on for the length of that read. The
+            # cursor stays below the block, exactly where `paint` leaves it,
+            # because that is where the next `paint` expects to start winding
+            # back from. See `_STANDING`.
+            _STANDING[0] = painted
+        elif erase and painted:
             # Wind the cursor back over the block so whatever the caller draws
             # next occupies the same rows. Without this each level would append
             # to a growing transcript instead of replacing the one before it.

@@ -295,10 +295,16 @@ class TestNothingChangesWhenThereIsNothingToQualify:
 
     #: The `accelerators --all` rows, verbatim.  A literal, not a property:
     #: byte-identical is the claim being made.
+    #:
+    #: The `free` column held `█████████ 8/8` until meters were removed from
+    #: every view; it is the bare fraction now. Updating a literal is the cost
+    #: of asserting on bytes, and it is the right cost here -- the claim is
+    #: that *qualification* changes nothing, so the rows have to be compared
+    #: character for character rather than by a property that would also hold
+    #: if the table were rebuilt differently.
     ROWS = (
-        "  model  vendor  arch   mem  nodes  free           bf16  fp8  "
-        "partitions",
-        "  A100   NVIDIA  sm_80  80G      2  █████████ 8/8  yes   no   work",
+        "  model  vendor  arch   mem  nodes  free  bf16  fp8  partitions",
+        "  A100   NVIDIA  sm_80  80G      2  8/8   yes   no   work",
     )
 
     def test_the_table_is_byte_identical(self, ordinary):

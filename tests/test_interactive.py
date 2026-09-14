@@ -638,12 +638,25 @@ class TestNavigationHasThreeOutcomes:
             == 0
         )
 
-    def test_the_block_is_erased_on_the_way_out(self):
+    def test_the_block_is_erased_when_one_level_replaces_another(self):
         # This is what makes each level replace the last instead of appending to
-        # a transcript of screens.
+        # a transcript of screens. Stepping *back* is such a transition: the
+        # parent is about to redraw over these rows.
         frames = []
-        select(lambda _i: ["a", "b"], 2, keys=lambda: Key.QUIT, write=frames.append, raw=False)
+        select(lambda _i: ["a", "b"], 2, keys=lambda: Key.BACK,
+               write=frames.append, raw=False)
         assert "J" in frames[-1] and "F" in frames[-1]
+
+    def test_quitting_leaves_the_block_on_the_screen(self):
+        # Quitting used to erase it, so the report a reader had just asked for
+        # was taken away as they stopped looking at it: "when i exit it ...
+        # everything shown before is gone." Nothing replaces these rows, so
+        # nothing should wipe them -- and `paint` has already left the cursor
+        # one line below, where the shell prompt belongs.
+        frames = []
+        select(lambda _i: ["a", "b"], 2, keys=lambda: Key.QUIT,
+               write=frames.append, raw=False)
+        assert not any("\033[J" in f for f in frames), frames
 
     def test_erase_can_be_declined(self):
         frames = []

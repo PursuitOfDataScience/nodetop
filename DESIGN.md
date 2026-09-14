@@ -115,12 +115,34 @@ printed to someone looking at a rack of NVIDIA cards. Every backend calls the re
 `nodetop gpus` works. The JSON keys and the core model keep `accelerator`: a machine
 consumer should not have its field names churned for a wording fix.
 
-**One panel, one population.** The header reported cluster-wide totals while the table
-below it was filtered to the caller's slice — `358 GPUs, 117 free` printed above five
-partitions holding 230 of them. It is built after the filtering now and inserted at the
-top, so it counts exactly the partitions shown: `90 of 607 nodes, 88 up · 176 of 358 GPUs,
-31 free`. Your slice is the subject; the cluster size is the qualifier, and it disappears
-under `--all` where nothing is hidden.
+**One panel, one population — and one denominator per number.** The header reported
+cluster-wide totals while the table below it was filtered to the caller's slice —
+`358 GPUs, 117 free` printed above five partitions holding 230 of them. It is built after
+the filtering now and inserted at the top, so it counts exactly the partitions shown.
+
+Scoping the counts left a subtler version of the same fault standing. The line read
+`330 of 608 nodes, 324 up · 230 of 358 GPUs, 58 free`: four numbers, two denominators,
+and nothing saying which belonged to which. `324 up` is 324 of the **330**, not of the
+608 beside it, and `58 free` is 58 of the **230** — so the two cluster totals were the
+denominators of nothing on the line while the real ones stayed implicit, and the natural
+reading was the wrong one. The totals are gone: they answered "how much of this machine
+can I touch", which the funnel below accounts for partition by partition and which
+`nodetop gpus` states outright. Each figure now names what it is a fraction of —
+`324 of 330 nodes up · 57 of 230 GPUs free`.
+
+**And no possessive.** It read `324 of your 330 nodes up` for a while, which claimed
+something untrue: these are somebody else's nodes that the reader is permitted to submit
+to, not the reader's nodes. "i don't own these gpus or nodes. why are they mine?" The
+bare fraction says everything the line needs and claims nothing; which 330 is the
+funnel's job one line below, and it answers it partition by partition.
+
+**No prose annotating the funnel either.** A note was tried under it — "11 look open on
+paper; a test job could not get in. check -q says why" — to carry the one thing the
+merged `no access` term cannot say, that some of its members passed the first filter. It
+was the longest line on the screen and a footnote in the middle of the answer. The fact
+stays reachable rather than displayed: opening the term names each partition's own
+reason, `check -q <name>` gives the control plane's words, and `--json` carries both
+reason codes.
 
 **Free means reachable-and-free.** `Queue.effective_free_gpus` has always returned 0 for an
 unusable queue. `Cluster.summary` did not: it counted every *schedulable* node's free
@@ -156,7 +178,7 @@ node; this is the same arithmetic one level up.
 **No cell is a bare `free/total` fraction.** `4/4  100%` was read as plausibly meaning all
 four are *busy* — a single fraction cannot say which side is free, and a percentage next to
 it does not disambiguate. Free and total are separate columns under their own names now,
-and the header line spells it out too (`607 nodes, 549 up` rather than `549/607 nodes`).
+and the header line spells it out too (`549 of 607 nodes up` rather than `549/607`).
 
 **Access is filtered by default, in two stages, and both were measured against the control
 plane before being trusted.**
@@ -213,9 +235,9 @@ shown count rather than filed under `refused`, because "we did not ask" and "you
 are the exact pair of claims this whole tool exists to keep apart.
 
 ```
- ada  ·  607 nodes, 548 up  ·  358 GPUs, 110 free
+ ada  ·  548 of 607 nodes up  ·  110 of 358 GPUs free
 
- 87 partitions  →  5 open to you  ·  65 no access  ·  14 refused  ·  3 dead
+ 87 partitions  ·  5 open to you  ·  79 no access  ·  3 down
  ───────────────────────────────────────────────────────────────────────────
  partition       nodes  idle  cores  free  share             gpu  free  models
  amd                40     0   5120  2825  █████▌░░░░   55%
@@ -237,10 +259,22 @@ question that came back — *"why is it showing me five rows?"* — is what you 
 reader has to do that arithmetic themselves and one term is missing from it. So the
 count moved down beside the table it describes, every stage that drops a partition is
 named in the same line, and the terms sum to the total exactly: shown + no-access +
-refused + no-nodes + dead == 87. A partition cannot leave the screen without appearing
-in that line. The footer no longer repeats any of those counts — it says only what
-`refused` *means*, since which dry-run refused you is the part that is not obvious, and
-two sixty-fives four lines apart read as two different sixty-fives.
+no-nodes + down == 87. A partition cannot leave the screen without appearing in that
+line. The footer no longer repeats any of those counts — two sixty-fives four lines
+apart read as two different sixty-fives.
+
+**One term for the two ways of having no access, and that is deliberate.** Two filters
+run: the queue's own account list, read off the queue for nothing, and a dry-run
+submitted to the queues that list survives. Both were named on the headline, and every
+wording tried for the second failed — `refused` and `denied` read as synonyms of the
+first, `not listed` named a Slurm field the reader has never seen, `didn't work` invited
+the one question four words cannot answer. It also answers a question nobody asked: a
+reader on this line wants to know why the table has eight rows, and both groups answer
+that identically. So the line says `76 no access`, and the note under it carries the
+one thing it cannot say — that some of those passed the first filter — reachable rather
+than printed. Opening the term lists each partition with its own reason, `no account` or
+`tried, no luck`; `check -q <name>` gives the control plane's own words; and `--json`
+reports both codes.
 
 **All four listings share the filter**, through one helper, because getting this right in
 one place and not the others is a mistake this file has made three times. Unfiltered, they
@@ -322,11 +356,33 @@ meant "40% of GPUs are free", which is not a warning about anything. Two colours
 side of a threshold is a judgement.
 
 The fix was a flat single-colour fill, and that overcorrected: it bought the honesty by
-giving up on colour carrying any quantity at all. What it now uses is a twelve-step ramp
-from deep blue through cyan and green to amber — ordered, so it reads as a scale the way a
-heatmap legend does, and with **no red at either end**, so neither a full bar nor an empty
-one can be mistaken for an alarm. Red stays reserved for the things that are actually
-wrong, said with a glyph and a word.
+giving up on colour carrying any quantity at all. What it now uses is a twelve-step ramp,
+ordered, so it reads as a scale the way a heatmap legend does, and with **no red at either
+end**, so neither a full bar nor an empty one can be mistaken for an alarm. Red stays
+reserved for the things that are actually wrong, said with a glyph and a word.
+
+**The ramp is ordered by lightness, because that is the only channel the eye reads as a
+quantity.** It used to run deep blue through cyan to green, and that is a rainbow: its
+brightest step was in the *middle* — L\* climbed to 91 at cyan and fell back to 76 at the
+green end, six lightness reversals in twelve steps — so a mid-range value drew the loudest
+row on the screen and the true extreme read as mid-range. That is the defect that got the
+jet colormap retired from scientific plotting. Its steps were also spaced between ΔE2000
+2.8 and 15.3, a 5.5× spread, and four of the top five were one green, so two partitions an
+order of magnitude apart came out the same colour.
+
+It is now built the way a perceptually uniform colormap is built: a path through OKLCH
+from blue to turquoise, resampled at twelve points of **equal ΔE2000 arc length**. The
+result is monotonic in lightness with steps 4.3–5.1 apart, and every step clears WCAG AA
+4.5:1 against a dark terminal, so the coldest count is legible and not merely present.
+
+**A colour is either a verdict or a quantity, never both.** The ramp stops at turquoise
+and does not reach green, because green is `ok`. The old top step was ΔE2000 8 from it, so
+an idle node's green dot and its green core count were one colour by accident. Every
+verdict — `ok`, `warn`, `bad` — is now at least ΔE 18 from every step of the ramp, at least
+25 from the other verdicts, and separated from them in *lightness* as well as hue, since
+red–green colour vision deficiency takes the hue away and leaves the brightness. The frame
+gradient moved out of cyan for the same reason: a border drawn in the colours of the
+numbers inside it is chrome competing with content.
 
 Two more properties make it mean something rather than merely look like something:
 
@@ -335,12 +391,18 @@ Two more properties make it mean something rather than merely look like somethin
   values an order of magnitude apart in the same tone is what makes a ramp read as noise.
   Rows are walked largest-first and one that is *measurably* smaller than the row above is
   forced at least one step cooler; rows that really are equal stay equal.
-- **Tone and bar length are deliberately different quantities.** Length is the row's own
-  free *share*; tone is how its free cores rank against the other rows. `compute-hm` draws a
-  full bar in a cold tone — all of it free, and it is one node. `amd` draws a short bar in
-  a warm one — mostly busy, and still the largest pool of free cores on the list.
-  Collapsing the two would lose whichever was dropped, and both are answers someone came
-  here for.
+- **Tone and bar length measure the same quantity.** They did not, and that was a bug
+  wearing the clothes of a feature: length was the row's own free *share* while tone was
+  its rank against the other rows, so `amd-hm` drew a *full* bar in the coldest tone (all
+  of one node) directly under `amd` drawing a half bar in the warmest (half of eighty).
+  The eye takes the longer bar for the roomier queue, and it was the smaller one by a
+  factor of twenty. One object cannot make two claims. The bar now draws the column the
+  table is sorted by; how full a queue is in its own terms is what `zoom` is for.
+- **Hue is never spent on an identifier.** Partition names, node names and job ids are
+  plain. Painting a name on the heat ramp spends the one channel the eye reads as identity
+  on a quantity the row already states twice, and it does not even do that well: on a real
+  cluster fourteen of twenty-two partition names came out the same blue, so the column
+  that says *which row this is* read as a rainbow with repeats in it.
 
 ### 1c. An empty answer and an unobtainable one are different claims
 
@@ -1425,7 +1487,7 @@ quantity in text.
 
 Every command takes exactly one reading and every number in its output describes
 that instant -- a guarantee with a test behind it, and the reason a report never
-says "607 nodes, 549 up" above a table that adds to 606. For a printout that is
+says "549 of 607 nodes up" above a table that adds to 606. For a printout that is
 the whole answer: you ran it, you read it, it was true.
 
 A browse is not a printout. It renders that one reading for as long as it is
@@ -1469,11 +1531,33 @@ third of its width and four rows:
 ```
 
 *"whatever we choose in the ui, the window should stay the same and the text and
-information getting displayed should dynamically get adjusted."* Every view now draws at
-`term_width()` × `term_height()` and pads up to it, so the box is where the eye left it and
-only the contents change. `term_height()` is the window less one line — the spare line the
-repaint needs — capped at 30 for the same reason `MAX_WIDTH` exists, and floored where the
-chrome no longer fits.
+information getting displayed should dynamically get adjusted."* Every view draws at one
+width and one height and pads up to them, so the box is where the eye left it and only the
+contents change.
+
+The width is `term_width()` — **the terminal's, in full.** It was capped at 100, and a box
+ending at column 100 of a wide window reads as a thing that failed to open: *"i think the
+app should take the entire hortizontal space. the current one looks so squeezed and
+unnatural."* Taking the window is only half of it, though, because the other half is that
+nothing inside was using the room. Every cell in these tables is sized by its text — a
+node name, a core count — and cannot spend extra columns on anything. A bar can: it is a
+proportion, so more cells is strictly more resolution. So **the meter absorbs the slack**,
+from 10 cells at 80 columns to 40 at 112 and above, bounded at both ends because below ten
+the sub-cell eighths stop separating a nearly-empty queue from an empty one and past forty
+a bar reads as a rule across the screen.
+
+Three widths, for three jobs. `MAX_WIDTH` is a sanity bound (400) — a terminal claiming
+tens of thousands of columns is lying, and every cell gets padded to whatever this
+returns. `FALLBACK_WIDTH` (100) is what a pipe with no window gets, because inheriting the
+cap there would set every redirected table to four hundred columns. `PROSE_WIDTH` (96) is
+what sentences wrap to: a paragraph set 300 columns wide is measurably harder to read than
+the same paragraph at 90, and tables taking the whole window is no reason for prose to.
+
+The height is a different number and deliberately not the window: it is the overview's own
+height, clamped to what the window can hold. Padding to the window spent fourteen rows on
+blank lines inside a border and pushed fourteen lines of the reader's scrollback away to do
+it, every run. Still one number for every level, so nothing jumps; deeper levels page
+inside it and say so with their position line.
 
 Escape got the same treatment as Left when Left had to stop leaving the program, and should
 not have: at the root it did nothing, which is indistinguishable from a hang. It is now its
@@ -2318,9 +2402,12 @@ sequences per border rather than one per column.
 `--help` is coloured too, and it is coloured *after* argparse has formatted it. argparse
 lays its columns out with `len()`, so painting the strings it is handed throws every
 column off by the width of its own escape sequences. Four roles and no more — flags and
-sub-commands in blue (what you type), placeholders in amber (what you substitute), section
-headings bold, defaults and example notes dim — because a help screen wearing a dozen
-colours is harder to read than one wearing none.
+sub-commands in blue (what you type), placeholders in the identity magenta (what you
+substitute), section headings bold, defaults and example notes dim — because a help screen
+wearing a dozen colours is harder to read than one wearing none. The placeholders used to
+be amber, which is the colour this tool uses for a degraded node and a queue that will not
+take your job; a help page that spends it on `NAME` in `--backend NAME` is a help page that
+teaches the reader amber means nothing.
 
 The one deliberate exemption is the `to request exactly what was checked` line.
 It is neither wrapped nor truncated, because it exists to be copied and an
@@ -2487,6 +2574,62 @@ Two things to get right in `capabilities()`:
   fixes and blames the cluster for a local problem. `TestProbeIsGatedOnItsClient` enforces
   this across the registry, because two of the three probe-capable backends had the guard
   and the third did not.
+
+## Serving it to an agent
+
+`nodetop mcp` exposes seven read-only tools over MCP on stdin/stdout. It adds no data —
+an agent with a shell could already run `nodetop where -g 4 --json` and get the same
+bytes — so the question is what the protocol buys, and the answer is narrower and more
+specific than "agents can now use nodetop".
+
+**The flag an agent reaches for does not parse.** `--gpu` is an ambiguous prefix of
+`--gpus` and `--gpu-mem`, so the obvious spelling of the commonest question fails:
+asking for `where --gpu 1 --json` answers `error: ambiguous option: --gpu could match
+--gpus, --gpu-mem`, and nothing else.
+
+That is not a hypothetical. It happened while this feature was being designed, to the
+author of the parser. A human reads the message and retypes; a model reads a failed
+command and is liable to report that nothing is available — the usage error and the
+answer "no capacity" arrive on the same channel and look alike. `gpus: integer` in a
+tool schema cannot be spelled wrong. That, plus clients with no shell at all, is the
+whole case; it does not need a bigger one.
+
+**There is no second implementation, by construction.** Every `--json` view in the
+package funnels through one function, so `_print_json` grew a collector and a tool call
+runs the real command through `main()`. Two consequences worth stating: the payload is
+identical because it *is* the same object, and every guard comes along unasked — backend
+detection and its warnings, the broken-snapshot refusal, the unknown-queue check, the
+exit code. The alternative — a second set of builders assembling these dictionaries for
+the protocol — is the drift this codebase has paid for repeatedly in its renderers, and
+it would be worse here: a report that disagrees with the CLI is something a reader can
+see, while a tool result that disagrees is something a model repeats with confidence.
+
+**A server outlives the state it describes, and three things follow.**
+
+| | |
+|---|---|
+| Each call takes a fresh reading | The one-snapshot rule is per *report*. Caching across calls would serve a remembered cluster, which is this tool's cardinal sin committed by its newest surface. It costs ~2 s per call and that is the right price. |
+| `sys.stdout` is pointed at stderr for the session | stdout is the JSON-RPC channel. One stray `print` out of the package's 111 corrupts the stream and the client drops the session with no useful diagnosis, so the real descriptor is taken away at startup and handed to the framing code alone. |
+| Dry-runs are throttled | A person types `where` a few times an hour. An agent in a loop will call it fifty times a minute, at somebody else's controller. A probing call within ten seconds of the last is answered from the declared allowlists instead. |
+
+The throttle's downgrade is **said out loud**, in a content block of its own: the payload
+stays byte-identical to `--json`, because a caveat folded into the answer changes the
+shape of the answer, and the shape is the thing this module exists to keep.
+
+**A tool that fails is a successful call.** JSON-RPC errors are reserved for the call
+itself going wrong — an unknown method, parameters that will not parse. A command that
+ran and reported "no batch system here" reaches the model as its own words and its own
+exit code, because that is a fact it can act on and `-32603` is not.
+
+`snapshot`, `exclude`, `backends` and `check` are deliberately absent. The first writes a
+file, the second emits input for a shell to interpolate, the third answers a question
+about this host rather than about the cluster, and the fourth exists only to spend the
+dry-runs that `where` already reports. Read-only is not the same as harmless.
+
+No dependency was added. A tools-only MCP server is four JSON-RPC methods over a
+newline-delimited pipe, which is standard library; the official SDK would have pulled in
+pydantic, anyio, httpx and starlette, and `pyproject.toml` states with a reason that this
+must run on a login node with nothing but the system Python.
 
 ## The bias, stated
 

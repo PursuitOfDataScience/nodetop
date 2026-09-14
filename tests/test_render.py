@@ -1275,14 +1275,22 @@ class TestHelpIsPaintedAfterFormatting:
     def test_a_flag_and_its_placeholder_are_different_colours(self):
         out = colorize_help(self.HELP, COLOR)
         assert COLOR.paint("info", "--backend") in out
-        assert COLOR.paint("warn", "NAME") in out
+        assert COLOR.paint("accent", "NAME") in out
+
+    def test_a_placeholder_is_not_painted_as_a_warning(self):
+        # `NAME` in `--backend NAME` was amber, which is this tool's colour for
+        # a degraded node and a queue that will not take your job. A help page
+        # that spends it on syntax is a help page that teaches the reader to
+        # ignore it.
+        out = colorize_help(self.HELP, COLOR)
+        assert COLOR.paint("warn", "NAME") not in out
 
     def test_the_separator_between_two_spellings_is_not_a_value(self):
         # "-h, --help" read as a flag taking an argument when the comma was
-        # painted amber.
+        # painted as a placeholder.
         out = colorize_help(self.HELP, COLOR)
         assert COLOR.dim(", ") in out
-        assert COLOR.paint("warn", ", ") not in out
+        assert COLOR.paint("accent", ", ") not in out
 
     def test_a_default_is_context_not_content(self):
         assert COLOR.dim("(default: 20)") in colorize_help(self.HELP, COLOR)

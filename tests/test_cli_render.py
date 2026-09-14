@@ -126,14 +126,26 @@ def _prose(out: str) -> str:
 class TestContent:
     """A few assertions on meaning, so the renderers cannot go silently blank."""
 
-    def test_status_names_the_backend_and_accounts_for_every_queue(self, cluster, capsys):
+    def test_status_accounts_for_every_queue(self, cluster, capsys):
         cmd_status(cluster, _args(["status"]), MODES["plain"])
         out = _prose(capsys.readouterr().out)
-        assert "slurm" in out
         # The funnel, not a DEAD block: what is broken is a count on this view,
         # and `queues` / `health` carry the detail. See TestStatus.
         assert "partitions" in out and "down" in out
         assert "advertised" not in out
+
+    def test_the_backend_is_named_only_when_it_was_not_autodetected(
+            self, cluster, capsys):
+        # On any one machine the backend is a constant, so printing it on every
+        # header told the reader nothing they could act on: "if it's not slurm,
+        # then what else will it be?" It is worth a word when `--backend`
+        # overrode the detection, or `--replay` is reading a file, because then
+        # it says which world the numbers came from.
+        cmd_status(cluster, _args(["status"]), MODES["plain"])
+        assert "slurm" not in _prose(capsys.readouterr().out)
+        cmd_status(cluster, _args(["--backend", "slurm", "status"]),
+                   MODES["plain"])
+        assert "slurm" in _prose(capsys.readouterr().out)
 
     def test_queues_table_summarises_the_blockers(self, cluster, capsys):
         cmd_queues(cluster, _args(["queues", "--unusable-only"]), MODES["plain"])

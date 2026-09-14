@@ -353,8 +353,8 @@ def evaluate(
         if settled is not verdict:
             verdict = settled
             caveats.append(
-                f"refused by {tried} of {of} accounts tried; the rest were not "
-                f"asked -- name one with -A to settle it"
+                f"{tried} of {of} accounts tried could not get in; the rest "
+                f"were not asked -- name one with -A to settle it"
             )
         elif (
             verdict is not None
@@ -379,7 +379,7 @@ def evaluate(
                 reason=f"{verdict.category}: {verdict.reason}".strip(": "),
             )
             caveats.append(
-                "refused with no account named, because your associations "
+                "tried with no account named, because your associations "
                 "could not be read -- name one with -A to settle it"
             )
         elif (
@@ -410,7 +410,7 @@ def evaluate(
             # hint goes last.
             flag, what = _SETTLEABLE_BY_FLAG[verdict.category]
             caveats.append(
-                f"the control plane refused the {what}, not the job -- "
+                f"the control plane turned back the {what}, not the job -- "
                 f"name one with {flag} to settle it"
                 + (f" (tried {verdict.effective_qos})"
                    if verdict.effective_qos else "")

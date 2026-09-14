@@ -52,14 +52,14 @@ from .core.model import (
 from .exceptions import NoBackendError
 from .hostlist import expand
 from .render import (
+    MIN_HEIGHT,
     Glyphs,
     Style,
     badge,
-    bar,
     colorize_help,
     columns,
     flow,
-    gauge,
+    heat_step,
     heat_steps,
     kv,
     panel,
@@ -224,7 +224,7 @@ def _named_failures(errors: dict[str, str]) -> str:
 #: DESIGN.md claimed "one guard at dispatch now covers every command" and nothing
 #: read that claim -- a command added after those returns would inherit the exact
 #: confidently-wrong-answer bug the guard exists to prevent.
-_GUARD_EXEMPT = frozenset({"backends", "snapshot"})
+_GUARD_EXEMPT = frozenset({"backends", "mcp", "snapshot"})
 
 
 def _name_failed_queries(cluster: Cluster) -> None:
@@ -390,19 +390,50 @@ def _reject_unknown_queues(cluster: Cluster, args: argparse.Namespace,
 #: `_browse`, and it can only do that safely if column 0 is a plain space. When
 #: it wrote over the *glyph* column instead it was overwriting the first byte of
 #: that cell's colour escape, and the row rendered as `❯[38;5;111m◐  node...`.
-#: One `<resource> free` per column, and the meter unlabelled beside the number
-#: it draws -- the same shape as the overview's table.
+#: One `<resource> free` per column, and no meter.
 #:
-#: It was `cpu | free | mem free | gpu`, with `cpu` over the meter and a bare
+#: It was `cpu | free | mem free | gpu`, with `cpu` over a meter and a bare
 #: `free` over the fraction beside it: "what does 'free' mean here? and then
 #: after that, you have 'mem free'. why so many frees?" The word was doing the
 #: work of three different labels, and none of the three said which resource it
 #: belonged to.
-NODE_HEADS = ["", "", "node", "state", "cpu free", "", "mem free", "gpu free",
-              "reason"]
-NODE_ALIGNS = ["left", "left", "left", "left", "right", "left", "right", "left",
-               "left"]
-NODE_LIMITS = [0, 0, 24, 18, 0, 0, 0, 0, 34]
+#:
+#: **The meter is gone from here too.** It survived the overview's by a couple
+#: of rounds on the argument that it drew the fraction printed beside it, which
+#: was true and still not enough: "inside each partition, the damn bar plot is
+#: still there. can you just remove it once and for all?" A forty-row listing
+#: of `110/128` next to `██████▉░` spends a column on a picture of a number the
+#: eye has already read, and the eighth-block glyphs put texture down every row
+#: of a table whose job is to be scanned.
+#: `cpu` is the processor the node actually has, and `jobs` how many are on
+#: it. Both were already in hand and neither was shown, so a node listing left
+#: most of a wide terminal blank: "all the space on the right side is wasted
+#: when going to each partition."
+#:
+#: They earn the space rather than filling it. The processor label comes free
+#: with the node -- `epyc-7702` against `gold-6248r` is the difference between
+#: two machines that both read `128 cores` -- and `jobs` previews the level
+#: that Right opens into, so a row says whether its busy half is one large job
+#: or twenty small ones before the reader steps in. Measured at 0.13s for all
+#: forty nodes of `amd`, from a job view this command has already fetched.
+#: **No reason column.** It was `reason`, then `why out` when a bare `reason`
+#: turned out to be a reason for *what*, and renaming it missed the point: the
+#: column is blank on every healthy row, and a listing is almost all healthy
+#: rows. `amd` has forty nodes and *one* with a reason, and unschedulable nodes
+#: sort last, so the row justifying the column is never on screen -- eleven
+#: visible rows of nothing under a heading, kept alive by a twelfth the reader
+#: cannot see. "why do we need it? it makes no sense."
+#:
+#: Nothing is lost. That a node is out is on the row already, twice: the `○`
+#: mark and the raw state. *Why* it is out is one keypress away in the node's
+#: own view, which prints the reason in full with the operator and timestamp
+#: split off -- and `health` exists to group those reasons across the whole
+#: cluster, which is the view for reading them in bulk.
+NODE_HEADS = ["", "", "node", "state", "cpu free", "mem free", "gpus free",
+              "cpu", "jobs"]
+NODE_ALIGNS = ["left", "left", "left", "left", "right", "right", "left",
+               "left", "right"]
+NODE_LIMITS = [0, 0, 24, 18, 0, 0, 0, 16, 0]
 
 
 def _interactive():
@@ -468,6 +499,22 @@ _STARTED: list[float] = []
 _IDLE_BACKOFF: list[int] = [0]
 _IDLE_FIRED: list[bool] = [False]
 
+#: The most a re-read may cost before the browse stops doing them by itself.
+#:
+#: The re-read runs on the thread that reads keypresses, so for its duration
+#: the view is frozen -- that is the whole cost being bounded here, and the
+#: `cost * 20` interval prices it proportionally: a one-second read refreshing
+#: every twenty is unresponsive for 5% of the time, which nobody notices.
+#:
+#: **It was 1.0 and this cluster reads in 1.05**, so auto-refresh was switched
+#: off by fifty milliseconds and the view sat on one reading until someone
+#: pressed `r`: "why can't it constantly providing the updated info?" Three
+#: seconds is where the frozen window stops being a rounding error -- a minute
+#: between refreshes with five percent of it dead -- and the case this protects
+#: is real: a 10,624-node PBS site measured at 70 seconds a read, where
+#: refreshing under the reader's hands would lock the view for 70s at a time.
+_REFRESH_COST_LIMIT = 3.0
+
 #: The longest an untouched browse will wait before re-reading. Five minutes:
 #: long enough to stop mattering, short enough that a reader coming back to a
 #: terminal is looking at something from this five minutes and the age line says
@@ -481,6 +528,39 @@ _IDLE_CAP = 300.0
 #: as a stack and a cursor map.
 _RESUME_STACK: list[tuple[str, str]] = []
 _RESUME_CURSORS: dict[tuple[str, str], int] = {}
+
+
+#: Collectors for `--json` payloads, innermost last. Empty in every normal run,
+#: so what this costs the CLI is one truth test.
+#:
+#: `nodetop mcp` pushes one for the duration of a tool call, because an MCP
+#: client wants the payload as a VALUE and the alternative -- a second set of
+#: builders assembling the same dictionaries for the protocol -- is the drift
+#: this package keeps paying for elsewhere (`_grid`/`_node_rows`, the browse
+#: repainting printed lines rather than re-rendering). There is exactly one
+#: JSON view per command and it is built inside that command, so the only way
+#: to reach it without duplicating it is to intercept where it lands.
+_JSON_SINK: list[list[object]] = []
+
+
+class _JsonCollector:
+    """Divert `--json` payloads to a list instead of stdout, for one call.
+
+    A context manager rather than a decorated generator so that `contextlib`
+    stays out of this module's import graph -- the same accounting that keeps
+    `json` itself out of it. See :func:`_print_json`.
+
+    Re-entrant by construction: the stack is a list and only its top is
+    written to, so a nested collection cannot steal an outer one's payloads.
+    """
+
+    def __enter__(self) -> list[object]:
+        self.payloads: list[object] = []
+        _JSON_SINK.append(self.payloads)
+        return self.payloads
+
+    def __exit__(self, *exc: object) -> None:
+        _JSON_SINK.pop()
 
 
 def _print_json(payload: object) -> None:
@@ -511,6 +591,12 @@ def _print_json(payload: object) -> None:
     command's output is byte-identical after this change -- which is exactly the
     kind of latent difference that surfaces the day a field is added.
     """
+    if _JSON_SINK:
+        # Handed over as an object, not as text a caller would have to parse
+        # back. The consumer is `nodetop mcp`; see `_JSON_SINK`.
+        _JSON_SINK[-1].append(payload)
+        return
+
     import json
 
     print(json.dumps(payload, indent=2, default=str))
@@ -655,7 +741,91 @@ class _Ticker:
         print(" " * self.width, end="\r", file=sys.stderr, flush=True)
 
 
-def _node_rows(nodes: Sequence, st: Style) -> list[list[object]]:
+#: Wire code -> the words a reader sees. The codes are the ``--json``
+#: ``excluded[].reason`` contract and the interactive selection keys, so they
+#: are frozen; the phrasing is not.
+#:
+#: **`no access` covers both ways of not having access, and that is the point.**
+#: The funnel used to split them: `no access` for what the queue *declares*
+#: (none of your accounts in its ``AllowAccounts``/``AllowGroups``, read off
+#: the queue and free), and a second term for what the scheduler *did* when a
+#: dry-run was actually submitted to a queue whose declared list named you.
+#: The distinction is real -- on this cluster the ACL filter takes 84 queues
+#: with room down to 19, and a dry-run then gets into 8 of those 19 -- and
+#: naming it on the headline was still wrong three times over.
+#:
+#: It answers a question nobody asked. A reader looking at this line wants to
+#: know why the table has eight rows; both groups answer that the same way,
+#: and "can't these 11 fucking ones go to 66 ones?" is the correct instinct.
+#: Every word tried for the second group failed the same way: `refused` and
+#: `denied` describe the cluster doing something *to* the reader, `not listed`
+#: names a Slurm field the reader has never seen, and `didn't work` invites
+#: exactly the question it cannot answer on one line -- "why do they not
+#: work?" The remedies do differ, so the split is kept where a reader has
+#: asked for it: per partition in the drill-down, and in ``--json``.
+_EXCLUSION_LABELS = {
+    "no access": "no access",
+    "refused": "no access",
+    "no nodes": "no nodes",
+    "down": "down",
+    "open": "open",
+}
+
+
+#: Wire code -> the specific reason, for the per-partition view.
+#:
+#: The funnel's term is deliberately coarse: two codes, one number, because on
+#: the headline they are one answer. **Here they must not be.** This is the
+#: level a reader opened *because* they wanted the breakdown, there is a column
+#: and a heading to say it in, and collapsing both to `no access` made the
+#: drill-down report "77 no access - 66 no access - 11 no access" and print
+#: one word down the whole `why` column. The distinction survives exactly
+#: where someone asked for it.
+#:
+#: `no account` is what the queue declares -- it takes accounts, and none of
+#: them is yours. `tried, no luck` is what happened when a job was actually
+#: submitted to a queue whose own list said you were fine; it is the group
+#: worth knowing about, because the remedy is a broken association rather than
+#: a new allocation.
+_REASON_LABELS = {
+    "no access": "no account",
+    "refused": "tried, no luck",
+    "no nodes": "no nodes",
+    "down": "down",
+    "open": "open",
+}
+
+
+def _exclusion_label(code: str) -> str:
+    """The funnel's term for this code -- coarse, and shared between codes."""
+    return _EXCLUSION_LABELS.get(code, code)
+
+
+def _reason_label(code: str) -> str:
+    """The specific reason this partition is out, for a per-partition view."""
+    return _REASON_LABELS.get(code, code)
+
+
+def _cpu_label(node) -> str:
+    """The processor this node advertises, or "".
+
+    Slurm features are a bag -- `['epyc-7702', '256g']` -- so the memory-shaped
+    and accelerator-shaped entries are dropped and what is left is the part
+    that names a chip. Nothing is invented: if no label survives, the cell is
+    empty rather than guessing.
+    """
+    drop = {(node.accelerator_label or "").lower()}
+    out = []
+    for label in node.labels:
+        low = label.lower()
+        if low in drop or re.fullmatch(r"\d+(g|gb|t|tb|m|mb)", low):
+            continue
+        out.append(label)
+    return out[0] if out else ""
+
+
+def _node_rows(nodes: Sequence, st: Style,
+               cluster: Cluster | None = None) -> list[list[object]]:
     """One table row per node, ranked-heat included.
 
     Extracted so `nodes` and `zoom` are the same table by construction rather
@@ -663,12 +833,33 @@ def _node_rows(nodes: Sequence, st: Style) -> list[list[object]]:
     the scars, which is why `_grid` exists -- and a zoom view whose columns
     disagree with the listing it zooms out to is worse than no zoom view.
     """
-    heat = dict(zip([n.name for n in nodes],
-                    heat_steps([n.effective_free_cpus for n in nodes]),
-                    strict=False))
+    # **One scale for the whole table: the share of this node that is free.**
+    #
+    # There were two. The core count was ranked across the listing with
+    # `heat_steps`, while memory and accelerators were coloured by each node's
+    # own share -- so one row could show `0/32` cores in a cold tone next to
+    # `5/250G` of memory in another, drawn from the same twelve colours on two
+    # incompatible scales, with nothing on screen to say which was which. The
+    # meter was worse: its LENGTH was the node's share and its COLOUR was the
+    # node's rank, so a single object measured two different quantities.
+    #
+    # Ranking is right for the queue tables, where free-core counts run from 0
+    # to 5120 and a linear map would crush the tail into one colour. It is
+    # wrong here: a share is already normalised, every row is asking the same
+    # question of the same denominator, and "how much of this node is free" is
+    # what a reader comparing two nodes actually wants compared.
     any_gpu = any(n.is_gpu_node for n in nodes)
     rows: list[list[object]] = []
     for n in nodes:
+        # `effective_free_cpus`, not `cpus_free`: the same argument as the
+        # unschedulable case below. A node with 44 of 48 cores idle and no
+        # allocatable memory left drew a nearly-full bright meter beside
+        # `0/180G`, which reads as the roomiest row on the screen and is the
+        # single most misleading thing this table could say. The claimed core
+        # count stays in the column beside it; the meter measures room.
+        cpu_share = ((n.effective_free_cpus / n.cpus_total)
+                     if n.cpus_total else 0.0)
+        cpu_step = heat_step(cpu_share)
         if not n.schedulable:
             mark, state = st.dim(st.g.off), st.dim(n.state_raw)
         elif n.degraded:
@@ -694,7 +885,7 @@ def _node_rows(nodes: Sequence, st: Style) -> list[list[object]]:
             # scanned column away from being the same character, and the
             # meaning of a shape would then differ between this table and the
             # three where `●`/`○` is a plain yes/no.
-            mark, state = st.tint(st.g.partial, heat[n.name]), n.state_raw
+            mark, state = st.tint(st.g.partial, cpu_step), n.state_raw
 
         # A dash, not the `·` used everywhere else for an empty cell. This
         # column says how many accelerators are free, and a node with none
@@ -727,46 +918,28 @@ def _node_rows(nodes: Sequence, st: Style) -> list[list[object]]:
                 )
             else:
                 accel = f"{n.gpus_free}/{n.gpus_total} {st.warn('UNKNOWN')}"
-        # A meter on CPU availability: the one resource every node has, and
-        # the last table in the tool without one.
+        # An unschedulable node's counts go grey rather than on the ramp.
         #
-        # Drawn flat and dim when the node is unschedulable, because a drained
-        # node still reports its full complement free and a bright full-length
-        # bar beside "8/8" reads as the roomiest row on the screen. It is
-        # phantom capacity -- the mark and the state say so, but a meter shouts
-        # louder than a glyph. The numbers are still shown: they are what the
-        # scheduler claims, and hiding them would be its own kind of lie.
-        # `effective_free_cpus`, not `cpus_free`: the same argument as the
-        # unschedulable case below. A node with 44 of 48 cores idle and no
-        # allocatable memory left drew a nearly-full bright meter beside
-        # `0/180G`, which reads as the roomiest row on the screen and is the
-        # single most misleading thing this table could say. The claimed core
-        # count stays in the column beside it; the meter measures room.
-        cpu_share = ((n.effective_free_cpus / n.cpus_total)
-                     if n.cpus_total else 0.0)
+        # A drained node still reports its full complement free, so tinting
+        # `8/8` by its share paints the roomiest colour on the screen onto
+        # phantom capacity -- the mark and the state say otherwise, but a
+        # colour carries further than a glyph. The numbers stay: they are what
+        # the scheduler claims, and hiding them would be its own kind of lie.
         if n.schedulable:
-            meter = bar(cpu_share, 8, st, step=heat[n.name])
-            cpus = st.tint(str(n.cpus_free), heat[n.name])
+            cpus = st.tint(str(n.cpus_free), cpu_step)
             mem = st.heat(str(n.memory_free_mb // 1024),
                           (n.memory_free_mb / n.memory_mb) if n.memory_mb else 0)
         else:
-            # Empty, not dim-but-full. Dimming is a colour, and with colour off
-            # a full-length bar beside "8/8" still reads as the roomiest row on
-            # the screen. The meter measures *room*, and an unschedulable node
-            # has none -- which is exactly what `Queue.effective_free_cpus`
-            # already says. The claimed counts stay in the column beside it.
-            meter = bar(0.0, 8, st, role="dim")
             cpus = st.dim(str(n.cpus_free))
             mem = st.dim(str(n.memory_free_mb // 1024))
+        running = len(cluster.jobs_on(n.name)) if cluster is not None else 0
         rows.append([
             " ", mark, n.name, state,
-            # The number, then the meter that draws it: same order as the
-            # overview's table, so one habit reads both.
             cpus + st.muted(f"/{n.cpus_total}"),
-            meter,
             mem + st.muted(f"/{n.memory_mb // 1024}G"),
             accel,
-            st.dim(n.reason) if n.reason else "",
+            st.muted(_cpu_label(n)),
+            st.muted(str(running)) if running else st.dim("0"),
         ])
     return rows
 
@@ -917,8 +1090,133 @@ def memory_gb(text: str) -> float:
     return float(m.group("n")) * _MEMORY_SCALE[m.group("unit").upper()]
 
 
+#: The height every level of one browse is drawn at, or 0 before a browse has
+#: set it.
+#:
+#: **It used to be the whole window, and that is what ate the scrollback.**
+#: Every level is padded to one height so the box does not jump as the reader
+#: moves between them -- that part is right, and was asked for: "whatever we
+#: choose in the ui, the window should stay the same and the text ... should
+#: dynamically get adjusted." What was wrong is which height. `term_height()`
+#: is up to thirty rows, and this cluster's overview is sixteen, so `nodetop`
+#: drew fourteen blank rows inside the border and pushed fourteen lines of the
+#: reader's terminal off the top to do it -- every single run, for nothing.
+#: "closing removing all the terminal history".
+#:
+#: So the height is the OVERVIEW's height, clamped to what the window can hold.
+#: Still one number for every level, so nothing jumps; deeper levels page
+#: inside it exactly as they already paged inside the larger one, and say so
+#: with their `15-29 of 44` position line. A frame is now as tall as the answer
+#: it is framing.
+def _fraction_cell(free: int, total: int, st: Style, unit: str = "") -> str:
+    """``1487/5120`` -- the figure coloured by how free it is, its total grey.
+
+    **One rule for colour in this table: a number's tone is its own share.**
+    There were two, and they produced the same two colours from different
+    reasons: every numerator was bright white *except* a zero node count,
+    which was grey -- so `0/1` and `42/48` differed in weight because one rule
+    said "numerator" and another said "non-zero". Add pink on the accelerator
+    models and the reading was fair: "the coloring is very randomly chosen ...
+    some use pink color, some use grey and some use bright white."
+
+    Colour now encodes the only thing in this table worth encoding, which is
+    how much of each resource is left. The heat ramp exists for exactly that
+    and had been left with nothing to do: removing the bars took away its last
+    call site, so the view went out in two greys and an accent. A denominator
+    is context, so it stays grey; descriptive text -- the node shape, the
+    walltime, the model list -- is grey for the same reason.
+
+    **No bar.** The overview carried a meter for a long time and it never
+    stopped costing more than it returned: it drew the wrong quantity twice,
+    took forty columns at one point, sat unlabelled, then under three headings
+    none of which could be defended. Widening the layout to the whole terminal
+    removed the last argument for it -- the numbers fit in full now, and a
+    fraction a reader can read needs no picture of itself. Meters remain where
+    they measure something a number cannot state as plainly: a single node's
+    CPU in `nodes`, a model's share in `accelerators`.
+    """
+    if not total:
+        return st.dim(st.g.dash)
+    return st.heat(str(free), free / total) + st.muted(f"/{total}{unit}")
+
+
+def _memory_gb(queue) -> tuple[int, int]:
+    """``(free, total)`` memory for one queue, in GB.
+
+    GB on both sides, always. A per-unit switch was tried -- TB above four
+    figures -- and it took the unit from one side and the number from the
+    other, rendering `5390/32.2G`; even corrected it makes the column
+    incomparable down its own length. GB is also the unit the reader is about
+    to type: `--mem` and `--mem-per-cpu` are megabytes or gigabytes, and
+    answering in terabytes hands back a conversion.
+    """
+    up = [n for n in queue.nodes if n.schedulable]
+    return (sum(n.memory_free_mb for n in up) // 1024,
+            sum(n.memory_mb for n in up) // 1024)
+
+
+def _models_cell(queue, st: Style, paint=None) -> str:
+    """Every accelerator model in the queue, named.
+
+    **No cap and no `+N`.** The cell was `models[:2]`, which dropped the `gpu`
+    partition's A100 in silence -- "it has a100, but why doesn't it show? a
+    bug?" -- and the first fix was a `+1` marker, which is no better: "how do
+    we know what +1 is". It is a count of things it will not name, which tells
+    the reader only that the cell is hiding something.
+
+    There is no need for either. These are short strings and there are rarely
+    more than three: `V100, RTX6000, A100` is nineteen columns, and the layout
+    takes the whole terminal now. If a window really is too narrow for them,
+    `table` clips the cell and leaves its own ellipsis, which says "there is
+    more here" in the one place the reader is already looking.
+    """
+    # Grey, like the other descriptive columns. It was `accent` -- pink --
+    # which put the loudest colour in the palette on the one column that
+    # carries no quantity, and left the reader hunting for the rule. There
+    # isn't one to find: accent belongs to the interactive cursor, so that a
+    # reader can see what they have selected, and to nothing else here.
+    paint = paint or st.muted
+    models = list(queue.accelerator_models)
+    return paint(", ".join(models)) if models else ""
+
+
+_FRAME_ROWS = [0]
+
+#: Columns every level of one browse is drawn at, or 0 before a browse has set
+#: it. The width counterpart of :data:`_FRAME_ROWS`, and the same argument:
+#: one number for every level so the box does not move, taken from the content
+#: rather than from the terminal.
+#:
+#: It was `term_width()` -- a hard 100 -- and the overview's content is 78, so
+#: the box carried twenty columns of empty margin at every level and on any
+#: terminal wide enough to allow it. "any reason why the overall ui area is too
+#: small": the area was not small, it was loose, and a box ruled out well past
+#: its content reads as an empty room whichever way the reader describes it.
+#:
+#: Widening it further would have made that worse, not better. There is no more
+#: to say on a partition row than 78 columns of it; the remedy for a box that
+#: does not fit its contents is never a bigger box.
+_FRAME_COLS = [0]
+
+
+
+def _frame_rows() -> int:
+    """Rows one frame of the current browse occupies, borders included."""
+    return _FRAME_ROWS[0] or term_height()
+
+
+def _frame_cols() -> int:
+    """Columns one frame of the current browse occupies, borders included."""
+    return _FRAME_COLS[0] or term_width()
+
+
+#: Scroll origin per browse level, so a window can stay put while the cursor
+#: moves inside it. Keyed by the caller's level name; see :func:`_window`.
+_SCROLL_TOP: dict[str, int] = {}
+
+
 def _window(data: list[str], index: int, st: Style,
-            reserved: int = 6) -> list[str]:
+            reserved: int = 6, key: str = "") -> list[str]:
     """``data`` trimmed to what fits, with a position line when it does not.
 
     **"14 above" was the wrong thing to say.** It answers a question nobody
@@ -947,22 +1245,53 @@ def _window(data: list[str], index: int, st: Style,
     # border. That is the stack of `╭────╮` lines a node listing used to grow,
     # one per repaint, at every terminal size. Subtracted here rather than
     # added to each caller's `reserved`, so no caller has to remember it.
-    room = max(1, term_height() - reserved)
+    room = max(1, _frame_rows() - reserved)
     if len(data) <= room:
+        _SCROLL_TOP.pop(key, None)
         return data
-    lo = max(0, min(index - room // 2, len(data) - room))
+    # **The window follows the cursor; it does not carry it.**
+    #
+    # This was `lo = index - room // 2`, which keeps the cursor pinned to the
+    # middle row -- so every press of Down slid the whole listing up by one
+    # while the cursor never moved, and walking to the last node meant reading
+    # a column of text that was in motion the entire way. "that > thing isn't
+    # at the very bottom when the app is scrolling down."
+    #
+    # Minimal scrolling instead, which is what a pager does: the window stays
+    # put while the cursor is inside it, and shifts by exactly as much as it
+    # takes to bring the cursor back to an edge. Walking down, the cursor
+    # reaches the bottom row and stays there with the rows moving under it;
+    # walking back up it settles on the top row the same way. The rows only
+    # move when they have to, and then by one.
+    #
+    # It needs the previous position, which is why this takes a `key`: one
+    # scroll origin per level of the browse, dropped when that level no longer
+    # needs one (above) so a shortened list cannot leave a stale offset behind.
+    lo = min(_SCROLL_TOP.get(key, 0), len(data) - room)
+    lo = max(0, min(lo, index))
+    if index >= lo + room:
+        lo = index - room + 1
+    _SCROLL_TOP[key] = lo
     shown = data[lo:lo + room]
     return [*shown, st.dim(f"{lo + 1}-{lo + len(shown)} of {len(data)}")]
 
 
-def _note(text: str, st: Style, indent: str = "  ") -> str:
+def _note(text: str, st: Style, indent: str = "  ",
+          size: int | None = None) -> str:
     """Dim explanatory prose, wrapped to the window.
 
     Every long sentence in the output goes through here. Printing prose raw is
     how a line ends up wider than the terminal, and a soft-wrapped explanation
     loses its indent and reads as new content.
+
+    ``size`` is for a note going INSIDE a panel, which is four columns
+    narrower than the window: two of border and two of padding. Wrapped to the
+    window instead, the last line of a note in a frame is the width of the
+    frame plus four, and the panel truncates it -- so the sentence lost its
+    final words at exactly the terminal sizes where it had the least room to
+    spare, and lost them silently.
     """
-    return st.dim(wrap_indent(text, indent=indent))
+    return st.dim(wrap_indent(text, indent=indent, size=size))
 
 
 #: Help text for flags that more than one subcommand takes.
@@ -1003,6 +1332,18 @@ def _add_global_args(parser: argparse.ArgumentParser, *, suppress: bool) -> None
         "--ascii", action="store_true", default=default,
         help="draw with ASCII only, for a terminal that cannot render UTF-8",
     )
+    _add_source_args(parser, suppress=suppress)
+
+
+def _add_source_args(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
+    """Where the facts come from: which batch system, or which recording.
+
+    Split out of :func:`_add_global_args` for ``mcp``, which needs exactly
+    these two and none of the rendering flags -- a protocol server has no
+    colour, no glyph set and no ``--json`` to opt into, so offering the other
+    three would be three flags that do nothing.  Fresh actions per call, for
+    the reason the caller's docstring gives.
+    """
     parser.add_argument(
         "--backend", default=argparse.SUPPRESS if suppress else None,
         metavar="NAME",
@@ -1295,6 +1636,14 @@ def build_parser() -> argparse.ArgumentParser:
     b = sub.add_parser("backends", help="which batch systems are usable here")
     _add_global_args(b, suppress=True)
 
+    # No `_add_global_args`: see `_add_source_args`. The dry-run throttle is
+    # configured through `NODETOP_MCP_PROBE_INTERVAL` rather than a flag,
+    # because an MCP server is launched by a client's config file and the
+    # `env` block is where that config puts knobs like this.
+    m = sub.add_parser(
+        "mcp", help="serve these reports to an AI agent over MCP (stdio)")
+    _add_source_args(m, suppress=True)
+
     sn = sub.add_parser("snapshot",
                         help="record this cluster's state for later analysis")
     _add_global_args(sn, suppress=True)
@@ -1416,6 +1765,29 @@ def _wrapped_by(name: str) -> str | None:
 STATUS_ROWS = 12
 
 
+def cmd_mcp(cluster: Cluster | None, args: argparse.Namespace, st: Style) -> int:
+    """Serve these reports over MCP instead of printing one of them.
+
+    ``cluster`` is always ``None`` and nothing is read here.  A server outlives
+    the state it describes, so the reading happens inside each tool call --
+    which is also why this returns before the snapshot the other commands share.
+    ``--backend`` and ``--replay`` are forwarded into every call rather than
+    applied once, so the recording or the forced backend holds for the session
+    without the server having to hold a `Cluster`.
+
+    Why any of this exists, and what it deliberately does not expose, is in
+    :mod:`nodetop.mcp`.
+    """
+    from .mcp import serve
+
+    extra: list[str] = []
+    if args.backend:
+        extra += ["--backend", args.backend]
+    if args.replay:
+        extra += ["--replay", args.replay]
+    return serve(extra=extra)
+
+
 def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     """The overview: one box, no prose.
 
@@ -1498,7 +1870,6 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         return 0
 
     term = cluster.queue_term
-    nodes = len(cluster.nodes)
     gpu_total = int(str(summary["accelerators_total"]))
     usable = cluster.usable_queues()
     ident = cluster.identity
@@ -1510,11 +1881,27 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # "358 GPUs, 117 free" above five partitions holding 230 of them -- the
     # same mixing of two populations that made `gpus` report a total nobody
     # could use.
-    # The tool and backend lead the facts line rather than sitting on a line of
-    # their own: now that the title is content instead of part of the border, a
-    # separate line for two words is a line spent on nothing.
-    facts = [f"{st.head('nodetop')} {st.dim(st.g.sep)} "
-             f"{st.accent(cluster.backend_name)}"]
+    # The tool leads the facts line rather than sitting on a line of its own:
+    # now that the title is content instead of part of the border, a separate
+    # line for one word is a line spent on nothing.
+    #
+    # **The backend's name is only here when it is news.** It sat on every
+    # header as `nodetop · slurm · youzhi`, and on any given machine it is a
+    # constant: "why putting ` · slurm · ` here? if it's not slurm, then what
+    # else will it be?" Autodetection found exactly one batch system and
+    # printing its name tells the reader something they cannot act on and
+    # could not have changed. It IS news in the two cases where it was not
+    # autodetected from the machine -- `--backend` overrode the detection, or
+    # `--replay` is reading somebody else's cluster out of a file -- because
+    # then it says which world the numbers below come from. `nodetop backends`
+    # answers the question on purpose, for anyone who has it.
+    # The tool names itself in the identity colour -- which is what `accent`
+    # is for, and what it was doing here until the backend name that carried
+    # it was dropped as noise. Bold white in its place left the whole line,
+    # and with it the whole view, in nothing but greys.
+    facts = [st.head("nodetop")]
+    if getattr(args, "backend", None) or getattr(args, "replay", None):
+        facts[0] += f" {st.dim(st.g.sep)} {st.accent(cluster.backend_name)}"
     if ident is not None and ident.user:
         facts.append(st.head(ident.user))
     # Nodes first, GPUs after. Only 91 of this cluster's 607 nodes have an
@@ -1735,43 +2122,47 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
 
 
     def order(q):
-        # Free CORES first -- not free nodes, and still not accelerators.
-        #
-        # Nodes remain the spine of this view: ranking by accelerators sorted a
-        # 607-node cluster by a property 85% of it lacks, and that stays fixed.
-        # The defect was the denominator. `effective_free_nodes` counts only
-        # *wholly* idle nodes, and on a busy cluster almost nothing is wholly
-        # idle, so any partition with a single job running reported zero room.
-        # It ranked `gn-bigmem` (128 free cores) above `amd` (2825) and
-        # drew `amd` as an empty meter. See Queue.effective_free_cpus.
+        """Most room first: free CORES, absolutely, not as a share.
+
+        **A share ranking answers a question nobody asked.** It put `build`
+        first with 42 free cores of 48, and `caslake` fifth with 1740 of 9120
+        -- forty times the room, four rows down. `build` is one node with a
+        six-hour ceiling. For anything a reader is likely to submit, the list
+        was ordered almost exactly backwards, and it looked authoritative
+        while doing it: "do you think ranking these partitions is a way to
+        tell users which partition is most available".
+
+        It got that way for a bad reason. The share sort was introduced so a
+        *bar* would descend monotonically down the column -- letting a
+        decoration choose the ordering of the data. The bar is gone; the sort
+        it dragged in outlived it by several changes.
+
+        Absolute free cores is the honest default: a core is the unit of room,
+        so the top of the list is the end with the most of it. It is still only
+        a default -- "most available" has no answer without a job, which is
+        exactly what `where` takes and ranks by. This view has no job, so it
+        declines to guess and reports the plainest proxy instead.
+
+        Free nodes would be worse, and was tried: `effective_free_nodes` counts
+        only WHOLLY idle machines, so on a busy cluster nearly everything
+        reports zero and the order collapses to the tiebreak.
+        """
+        # Accelerators break a tie in the core count, then the name, so an
+        # all-idle cluster does not come out alphabetical.
         return (-q.effective_free_cpus, -q.effective_free_gpus, q.name)
 
     def rows_for(queues):
         ranked = sorted(queues, key=order)
-        # Two ramps, one per magnitude column, each ranked within this table.
-        # The ramp means one thing in both places -- warmer is more of that
-        # resource than the other rows have -- so a warm row is where the room
-        # is, at a glance, without reading a single number.
+        # No ramp on this table. Both magnitude columns used to carry one, and
+        # hue left them with the rest of the quantity columns: the bar already
+        # states the same thing in a channel that is ordered, and a second
+        # encoding of it in hue was the reading the palette work removed.
         #
-        # Tone and bar length now measure the SAME quantity, on purpose. They
-        # used to differ (length was the row's own free share, tone was its
-        # free cores against the rest), and a row could then be long and cold
-        # or short and warm, which read as two contradictory answers to one
-        # question. One quantity, drawn twice, agrees with itself -- and how
-        # full a partition is in its own terms is what `idle` and `zoom` say.
-        core_heat = heat_steps([q.effective_free_cpus for q in ranked])
-        gpu_heat = heat_steps([q.effective_free_gpus for q in ranked])
-        # The bar measures the column the table is SORTED by, which it did not.
-        #
-        # It drew each partition's free *share* of its own capacity while the
-        # rows were ordered by absolute free cores, so the most prominent thing
-        # on the screen ran 27%, 41%, 28%, 45%, 100% down a list that was in
-        # perfect order -- "why rank the partitions in this way ... it looks a
-        # bit confusing". The eye reads a bar as the ordering, so the bar has to
-        # be the ordering. Share is still there, as its own number.
-        peak_free = max((q.effective_free_cpus for q in ranked), default=0)
+        # The bar measures the column the table is SORTED by -- which is now
+        # the composite, so it is both monotonic down the list and readable
+        # without anything off the row. See `order` and `_free_share`.
         out = []
-        for i, q in enumerate(ranked):
+        for q in ranked:
             cores = q.cpus_total
             free = q.effective_free_cpus
             out.append([
@@ -1783,15 +2174,48 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                 # The name leads. Seven numeric columns came first before, so
                 # a row had to be read to its end before it said what it was
                 # describing.
-                st.tint(q.name, core_heat[i]),
-                # `idle/total`, one column, same shape as the two beside it.
-                # `idle` rather than `free` on purpose: a node counts here only
-                # when it is WHOLLY free, which is a stricter claim than having
-                # room -- this partition routinely shows 0 while carrying two
-                # hundred free cores.
-                (st.head(str(q.effective_free_nodes))
-                 if q.effective_free_nodes else st.muted("0"))
-                + st.muted(f"/{len(q.nodes)}"),
+                #
+                # **Plain, deliberately.** It was painted on the heat ramp,
+                # which spends a categorical channel -- hue, the one thing the
+                # eye reads as identity -- on a quantity already stated twice
+                # in the same row, as a number and as a bar. The cost was
+                # exactly what a colour scale costs when it is applied to
+                # labels: on this cluster fourteen of twenty-two partition
+                # names came out the same blue, so the column that says WHICH
+                # ROW THIS IS read as a rainbow with repeats in it. A name is
+                # not larger or smaller than another name.
+                q.name,
+                # Four fractions, one shape each: the count, its total, and
+                # the bar that draws exactly that ratio. See `_fraction_cell`.
+                #
+                # `idle` rather than `free` for the node count, on purpose: a
+                # node counts here only when it is WHOLLY free, which is a
+                # stricter claim than having room -- this partition routinely
+                # shows 0 while carrying two hundred free cores. That makes it
+                # a narrow column, reading zero in seven of the eight
+                # partitions this account can reach, and it stays because the
+                # question it answers has no other short answer: work wanting a
+                # whole machine needs this number and cannot get it from a core
+                # count. It is not the column to read first, which is why it is
+                # no longer the only one here.
+                _fraction_cell(q.effective_free_nodes, len(q.nodes), st),
+                _fraction_cell(free, cores, st),
+                # Memory, which is the gate the node count was standing in
+                # front of. A job asks for cores *and* `--mem`, and this
+                # cluster refuses on the second constantly: 45 of caslake's 183
+                # usable nodes have no allocatable memory left while the
+                # partition still advertises 820 free cores.
+                # `effective_free_cpus` already knows -- it is why the number
+                # two cells along is not `cpus_free` -- but nothing on the row
+                # said what had eaten the difference.
+                #
+                # A partition TOTAL, in the same `free/total` shape as the
+                # cores beside it, because a row of totals that switches to a
+                # per-node figure halfway across is worse than either. It
+                # carries the same caveat the core count already carries: 5 TB
+                # free spread over 183 nodes will not run a job that wants it
+                # on one. `zoom` is per node, and `where --mem` does the fit.
+                _fraction_cell(*_memory_gb(q), st, unit="G"),
                 # `free/total` in one column, under a header that names the
                 # numerator.
                 #
@@ -1805,16 +2229,51 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                 # header carries the answer instead -- `cores free`, `gpu free`
                 # -- which is what makes the same form readable in the node
                 # table, and it costs two columns less width.
-                (st.tint(str(free), core_heat[i]) + st.muted(f"/{cores}")
-                 if cores else st.dim(st.g.dash)),
-                bar(free / peak_free if peak_free else 0.0, 10, st,
-                    step=core_heat[i]),
-                (st.tint(str(q.effective_free_gpus), gpu_heat[i])
-                 + st.muted(f"/{q.gpus_total}") if q.gpus_total
-                 else st.dim(st.g.dash)),
+                # **Not tinted.** It was painted on the row's rank across the
+                # list, which is what the bar beside it already drew, in its
+                # length and in its fill both -- one variable encoded three
+                # times in adjacent cells, the same waste the partition names
+                # were guilty of.
+                #
+                # The colour is the one to drop, not the bar. Length is a far
+                # more accurate channel for a quantity than hue or saturation
+                # (Cleveland & McGill rank position, then length, well above
+                # colour), so the cell that can only offer colour should not be
+                # the one trying to carry it. The number now says what it is
+                # worth -- an exact count over this partition's own capacity,
+                # which is a *different* denominator from the bar's -- and the
+                # bar says how that count compares to the rest of the list.
+                #
+                # `mem free` and `gpu free` keep their tint: they have no meter,
+                # so there the colour is the only proportional cue on offer.
+
                 # Empty, not a dash: `gpu free` already said this partition
                 # has none, and saying it twice on one row is noise.
-                st.muted(", ".join(list(q.accelerator_models)[:2])),
+                #
+                # `accent`, as in `nodes --gpu` and `accelerators`, where an
+                # accelerator model is already the identity hue. It was
+                # `muted` here, so the same fact wore a different colour in
+                # three views of one cluster -- and this view had ended up with
+                # no accent in it at all, which is measurable rather than a
+                # matter of taste: 71 of the roughly 100 painted runs on the
+                # screen were one of the four greys. A model name is the one
+                # categorical fact on the row, which is what `accent` is for.
+
+                # How long a job may run here -- a partition fact with no
+                # other home on this screen, and the one a reader checks
+                # before submitting anything long.
+                st.muted(format_duration(
+                    cluster.effective_max_walltime(q.name))),
+                # The accelerator pair goes LAST because it is the sparse
+                # pair: two of the eight partitions this account can reach
+                # have any, and twenty of the cluster's eighty-eight. Sitting
+                # mid-row they put a column of dashes and a column of blanks
+                # between `mem free` and `maxtime`, so the columns that are
+                # always populated could not be read as a block. Same
+                # reasoning that keeps the overview from ranking by
+                # accelerators at all.
+                _fraction_cell(q.effective_free_gpus, q.gpus_total, st),
+                _models_cell(q, st),
             ])
         return out
 
@@ -1835,16 +2294,83 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # The sort marker went with it. `free ↓` was read as part of the value, not
     # as an ordering -- "what does free down arrow mean?" -- and the bar already
     # descends monotonically, which says the same thing without a glyph.
-    heads = ["", term, "nodes idle", "cores free", "", "gpu free", "gpu model"]
-    aligns = ["left", "left", "right", "right", "left", "right", "left"]
-    # A hue per resource, so the eye groups the columns before it reads them:
-    # the two accelerator columns are one colour, cores and the meter beside
-    # them another, and the partition's own identity stays neutral. Drawn from
-    # the same ramp every number in this table uses, at its cold and warm ends
-    # -- a header in a colour the palette does not contain reads as decoration.
-    head_paint = [None, st.head, st.muted,
-                  lambda s: st.tint(s, 2), None,
-                  lambda s: st.tint(s, 9), lambda s: st.tint(s, 9)]
+    # **The meter gets a heading.** It was the one unlabelled column in the
+    # table -- `""` -- so the bars stood over nothing and said so: "nobody
+    # knows what the bar plot is."
+    #
+    # And it could not be inferred, because its denominator is the only one on
+    # the row that is not printed on the row: the bar draws this partition's
+    # free cores against the LARGEST free-core count in the list, which is why
+    # the top row is always full and the list descends. A reader who assumed it
+    # drew `cores free` -- the fraction immediately to its left -- would read
+    # `amd` as entirely free. Naming the denominator is the whole fix.
+    #
+    # "roomiest" rather than "peak" or "max": it is already the word this tool
+    # uses for the same idea, in `zoom`'s "roomiest first".
+    # `usable`: one word, no sign, and the bar is the whole cell.
+    #
+    # It was `free share`, which is two words needing a third -- share of what?
+    # -- and then `% usable` with the figure spelled out, which answered that
+    # but put a symbol in a column of plain words and digits. The word does the
+    # work on its own: a bar drawn against a visible empty track already reads
+    # as a proportion, so what it needed was never a number but a name for
+    # what the proportion is OF.
+    #
+    # "usable" rather than "free" because the fraction is deliberately smaller
+    # than the free-core ratio beside it, and a reader checking one against the
+    # other deserves a word that explains the gap: `amd` has a quarter of its
+    # cores free and a sixth of it usable, because memory runs out first.
+    # "free" next to `1354/5120` would read as an arithmetic error.
+    # `gpus free`, plural. It counted devices and said `gpu free`, which reads
+    # as either -- "when you say gpu free, is it gpu nodes free or gpu free?"
+    # `beagle3` is 44 nodes carrying 176 accelerators, so `36/176` is cards,
+    # and the only thing on the row that said so was the denominator being too
+    # large to be a node count. The plural says it instead, and parallels
+    # `nodes idle` two columns to the left, which counts nodes.
+    # No `per node` column. It printed one machine's shape as `48c/180G`, and
+    # a compressed unit nobody asked for is worse than the fact being absent:
+    # "what is 48c ot 32c? don't put these weird info on the ui." The question
+    # it answered is real -- `--mem` is per node, so a partition total cannot
+    # say whether one machine will take the job -- but the place to answer it
+    # is `zoom`, which lists the nodes themselves, not a cryptic pair on a row
+    # of plain fractions.
+    heads = ["", term, "nodes idle", "cores free", "mem free", "maxtime",
+             "gpus free", "gpu model"]
+    aligns = ["left", "left", "right", "right", "right", "right", "right",
+              "left"]
+    # ONE treatment for labels. No exception.
+    #
+    # `cores free` was bold white while its neighbours were the label grey --
+    # L* 87 against L* 69 -- to mark the column the table is sorted by. That is
+    # the same mistake as the ramp-step headers below, one step less obvious:
+    # a heading that differs from the headings either side of it reads as a
+    # different KIND of thing, and a reader who cannot see why goes looking.
+    # "why cores free has a different lightness than everything else? it looks
+    # very unformtable."
+    #
+    # It was also redundant. The rows are in descending order by that column
+    # and the meter beside it descends monotonically with them, so the sort is
+    # already stated twice by the data. Spending a third channel on it bought
+    # nothing and cost the header row its evenness.
+    #
+    # **One treatment, and it is not the data's treatment.** Levelling the row
+    # by making every heading the label grey went too far the other way: the
+    # grey is `muted`, which is also what the `/9033G` denominators wear, so
+    # the headings stopped being a tier and joined the table -- "the title
+    # should be different from the actual entries". Bold `text` for all of
+    # them: one step up in weight and in lightness from anything below, the
+    # same step for every column, and no hue spent, so the row reads as a
+    # label row without competing with the ramp underneath it.
+    #
+    # The headers used to be painted in ramp steps 2 and 9 -- "a hue per
+    # resource", so the eye would group the columns before reading them. Two
+    # things went wrong. Those are the colours of *values*, so `cores free`
+    # was drawn in the same azure as a mid-sized core count and `gpu free` in
+    # the same green as a large one, and a header read as a data cell that had
+    # drifted up a row. And the two accelerator headers, being one colour by
+    # design, were simply indistinguishable from each other. A column heading
+    # is a label; labels are told apart by the words in them.
+    head_paint = [None] + [st.head] * (len(heads) - 1)
 
     # The funnel. Every partition on the cluster is in exactly one of these
     # terms, so the line answers "why five rows" by arithmetic rather than by
@@ -1871,15 +2397,34 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # The same measure the table's `free` column uses, or the header and the
     # rows beneath it would disagree on one number.
     my_gpu_free = sum(n.effective_free_gpus for n in my_nodes if n.schedulable)
+    # **One population, and every number counted against it.**
+    #
+    # This line said `330 of 608 nodes, 324 up  ·  230 of 358 GPUs, 58 free`,
+    # and it is four numbers with two different denominators and no way to tell
+    # which belongs to which: "why 330 of 608 nodes? what does it mean? why 324
+    # up? are the rest of them down? why 58 free? what are the rest of them?"
+    # Every one of those questions is fair. `324 up` is 324 of the 330, not of
+    # the 608, and `58 free` is 58 of the 230, not of the 358 -- so the two
+    # totals on the line were the denominators of nothing on it, while the
+    # actual denominators were left implicit and the reader naturally reached
+    # for the number printed next to them.
+    #
+    # The cluster totals are gone. They answered "how much of this machine can
+    # I touch", which is a real question and not this line's: the funnel
+    # directly below accounts for all 88 partitions, and `nodetop gpus` states
+    # the cluster's accelerator total outright. What is left is your slice with
+    # its own denominators written out -- `324 of 330 nodes up` -- so each
+    # figure says what it is a fraction of.
+    # No possessive. It read `324 of your 330 nodes up`, and they are not the
+    # reader's nodes -- they are somebody else's hardware the reader is allowed
+    # to submit to, which is a different relationship and one the word got
+    # wrong: "don't use your. it's not mine." The bare fraction says everything
+    # the line needs and claims nothing. Which 330 is the funnel's job, one
+    # line below, and it says it by partition.
     scope = facts[:]
-    if len(my_nodes) == nodes:
-        scope.append(f"{plural(nodes, 'node')}, {my_up} up")
-    else:
-        scope.append(f"{len(my_nodes)} of {plural(nodes, 'node')}, {my_up} up")
+    scope.append(f"{my_up} of {plural(len(my_nodes), 'node')} up")
     if gpu_total:
-        seen = (f"{my_gpu} GPUs" if my_gpu == gpu_total
-                else f"{my_gpu} of {gpu_total} GPUs")
-        scope.append(st.muted(f"{seen}, {my_gpu_free} free"))
+        scope.append(st.muted(f"{my_gpu_free} of {my_gpu} GPUs free"))
     body[header_at] = f"  {st.dim(st.g.sep)}  ".join(scope)
 
     dead_count = len(cluster.unusable_queues())
@@ -1900,7 +2445,14 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # cursor column fills in as usual.
     terms: list[tuple[int, str]] = []
     if not args.all:
-        for count, why in ((not_entitled, "no access"), (refused, "refused"),
+        # The two access buckets are ONE term. They carry different wire codes
+        # -- and the drill-down and `--json` still separate them -- but they
+        # are one number here, because they are one answer to the question
+        # this line exists to answer. See `_EXCLUSION_LABELS`.
+        #
+        # Keyed on `no access`, which is the code the drill-down filter then
+        # matches; `refused` rows are picked up alongside it below.
+        for count, why in ((not_entitled + refused, "no access"),
                            (no_nodes, "no nodes"), (dead_count, "down")):
             if count:
                 terms.append((count, why))
@@ -2009,7 +2561,7 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
                    else st.head(whole))
                 + f"  {st.dim(st.g.sep)} " + mark(selected == "open") + head)
         for count, why in terms:
-            text = f"{count} {why}"
+            text = f"{count} {_exclusion_label(why)}"
             line += f"  {st.dim(st.g.sep)} " + mark(why == selected) + (
                 st.accent(text, bold=True) if why == selected else st.muted(text))
         return line
@@ -2029,11 +2581,42 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     for _, why in terms:
         selectable.append((funnel_at, "excluded", why))
 
+    # **No note under the funnel explaining one of its terms.** One was tried
+    # -- "11 look open on paper; a test job could not get in. check -q says
+    # why" -- because the merged `no access` term cannot say that some of its
+    # members passed the first filter. It deserved to go. This panel is the
+    # reading; a sentence annotating one count inside it is a footnote in the
+    # middle of the answer, and it was the longest line on the screen.
+    #
+    # The fact is not lost, it is only not here: opening the term says
+    # `no account` or `tried, no luck` for each partition, `check -q <name>`
+    # gives the control plane's own words, and `--json` carries both reason
+    # codes. A reader who wants the breakdown asks for it.
+
     def add_table(queues, cap, header=True):
         ranked = sorted(queues, key=order)
         rows = rows_for(queues)
         shown = rows if args.all else rows[:cap]
-        out = table(heads, shown, aligns, st, indent="", size=200, fit=False,
+        # `fit=False`, and the row is kept inside the window by the METER
+        # instead -- the row is kept inside the window by the table's own
+        # column limits. Handing `table` the real width with
+        # `fit=True` was tried and is worse: it shrinks every column
+        # proportionally, so a narrow terminal came out with `1423/903…` and a
+        # truncated bar. A digit cut in half is unreadable in a way a short bar
+        # is not, and the bar is the redundant one here: it draws the number
+        # printed immediately to its left.
+        # Laid out to the width it is drawn at, so `table` shrinks the column
+        # with the most slack -- the accelerator model list, the only
+        # variable-width text here -- instead of the panel cutting whatever
+        # happens to overflow. With `size=200, fit=False` a 100-column window
+        # got `pe…` for a heading and `48…` for a node shape.
+        out = table(heads, shown, aligns, st, indent="",
+                    size=term_width() - 4, fit=True,
+                    # Everything but the name and the model list is atomic: a
+                    # ratio, a node shape and a walltime all lose their meaning
+                    # rather than their length when clipped. See `table`.
+                    atomic=[False, False, True, True, True, True, True,
+                            False],
                     header_role="dim", header_paint=head_paint,
                     show_header=header, underline=False).splitlines()
         if header:
@@ -2137,7 +2720,11 @@ def cmd_status(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         return _browse(cluster, args, st, body, selectable, excluded,
                        shown_names, (funnel_at, render_funnel), title,
                        access_age, recheck)
-    print(panel(body, title, st))
+    # `shrink=False`: the static report takes the window too, so piping it or
+    # running it non-interactively gives the same box as browsing it. Sized to
+    # its content the border stopped wherever the widest row happened to end,
+    # which on a wide terminal is the "squeezed" reading again.
+    print(panel(body, title, st, size=term_width(), shrink=False))
     return 0
 
 
@@ -2195,6 +2782,23 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
     all_queues: list[tuple[str, str]] = (
         [(name, "open") for name in shown] + list(excluded))
 
+    # The one height every level is drawn at, taken from the overview rather
+    # than from the window. See `_FRAME_ROWS`. The four spare rows are the two
+    # borders plus room for the two timestamp lines `framed` may add, so the
+    # box does not change height the moment the reading goes stale -- which
+    # would be the jumping the fixed height exists to prevent.
+    _FRAME_ROWS[0] = min(term_height(), max(MIN_HEIGHT, len(body) + 4))
+    # And the one width: the window's, in full.
+    #
+    # This was the widest line's width instead, which keeps the border tight
+    # against the content and leaves the rest of a wide terminal empty. Asked
+    # for and rejected: "i think the app should take the entire hortizontal
+    # space. the current one looks so squeezed and unnatural." A box that ends
+    # at column 82 of a 200-column window does look like a thing that failed
+    # to open. So the frame takes the window, and the meter takes the slack --
+    # so the columns have room to be shown in full rather than clipped.
+    _FRAME_COLS[0] = term_width()
+
     def visible(rows: list[str], index: int) -> list[str]:
         """``rows``, trimmed to a window around ``index`` that fits the screen.
 
@@ -2229,7 +2833,7 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         #
         # Three lines of the frame are not rows: its two borders and the
         # position line appended below.
-        room = max(1, term_height() - chrome - 3)
+        room = max(1, _frame_rows() - chrome - 3)
         if room >= total:
             return rows
         # `index` is an entry in `selectable`; the window is over rows, so it is
@@ -2274,7 +2878,8 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
 
     funnel_at, render_funnel = funnel
 
-    def framed(content: Sequence[str]) -> list[str]:
+    def framed(content: Sequence[str], openable: bool = True,
+               escapable: bool = True) -> list[str]:
         """Every view in the same box, whatever it happens to hold.
 
         The frame used to size itself to its content, so stepping from an
@@ -2284,14 +2889,18 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         ui, the window should stay the same and the text and information getting
         displayed should dynamically get adjusted."
 
-        So the box comes from :func:`term_width` and :func:`term_height` -- the
-        same two numbers for every level -- and content is padded up to it
+        So the box comes from :func:`term_width` and :func:`_frame_rows` --
+        the same two numbers for every level -- and content is padded up to it
         rather than letting the border close early. Over-long content is
         truncated here as a backstop: the viewport helpers size themselves from
         the same two numbers, and a frame taller than its own box is what makes
         the repaint destructive.
+
+        The height is the overview's, not the window's. See `_FRAME_ROWS` for
+        why: padding to the window spent fourteen rows of the reader's terminal
+        on blank lines inside a border.
         """
-        rows = term_height()
+        rows = _frame_rows()
         # The age of the reading, at the bottom of every level, once it is old
         # enough to matter. This is the one line in the frame that is not part
         # of the report: a browse renders a single snapshot for as long as it is
@@ -2302,34 +2911,38 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         # Silent under five seconds, and silent on a replay -- there the header
         # already dates the recording, and "read 6 days ago" twice on one screen
         # is the sort of repetition this view keeps being trimmed for.
-        stamp: list[str] = []
-        if cluster.taken_at is not None and not cluster.replayed:
-            age = (datetime.now() - cluster.taken_at).total_seconds()
-            if age >= 5:
-                # Seconds below a minute, `format_age` above it. That helper
-                # bottoms out at "<1m", which is the whole interesting range
-                # here: a browse goes stale in seconds, not in hours.
-                label = f"{int(age)}s" if age < 60 else format_age(age)
-                stamp = [st.dim(f"read {label} ago"
-                                f"  {st.g.sep}  r re-reads")]
-        # And when the ACCESS answer is older than the reading, say that too.
+        # **The footer tells you how to drive it.**
         #
-        # It is a different clock: the numbers came from the queries just now,
-        # but which partitions are listed at all came from the last run's
-        # dry-runs, because waiting 1.6s for them before drawing anything is the
-        # thing this trades away. A recheck is already running; this line says
-        # what is on screen meanwhile, and disappears the moment the recheck
-        # agrees or the browse reloads with a fresh answer.
-        if access_age is not None and access_age >= 5:
-            checked = (f"{int(access_age)}s" if access_age < 60
-                       else format_age(access_age))
-            note = "re-checking" if recheck is not None and not recheck.done.is_set() \
-                else "confirmed"
-            stamp = [*stamp, st.dim(f"access checked {checked} ago"
-                                    f"  {st.g.sep}  {note}")]
+        # It used to carry two clocks -- `read 8s ago  ·  r re-reads` and
+        # `access checked 8s ago  ·  confirmed` -- and both were bookkeeping:
+        # true, dull, and about the tool's own internals rather than about the
+        # cluster or about what the reader can do next. "i don't like this
+        # message shown here ... i think we should guide users how to use the
+        # app. up and down arrows to move around etc."
+        #
+        # Nothing else on the screen says the view is navigable. A reader who
+        # does not know that arrows move a cursor sees a static table and quits
+        # -- which is the one failure mode a key hint prevents and a timestamp
+        # never could. And the timestamps mattered most when the view could
+        # only be refreshed by hand; it now re-reads itself every few seconds
+        # (see `_REFRESH_COST_LIMIT`), so the age they reported is rarely more
+        # than the interval.
+        #
+        # Only the keys that do something HERE. `openable` is False at a leaf
+        # and there is nothing to step back to at the root, so offering either
+        # would be offering a key that does nothing -- which is how a reader
+        # decides the hints are decoration and stops reading them.
+        keys = [f"{st.head(st.g.arrow_pair)} {st.dim('move')}"]
+        if openable:
+            keys.append(f"{st.head(st.g.arrow)} {st.dim('open')}")
+        if escapable:
+            keys.append(f"{st.head(st.g.arrow_back)} {st.dim('back')}")
+        keys.append(f"{st.head('r')} {st.dim('refresh')}")
+        keys.append(f"{st.head('q')} {st.dim('quit')}")
+        stamp = [f"  {st.dim(st.g.sep)}  ".join(keys)]
         body = list(content)[: rows - 2 - len(stamp)]
         body += [""] * (rows - 2 - len(stamp) - len(body))
-        return panel(body + stamp, title, st, size=term_width(),
+        return panel(body + stamp, title, st, size=_frame_cols(),
                      shrink=False).splitlines()
 
     def partition_frame(index: int) -> list[str]:
@@ -2366,7 +2979,7 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         key = (queue.name if queue is not None else "", term_width())
         built = frames.get(key)
         if built is None:
-            rows = _node_rows(nodes, st)
+            rows = _node_rows(nodes, st, cluster)
             lines = table(NODE_HEADS, rows, NODE_ALIGNS, st, indent="",
                           limits=NODE_LIMITS, header_role="dim",
                           underline=False).splitlines()
@@ -2381,7 +2994,7 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         # to come back clean for the next keypress.
         data = list(rendered)
         highlight(data, index)
-        shown = _window(data, index, st)
+        shown = _window(data, index, st, key=f"nodes:{queue.name}")
         facts = [st.head(queue.name),
                  st.muted(f"{len(nodes)} nodes"),
                  st.muted(f"{with_room} with room")]
@@ -2428,7 +3041,12 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
             # Wrapped to the frame, never truncated: the whole point of being
             # here. The operator and timestamp follow it rather than sitting
             # inside it, because they are who to ask, not what is wrong.
-            room = term_width() - 6
+            # The FRAME's width, not the window's: these lines are drawn
+            # inside the box, and wrapping them to the terminal is what
+            # makes the panel truncate the overflow -- which in this view
+            # means an ellipsis through the one thing it exists to show
+            # whole. See `_FRAME_COLS`.
+            room = _frame_cols() - 6
             body_text = wrap_indent(text, indent="", size=room)
             out.append("")
             for i, line in enumerate(body_text.splitlines()):
@@ -2496,7 +3114,13 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
 
         rows = [[
             " ",
-            st.tint(j.id, heat[i]),
+            # The job id is a NAME. It was painted on the heat ramp, which is
+            # the same mistake the partition column was making: an identifier
+            # coloured by a quantity, so two unrelated jobs that happen to
+            # hold a similar number of cores come out the same colour and the
+            # column reads as a code the reader has to crack. The core count
+            # is one cell away and is tinted.
+            j.id,
             j.user,
             st.muted(j.account),
             cell(share.cpus if (share := shares[i]) else 0, i, tint=True),
@@ -2528,7 +3152,8 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
         head, data = lines[0], lines[1:]
         highlight(data, index)
         detail = node_detail(node, jobs)
-        shown = _window(data, index, st, reserved=5 + len(detail))
+        shown = _window(data, index, st, reserved=5 + len(detail),
+                        key=f"jobs:{node.name}")
         return framed([*detail, "", head, *shown])
 
     def reason_frame(index: int, entries: Sequence[tuple[str, str]],
@@ -2549,28 +3174,38 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
             tone = {"down": st.bad, "refused": st.warn,
                     "open": st.ok}.get(why, st.muted)
             rows.append([
-                " ", name, tone(why),
+                " ", name, tone(_reason_label(why)),
                 st.muted(str(len(q.nodes))) if q else "",
                 st.muted(str(q.cpus_total)) if q and q.cpus_total else "",
-                st.muted(", ".join(list(q.accelerator_models)[:2])) if q else "",
+                _models_cell(q, st, paint=st.muted) if q else "",
             ])
         lines = table(["", cluster.queue_term, "why", "nodes", "cores",
                        "models"], rows,
                       ["left", "left", "left", "right", "right", "left"], st,
-                      indent="", limits=[0, 22, 12, 0, 0, 22],
+                      indent="", limits=[0, 22, 14, 0, 0, 22],
                       header_role="dim", underline=False).splitlines()
         head, data = lines[0], lines[1:]
         highlight(data, index)
-        shown = _window(data, index, st)
+        shown = _window(data, index, st, key=f"reasons:{heading}")
         facts = [st.head(heading)]
         if len(by_reason) > 1:
-            facts += [st.muted(f"{n} {w}") for w, n in by_reason.items()]
+            facts += [st.muted(f"{n} {_reason_label(w)}")
+                      for w, n in by_reason.items()]
         return framed([f"  {st.dim(st.g.sep)}  ".join(facts), "", head, *shown])
+
+    #: Wire codes a single funnel term stands for. `no access` is one count on
+    #: the line and two reasons underneath it, so opening it has to bring both
+    #: -- otherwise the term says 77 and shows 66, which is the arithmetic the
+    #: funnel exists to keep.
+    term_codes = {"no access": ("no access", "refused")}
+
+    def _under(only: str) -> tuple[str, ...]:
+        return term_codes.get(only, (only,))
 
     def excluded_frame(index: int, only: str = "") -> list[str]:
         """The partitions the funnel counted out, optionally one reason's worth."""
-        chosen = [e for e in excluded if not only or e[1] == only]
-        heading = (f"{len(chosen)} {only}" if only
+        chosen = [e for e in excluded if not only or e[1] in _under(only)]
+        heading = (f"{len(chosen)} {_exclusion_label(only)}" if only
                    else f"{len(chosen)} not in the list")
         return reason_frame(index, chosen, heading)
 
@@ -2632,7 +3267,9 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                 f"  {st.dim(st.g.sep)}  ".join(x for x in (used, left) if x))))
         if len(job.nodes) > 1:
             pairs.append(("nodes", st.muted(cluster.format_nodelist(job.nodes))))
-        out += ["", *kv(pairs, st, indent="", size=term_width() - 6).splitlines()]
+        # The frame's width -- same reason as the reason block above.
+        out += ["", *kv(pairs, st, indent="",
+                        size=_frame_cols() - 6).splitlines()]
         return framed(out)
 
     # One raw-mode block, one screen, and an explicit stack.
@@ -2667,10 +3304,23 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
             cursors = dict(_RESUME_CURSORS)
             _RESUME_STACK.clear()
             _RESUME_CURSORS.clear()
-        # How long a re-read costs decides whether one happens by itself. A
-        # cluster that answers in 70 seconds -- measured, on a 10,624-node PBS
-        # site -- must never refresh under the reader's hands; one that answers
-        # in 70 milliseconds may as well stay current. `r` works either way.
+        # How long a re-read costs decides whether one happens by itself, and
+        # how often. A cluster that answers in 70 seconds -- measured, on a
+        # 10,624-node PBS site -- must never refresh under the reader's hands,
+        # because the re-read happens on this thread and keypresses are dead
+        # for its duration; one that answers in 70 milliseconds may as well
+        # stay current. `r` works either way.
+        #
+        # **The cutoff was 1.0s and this cluster reads in 1.05.** So the view
+        # that prompted "why can't it constantly providing the updated info?"
+        # had auto-refresh switched off by fifty milliseconds -- an arbitrary
+        # cliff, not a policy. The real cost of refreshing is the dead-input
+        # window, and the `cost * 20` interval below already prices that
+        # proportionally: a 1s read refreshes every 21s and is unresponsive for
+        # 1s of them, which is 5% and imperceptible; the 70s site would be
+        # unresponsive for 70s, which is not. Three seconds is where that stops
+        # being a rounding error -- a minute between refreshes, 5% of it
+        # frozen -- and beyond it `r` stays the only way.
         # The measured turnaround if there is one -- this is the second pass
         # through a reload -- and the load time as the opening estimate.
         # The rebuild is over: everything from here is the reader's own time, so
@@ -2679,7 +3329,9 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
             _TURNAROUND[:] = [time.monotonic() - _STARTED[0]]
             _STARTED.clear()
         cost = max([cluster.load_seconds or 0.0] + _TURNAROUND[-1:])
-        idle = None if cluster.load_seconds is None or cost > 1.0 else max(5.0, cost * 20)
+        idle = (None if cluster.load_seconds is None
+                or cost > _REFRESH_COST_LIMIT
+                else max(5.0, cost * 20))
         # A background access recheck turns the idle timeout into a poll: short
         # enough that a changed answer reaches the screen in well under a
         # second, and `on_idle` is what stops every expiry from becoming a
@@ -2774,7 +3426,8 @@ def _browse(cluster: Cluster, args: argparse.Namespace, st: Style,
                 cursors[where] = got
                 stack.append(("nodes", all_queues[got][0]))
             elif kind == "excluded":
-                subset = [e for e in excluded if not payload or e[1] == payload]
+                subset = [e for e in excluded
+                          if not payload or e[1] in _under(payload)]
 
                 def draw_excluded(i: int, only: str = payload) -> list[str]:
                     return excluded_frame(i, only)
@@ -2893,9 +3546,11 @@ def cmd_queues(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     # its DEAD block deleted. A command whose rows are places you might submit
     # to should not lead with the places you cannot.
     #
-    # Ranked by free cores inside each group, for the same reason `status` is: a
-    # core is the unit of room, and it makes the top of the list the useful end.
-    # Blocked queues keep name order -- there is no room to rank them by.
+    # Ranked by free cores inside each group, the same ordering `status` uses,
+    # so one habit reads both listings -- and absolutely, not as a share: see
+    # the `order` docstring in `_where` for why a share ranking put a
+    # one-node partition above one with forty times the room. Blocked queues
+    # keep name order; there is nothing to rank them by.
     queues.sort(key=lambda q: (
         not q.usable, -q.effective_free_cpus if q.usable else 0, q.name))
 
@@ -2990,7 +3645,6 @@ def _queues_table(cluster: Cluster, queues: list, st: Style,
             # matters is where it sends work, which belongs in the note column
             # rather than in a capacity slot it has no value for.
             summary = st.info(f"{st.g.arrow} " + ",".join(q.forwards_to))
-            capacity = ""
             nodes_up = st.dim(st.g.dash)
             idle: object = st.dim(st.g.dash)
         else:
@@ -3003,8 +3657,6 @@ def _queues_table(cluster: Cluster, queues: list, st: Style,
             # because work wanting a whole node still needs that number.
             total = len(q.nodes)
             cores = q.cpus_total
-            capacity = bar((q.effective_free_cpus / cores) if cores else 0.0,
-                           8, st, step=heat[q.name])
             nodes_up = f"{schedulable}/{total}"
             # The number beside the meter must BE what the meter measures.
             # This held the wholly-idle node count while the bar showed core
@@ -3016,11 +3668,12 @@ def _queues_table(cluster: Cluster, queues: list, st: Style,
         gpus = (f"{q.effective_free_gpus}{st.muted('/' + str(q.gpus_total))}"
                 if q.gpus_total else st.dim(st.g.dash))
         rows.append([
-            # Number then meter, and `free/total` in one cell: the same shape
-            # the overview uses, so one habit reads both tables.
-            mark, q.name, st.muted(q.state_raw), nodes_up, idle, capacity, gpus,
+            # The counted columns together, then the meter that summarises
+            # them, then the scheduler's own prose -- the same order as the
+            # overview, so one habit reads both tables.
+            mark, q.name, st.muted(q.state_raw), nodes_up, idle,
             format_duration(cluster.effective_max_walltime(q.name)),
-            summary,
+            gpus, summary,
         ])
     facts = [f"{len(queues)} shown",
              f"{sum(1 for q in queues if q.usable)} usable"]
@@ -3028,15 +3681,16 @@ def _queues_table(cluster: Cluster, queues: list, st: Style,
         facts.append(f"{hidden_queues} not on your allowlist")
     print(section(f"{term}s", st, ", ".join(facts)))
     print(_grid(
-        ["", term, "state", "nodes up", "cores free", "", "gpu free",
-         "maxtime", "blocked by"],
+        # No meter here either -- see `_fraction_cell`.
+        ["", term, "state", "nodes up", "cores free", "maxtime",
+         "gpus free", "blocked by"],
         rows,
-        ["left", "left", "left", "right", "right", "left", "right", "left",
-         "left"],
+        ["left", "left", "left", "right", "right", "left", "right", "left"],
         st, indent="  ", limits=[0, 22, 12, 0, 0, 0, 0, 0, 26],
-        head_paint=[None, st.head, st.muted, st.muted,
-                    lambda s: st.tint(s, 2), None,
-                    lambda s: st.tint(s, 9), st.muted, st.muted],
+        # Bold, all of them, none singled out -- see the header note in
+        # `_where` for why the sorted column is not marked, why these are not
+        # ramp steps, and why the label grey was not enough.
+        head_paint=[None] + [st.head] * 8,
     ))
     print()
     print(_note(f"zoom <{term}> lists the nodes inside one", st))
@@ -3056,7 +3710,13 @@ def _queues_detail(cluster: Cluster, queues: list, st: Style) -> None:
               f"{st.dim('[' + tag + ']')}")
 
         schedulable = len([n for n in q.nodes if n.schedulable])
-        node_note = gauge(schedulable, len(q.nodes), 14, st, "schedulable")
+        # A fraction, not a gauge. Meters are gone from every view -- the
+        # overview, the queue listing and the node listing in turn -- and a
+        # detail block that keeps one is the third place a reader has to be
+        # told they were removed. "can you just remove it once and for all?"
+        node_note = (st.heat(str(schedulable), schedulable / len(q.nodes)
+                             if q.nodes else 0)
+                     + st.muted(f"/{len(q.nodes)} schedulable"))
         if q.unresolved_nodes:
             node_note += st.warn(
                 f"  {st.g.warn} +{q.unresolved_nodes} claimed but unresolved"
@@ -3089,7 +3749,9 @@ def _queues_detail(cluster: Cluster, queues: list, st: Style) -> None:
         print(kv([
             ("nodes", node_note),
             ("idle", idle),
-            ("accel", gauge(q.effective_free_gpus, q.gpus_total, 14, st, "free")
+            ("accel", (st.heat(str(q.effective_free_gpus),
+                               q.effective_free_gpus / q.gpus_total)
+                       + st.muted(f"/{q.gpus_total} free"))
              if q.gpus_total else st.dim("none")),
             ("models", ", ".join(f"{k}x{v}" for k, v in q.accelerator_models.items())
              or st.dim("none")),
@@ -3349,7 +4011,7 @@ def cmd_zoom(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
     nodes = sorted(nodes, key=lambda n: (not n.schedulable,
                                          -n.effective_free_gpus,
                                          -n.effective_free_cpus, n.name))
-    rows = _node_rows(nodes, st)
+    rows = _node_rows(nodes, st, cluster)
     limit = None if args.all else max(1, args.top)
     visible = rows if limit is None else rows[:limit]
     print(_grid(NODE_HEADS, visible, NODE_ALIGNS, st, indent="  ",
@@ -3486,7 +4148,7 @@ def cmd_nodes(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         } for n in nodes])
         return 0
 
-    rows = _node_rows(nodes, st)
+    rows = _node_rows(nodes, st, cluster)
     matched = len(nodes)
     total = len(cluster.nodes)
     # Not `accel`: that name is the GPU *cell* in the row loop above, and
@@ -3583,10 +4245,22 @@ def cmd_health(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         return 0
 
     total = len(cluster.nodes)
+
+    def _count(number: int, paint) -> str:
+        """A verdict colour only when there is a verdict to give.
+
+        `0 degraded` was painted amber and `0 out` red, so a perfectly healthy
+        cluster drew the two alarm colours on its headline and the reader had
+        to go and read the digit to find out nothing was wrong. Amber and red
+        are the loudest things in this palette; spending them on a zero is
+        what teaches someone to stop looking at them.
+        """
+        return paint(str(number)) if number else st.muted("0")
+
     print(panel([
         f"{st.ok(str(total - len(down)))} schedulable   "
-        f"{st.dim(st.g.sep)}   {st.warn(str(len(degraded)))} degraded   "
-        f"{st.dim(st.g.sep)}   {st.bad(str(len(down)))} out   "
+        f"{st.dim(st.g.sep)}   {_count(len(degraded), st.warn)} degraded   "
+        f"{st.dim(st.g.sep)}   {_count(len(down), st.bad)} out   "
         f"{st.dim(st.g.sep)}   {total} total",
     ], "node health", st))
 
@@ -3986,7 +4660,7 @@ def _render_placements(
 
     note = f"{plural(len(places), term)} considered"
     if turned_away:
-        note += f"  {st.g.sep}  {turned_away} refused you"
+        note += f"  {st.g.sep}  {turned_away} would not take it"
     print(section("placements", st, note))
     print(_grid(headers, rows, aligns, st, indent="  ", limits=limits))
     print()
@@ -4437,9 +5111,9 @@ def cmd_check(cluster: Cluster, args: argparse.Namespace, st: Style) -> int:
         print()
         print(section("the submit filter and the scheduler disagree", st))
         print(_note(
-            "The site filter reported PASSED for these and the scheduler refused "
-            "them anyway. Reading only the filter's verdict gives the opposite of "
-            "the truth.", st))
+            "The site filter reported PASSED for these and the scheduler would "
+            "not take them anyway. Reading only the filter's verdict gives the "
+            "opposite of the truth.", st))
         print(tree([(st.bad(r.queue), r.reason) for r in disagree], st))
 
     # A category is a bucket, and for an unanswered probe the bucket is
@@ -4779,7 +5453,7 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
             rows.append([
                 st.warn(model), st.dim(st.g.dash), st.dim(st.g.dash),
                 st.dim(st.g.dash),
-                count, gauge(free, total, 9, st),
+                count, _fraction_cell(free, total, st),
                 st.dim("unknown"), st.dim("unknown"), st.muted(homes(group)),
             ])
             continue
@@ -4798,7 +5472,7 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
         mem = (st.dim(">=") if not exact else "") + f"{floor}G"
         rows.append([
             st.accent(spec.model), spec.vendor, spec.arch, mem, count,
-            gauge(free, total, 9, st),
+            _fraction_cell(free, total, st),
             st.ok("yes") if spec.bf16 else st.dim("no"),
             st.ok("yes") if spec.fp8 else st.dim("no"),
             st.muted(homes(group)),
@@ -4853,15 +5527,17 @@ def cmd_accelerators(cluster: Cluster, args: argparse.Namespace, st: Style) -> i
     for cap in _CAPABILITIES:
         total, free = reach[cap]
         labels[cap] = f"{total}/{identified}" + (f" {st.g.sep} {free} free" if total else "")
-    window = term_width()
-    widest = max(width(v) for v in labels.values())
-    bar_w = max(6, min(18, window - 2 - 6 - 2 - widest))
+    # The label and nothing else. `labels` already spells out
+    # `190/230 · 47 free`, so the bar was a second drawing of a figure printed
+    # immediately to its right -- and the count I first replaced it with was a
+    # third: `190 of 230  ·  190/230 · 47 free`.
     for cap in _CAPABILITIES:
         total, _ = reach[cap]
         share = (total / identified) if identified else 0.0
+        figure, _, rest = labels[cap].partition(" ")
         print(
             f"  {st.dim(cap.replace('_attention', '').ljust(6))} "
-            f"{bar(share, bar_w, st)} {st.dim(labels[cap])}"
+            f"{st.heat(figure.rjust(9), share)} {st.dim(rest)}"
         )
     if unknown:
         print()
@@ -5168,6 +5844,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "backends":
         return cmd_backends(None, args, st)
 
+    # Before the replay branch, not after: `mcp --replay` configures the
+    # SERVER, and letting the branch below load that snapshot here would
+    # dispatch one command against one reading -- the opposite of a server
+    # that re-reads per call.
+    if command == "mcp":
+        return cmd_mcp(None, args, st)
+
     if args.replay:
         try:
             backend, name, captured = _load_replay(args.replay)
@@ -5269,8 +5952,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         # convention for SIGINT, and the newline closes whatever partial line
         # the progress ticker had written so the prompt does not land in it.
         try:
+            # **Nothing is printed while the first read happens.**
+            #
+            # A `reading <backend>` line lived here, added because a cold start
+            # shows the reader's shell history and nothing else for up to 1.7
+            # seconds and that is indistinguishable from a hang. It went on two
+            # counts. On a reload it landed *below* the standing frame, outside
+            # the border, because `paint` leaves the cursor there -- "even
+            # outside of the box? it looks very ugly" -- and gating it to
+            # startup only left it as an unwanted flash before the report:
+            # "when starting nt, the message is also shown, which is
+            # unpleasant."
+            #
+            # So the wait is silent. It is also short: the read is ~0.25s warm
+            # here, and the frame that follows is the feedback.
             cluster = Cluster.load(
-                backend, with_free_times=command in {"where", "fit", "status"})
+                backend,
+                with_free_times=command in {"where", "fit", "status"})
             if bad := _reject_broken_snapshot(cluster, command):
                 return bad
             if bad := _reject_unknown_queues(cluster, args, st):
@@ -5278,6 +5976,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             started = time.monotonic()
             _STARTED[:] = [started]
             rc = _COMMANDS[command](cluster, args, st)
+            # The browse's frame size does not outlive the browse: the next
+            # command, or the next pass of this loop, measures its own content.
+            # See `_FRAME_ROWS` and `_FRAME_COLS`.
+            _FRAME_ROWS[0] = _FRAME_COLS[0] = 0
             if _STARTED:
                 # No browse opened, so the whole command was the rebuild.
                 _TURNAROUND[:] = [time.monotonic() - started]

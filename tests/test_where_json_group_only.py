@@ -43,7 +43,13 @@ import sys
 
 from nodetop.cli import ENTITLEMENT_SOURCES, build_parser, cmd_where
 from nodetop.core.cluster import Cluster, Node, Queue
-from nodetop.core.model import BackendCapabilities, Identity, Verdict, VerdictCategory
+from nodetop.core.model import (
+    BackendCapabilities,
+    Identity,
+    Verdict,
+    VerdictCategory,
+    category_label,
+)
 from nodetop.render import Glyphs, Style
 
 PLAIN = Style(depth=0, glyphs=Glyphs())
@@ -222,7 +228,8 @@ class TestAVerdictOutranksTheHeuristicInTheOneSlot:
         text = _run(_cluster(answers=self.ANSWERS), ARGV_TEXT)
         line = next(ln for ln in text.splitlines() if " owned " in ln
                     and ("BLOCKED" in ln or "RUN NOW" in ln or "QUEUE" in ln))
-        assert "refused" in line and "group-only" not in line, line
+        assert (category_label("NOT_ENTITLED") in line
+                and "group-only" not in line), line
 
     def test_a_confirmed_partition_says_so_on_both_keys(self):
         rows = _rows(_cluster(answers=self.ANSWERS), ARGV_JSON)

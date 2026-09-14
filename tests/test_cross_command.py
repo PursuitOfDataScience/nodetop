@@ -120,13 +120,26 @@ class TestTheViewsAgree:
 
 
 class TestTheHeaderDescribesTheTableBeneathIt:
-    """One panel, one population.
+    """One panel, one population -- and one denominator per number.
 
     The header reported cluster-wide totals while the table below it was
     filtered to the caller's slice, so `status` read "358 GPUs, 117 free" above
     five partitions holding 230 of them. Two populations in one box, which is
     the same defect `accelerators` had when it announced a total nobody could
     use.
+
+    Scoping the counts fixed that and left a subtler version of it in place.
+    The line read `330 of 608 nodes, 324 up  ·  230 of 358 GPUs, 58 free`:
+    four numbers, two denominators, and nothing saying which was which. `324
+    up` is 324 of the **330**, not of the 608 printed beside it, and `58 free`
+    is 58 of the **230** -- so the two cluster totals on the line were the
+    denominators of nothing on it, while the real denominators stayed
+    implicit. "why 330 of 608 nodes? what does it mean? why 324 up? are the
+    rest of them down? why 58 free? what are the rest of them?"
+
+    So the cluster totals are gone -- the funnel below accounts for every
+    partition, and `nodetop gpus` states the accelerator total outright -- and
+    each figure now names what it is a fraction of, in words.
     """
 
     @staticmethod
@@ -158,29 +171,45 @@ class TestTheHeaderDescribesTheTableBeneathIt:
         return next(ln for ln in out.splitlines() if "node" in ln and "up" in ln)
 
     def test_it_counts_only_the_nodes_you_can_use(self, capsys):
-        assert "2 of 5 nodes" in self._header(capsys)
+        # Two of the five nodes are yours, and both are idle.
+        assert "2 of 2 nodes up" in self._header(capsys)
 
     def test_it_counts_only_the_gpus_you_can_use(self, capsys):
-        assert "8 of 20 GPUs" in self._header(capsys)
+        assert "of 8 GPUs" in self._header(capsys)
 
     def test_the_free_figure_is_scoped_too(self, capsys):
         # Every node in the fixture is idle, so cluster-wide free is 20 and
         # yours is 8. Without this, counting free accelerators over the whole
         # cluster went unnoticed -- the installed figure was scoped and the
         # free one beside it was not.
-        assert "8 free" in self._header(capsys)
+        assert "8 of 8 GPUs free" in self._header(capsys)
 
-    def test_it_keeps_the_cluster_total_as_context(self, capsys):
-        # Your slice is the subject; the cluster size is the qualifier.
+    def test_it_does_not_mix_two_denominators(self, capsys):
+        # The cluster's 5 nodes and 20 GPUs are not on this line, because
+        # nothing on this line is a fraction of them. They are the funnel's
+        # job, and `nodetop gpus`'.
         head = self._header(capsys)
-        assert " of 5 " in head and " of 20 " in head
+        assert "of 5 " not in head and "of 20 " not in head
 
-    def test_all_reports_the_whole_cluster_without_the_qualifier(self, capsys):
+    def test_every_figure_names_its_own_denominator(self, capsys):
+        # "324 up" next to "330 of 608" is the shape that has to stay gone: a
+        # count whose denominator is one of two numbers beside it, with no way
+        # to tell which.
+        head = self._header(capsys)
+        assert head.count(" of ") == 2, head
+
+    def test_all_reports_the_whole_cluster(self, capsys):
         cli.cmd_status(self._build(), _args(["status", "--all"]), PLAIN)
         out = capsys.readouterr().out
         head = next(ln for ln in out.splitlines() if "node" in ln and "up" in ln)
-        assert "5 nodes" in head
-        assert " of 5 " not in head   # nothing is hidden, so nothing to qualify
+        assert "5 of 5 nodes up" in head
+
+    def test_the_header_claims_nothing_it_should_not(self, capsys):
+        # `324 of your 330 nodes up` called them the reader's nodes. They are
+        # somebody else's hardware the reader may submit to -- a different
+        # relationship, and the possessive got it wrong: "don't use your. it's
+        # not mine."
+        assert "your" not in self._header(capsys)
 
     def test_the_header_matches_the_rows(self, capsys):
         # The invariant, not a fixed string: whatever is shown, the header

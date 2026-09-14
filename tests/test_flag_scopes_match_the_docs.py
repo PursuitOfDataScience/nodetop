@@ -4,7 +4,8 @@ The audit found four claims that were false against `build_parser()`:
 
 * README and DESIGN.md both said `-p` "is accepted everywhere as an alias for
   `-q`". It is on six commands; `status`, `zoom`, `health`, `backends` and
-  `snapshot` take neither, because they do not name a single queue.
+  `snapshot` take neither, because they do not name a single queue — nor does
+  `mcp`, which names no queue and takes no rendering flag either.
 * DESIGN.md said `--all` widens "`status`, `queues` and `where`", omitting
   `zoom`, `nodes` and `accelerators`, which also have it.
 * README listed `--all`/`--detail`/`--static` unqualified, and `--static`
@@ -39,7 +40,7 @@ SCOPES = {
 
 COMMANDS = [
     "status", "queues", "zoom", "nodes", "health", "where",
-    "check", "exclude", "accelerators", "backends", "snapshot",
+    "check", "exclude", "accelerators", "backends", "snapshot", "mcp",
 ]
 
 
@@ -66,7 +67,7 @@ class TestTheParserMatchesTheTable:
 
     def test_the_commands_that_name_no_queue_take_neither_alias(self) -> None:
         # The specific claim that was false: "accepted everywhere".
-        for name in ("status", "zoom", "health", "backends", "snapshot"):
+        for name in ("status", "zoom", "health", "backends", "snapshot", "mcp"):
             assert name not in _commands_taking("-p"), name
             assert name not in _commands_taking("-q"), name
 

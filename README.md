@@ -97,23 +97,27 @@ Arrow keys, enter to open, `q` to leave. The same screen the whole way down —
 partitions, then the nodes inside one, then the jobs on a node, then a job.
 
 ```
-╭──────────────────────────────────────────────────────────────────────────────────────╮
-│ nodetop · slurm  ·  ada  ·  328 of 607 nodes, 326 up  ·  222 of 358 GPUs, 53 free    │
-│                                                                                      │
-│    87 partitions  · ❯8 open to you  ·  65 no access  ·  11 refused  ·  3 down        │
-│ ──────────────────────────────────────────────────────────────────────────────────── │
-│    partition   nodes idle  cores free              gpu free  gpu model               │
-│    compute           0/40   1695/5120  ██████████         —                          │
-│    gpu-a            11/44    406/1408  ██▍░░░░░░░    48/176  A100, A40               │
-│    wide             0/190    436/9120  ██▋░░░░░░░         —                          │
-│    gpu-b              0/9     186/432  █▏░░░░░░░░      0/36  V100, RTX6000           │
-╰──────────────────────────────────────────────────────────────────────────────────────╯
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ nodetop  ·  ada  ·  326 of 328 nodes up  ·  53 of 212 GPUs free                                            │
+│                                                                                                            │
+│    87 partitions  · ❯8 open to you  ·  76 no access  ·  3 down                                             │
+│ ────────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│    partition  nodes idle     mem free  cores free  gpus free  gpu model  usable                            │
+│    gpu-b             0/9    270/1620G     180/432       0/36  V100       ███▍░░░░░░░░░░░░░░░░              │
+│    compute          0/40  1400/10000G   1320/5120          —             ██▊░░░░░░░░░░░░░░░░░              │
+│    gpu-a            0/44  1320/11000G    396/1408     44/176  A100       ██▍░░░░░░░░░░░░░░░░░              │
+│    wide            0/190   190/34200G    380/9120          —             ▏░░░░░░░░░░░░░░░░░░░              │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-Every column is `free/total` under a header naming the numerator, and one hue per
-resource. `wide` has 190 nodes and 2654 cores its scheduler calls free. **436** of them can
-actually be allocated: the rest sit on nodes whose memory is entirely spoken for, so
-nothing can land there. `free` is what you can have, not what is advertised.
+Every column is `free/total` under a header naming the numerator, and the meter is the
+composite: `usable` is the fraction of that partition you can actually have — the
+**smaller** of its core and memory shares, because a partition is only as free as its
+scarcest resource. The rows run most free to least by it, in `queues` as well.
+
+Which is how `wide` ends up last despite having the most of everything. **190G** of memory
+free across 190 nodes is one gigabyte each, so almost nothing can land there whatever the
+380 free cores suggest. `free` is what you can have, not what is advertised.
 
 *(Names and figures throughout are illustrative. Run it on your own cluster for yours.)*
 
@@ -152,7 +156,38 @@ nodetop health               # down, drained, and silently degraded nodes
 nodetop gpus                 # what each accelerator model can do
 nodetop exclude --gpu-nodes  # an exclusion list for CPU-only work
 nodetop snapshot -o snap.json && nodetop --replay snap.json status
+nodetop mcp                  # serve these reports to an AI agent over MCP
 ```
+
+### For an agent (MCP)
+
+`nodetop mcp` speaks MCP on stdin/stdout, so an assistant can ask the questions
+above and get the same JSON. Point a client at it:
+
+```json
+{
+  "mcpServers": {
+    "nodetop": { "command": "nodetop", "args": ["mcp"] }
+  }
+}
+```
+
+Seven read-only tools — `where_can_i_run`, `cluster_status`, `list_queues`,
+`list_nodes`, `zoom_queue`, `cluster_health`, `list_accelerators`. Each one runs
+the real command and hands back exactly what `--json` prints, so there is no
+second implementation to drift. Nothing that writes is exposed.
+
+The reason to prefer it over letting an agent type the CLI is the schema:
+`gpus` is an integer in a tool definition, whereas `--gpu` on the command line
+is an ambiguous prefix of `--gpus` and `--gpu-mem` and fails as a usage error.
+
+Each call takes a **fresh reading** — a server outlives the cluster state it
+describes, so nothing is cached between calls. `where_can_i_run` and
+`cluster_status` spend a dry-run against the control plane, so a second such
+call within ten seconds is answered from the declared allowlists instead and
+says so in the reply. `NODETOP_MCP_PROBE_INTERVAL` changes that bound; `0`
+removes it. No dependencies are added: it is JSON-RPC over a pipe, written
+against the standard library like the rest of the package.
 
 ### Flags worth knowing
 
@@ -176,7 +211,7 @@ The vocabulary follows the system — `partition` on Slurm, `queue` on PBS/LSF/S
 `namespace` on Kubernetes, `pool` on an ssh pool — and `-p` is an alias for `-q` on
 every command that takes one: `queues`, `nodes`, `where`, `check`, `exclude` and
 `accelerators`. The commands that do not name a single queue (`status`, `zoom`,
-`health`, `backends`, `snapshot`) take neither.
+`health`, `backends`, `snapshot`, `mcp`) take neither.
 
 ## Why it exists
 

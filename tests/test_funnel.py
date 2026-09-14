@@ -1,11 +1,17 @@
 """The funnel line must actually account for every partition.
 
-`status` prints `87 partitions -> 5 open to you · 65 no access · 14 refused ·
-3 dead`, and the whole point of that line is that it answers "why five rows"
-by arithmetic rather than by asking the reader to trust it. That only holds if
-every partition lands in exactly one term -- which is a property of the filter
-chain, not of the line, and it breaks silently the moment a filter is added
-without a matching count. Several have been.
+`status` prints `87 partitions · 5 open to you · 79 no access · 3 down`,
+and the whole point of that line is that it answers
+"why five rows" by arithmetic rather than by asking the reader to trust it.
+That only holds if every partition lands in exactly one term -- which is a
+property of the filter chain, not of the line, and it breaks silently the
+moment a filter is added without a matching count. Several have been.
+
+The terms are read from `_EXCLUSION_LABELS` rather than spelled out here: the
+wire codes in `--json` and the words on the screen are deliberately two
+different things now, and a test that hardcoded the words would either go
+stale on the next rewording or, worse, keep passing while the line said
+something else.
 """
 
 from __future__ import annotations
@@ -15,7 +21,7 @@ import re
 
 import pytest
 
-from nodetop.cli import build_parser, cmd_status
+from nodetop.cli import _EXCLUSION_LABELS, build_parser, cmd_status
 from nodetop.core.cluster import Cluster
 from nodetop.core.model import (
     BackendCapabilities,
@@ -28,7 +34,9 @@ from nodetop.core.model import (
 from nodetop.render import Glyphs, Style
 
 PLAIN = Style(depth=0, glyphs=Glyphs())
-TERMS = ("open to you", "with nodes", "no access", "refused", "no nodes", "down")
+TERMS = ("open to you", "with nodes",
+         *(_EXCLUSION_LABELS[code]
+           for code in ("no access", "refused", "no nodes", "down")))
 
 
 def _args(argv):
@@ -126,10 +134,14 @@ class TestTheFunnelWithAProbe:
         total, parts = _funnel(cluster, capsys)
         assert sum(parts.values()) == total, parts
 
-    def test_a_refusal_is_counted_as_refused(self, capsys):
+    def test_a_refusal_lands_in_the_access_term(self, capsys):
+        # One term covers both ways of not having access -- the queue's own
+        # allowlist and a dry-run that could not get in -- so `theirs` and
+        # `no` are counted together here. Which is which is still per-partition
+        # in the drill-down and in `--json`.
         cluster = _build(self.SPECS, accepts=("yes",), probe=True)
         _total, parts = _funnel(cluster, capsys)
-        assert parts.get("refused") == 1, parts
+        assert parts.get(_EXCLUSION_LABELS["no access"]) == 2, parts
 
     def test_all_reports_the_whole_cluster(self, capsys):
         cluster = _build(self.SPECS, accepts=("yes",), probe=True)
