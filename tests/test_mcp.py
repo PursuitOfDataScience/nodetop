@@ -423,8 +423,51 @@ class TestTheSubcommand:
         assert "--backend" in flags and "--replay" in flags
         assert not (flags & {"--json", "--no-color", "--ascii"})
 
-    def test_extra_arguments_reach_the_command(self) -> None:
-        # `--replay`/`--backend` are root flags, so they must lead the argv.
-        rc, payloads, log = mcp._run(["--backend", "slurm", "nodes", "--json",
-                                      "-n", "1"])
-        assert rc == 0 and payloads
+    def test_the_source_flags_lead_the_argv(self, monkeypatch) -> None:
+        """Root flags must come BEFORE the verb, or they are not accepted.
+
+        `--backend` and `--replay` belong to the root parser, so
+        `nodetop nodes --replay f` is a different -- and rejected -- command
+        from `nodetop --replay f nodes`. Asserted on the argv rather than by
+        running it: the first spelling of this test forced a real backend,
+        which passed on a login node with a live Slurm and failed on CI, where
+        there is none. That is the exact trap `conftest` warns about.
+        """
+        from nodetop import cli
+
+        seen: list[list[str]] = []
+        monkeypatch.setattr(cli, "main", lambda argv: seen.append(list(argv)) or 0)
+        mcp.call("list_nodes", {"top": 1}, extra=["--replay", "snap.json"])
+        assert seen[0][:3] == ["--replay", "snap.json", "nodes"]
+
+    def test_a_forwarded_replay_is_actually_read(
+        self, tmp_path, slurm_nodes, slurm_partitions, slurm_qos
+    ) -> None:
+        """And end to end, against a recording rather than against this host.
+
+        A snapshot is the one source that makes `extra` testable without
+        asking what batch system the runner happens to have.
+        """
+        from nodetop.backends.slurm import SlurmBackend
+        from nodetop.cli import cmd_snapshot
+        from nodetop.core.cluster import Cluster
+        from nodetop.render import Glyphs, Style
+        from nodetop.runner import CapturingRunner, RecordedRunner
+
+        capture = CapturingRunner(RecordedRunner({
+            "scontrol show node": (0, slurm_nodes, ""),
+            "scontrol show partition": (0, slurm_partitions, ""),
+            "show qos": (0, slurm_qos, ""),
+            "show assoc": (0, "acct||gn\n", ""),
+            "squeue": (0, "", ""),
+        }))
+        cluster = Cluster.load(SlurmBackend(capture), with_free_times=True)
+        cluster.capture = capture
+        path = tmp_path / "snap.json"
+        args = build_parser().parse_args(["snapshot", "-o", str(path)])
+        assert cmd_snapshot(cluster, args, Style(depth=0, glyphs=Glyphs())) == 0
+
+        rc, payloads, _log = mcp._run(
+            ["--replay", str(path), "nodes", "--json", "-n", "1"])
+        assert rc == 0
+        assert payloads and payloads[0]
