@@ -232,7 +232,7 @@ class TestTheVersionIsSpelledOnce:
 
         declared = self._pyproject_version()
         assert declared == VERSION, (
-            f"_version.py says {VERSION}, pyproject.toml says {declared} — "
+            f"_version.py says {VERSION}, pyproject.toml says {declared}; "
             f"`nodetop --version` reports the former and PyPI publishes the latter"
         )
 
@@ -256,13 +256,13 @@ class TestTheNoDependenciesClaimIsTrue:
     """"No dependencies" is asserted in three places and guarded in none.
 
     `pyproject.toml` says `dependencies = []` with a comment explaining why, the
-    README carries a `dependencies-none` badge, and DESIGN.md restates it — and
+    README says `No dependencies`, and DESIGN.md restates it, but
     nothing checked the tree. The claim is load-bearing rather than decorative:
     this is a tool reached for while a cluster is misbehaving, on a login node
     with nothing but the system Python, so one `import rich` ends its reason to
     exist.
 
-    A sibling package had the same gap, with the check living only in a CI job —
+    A sibling package had the same gap, with the check living only in a CI job,
     which cannot fail during the local gate run that introduces the import.
     """
 
@@ -312,7 +312,7 @@ class TestTheNoDependenciesClaimIsTrue:
             if third:
                 offenders[path.name] = sorted(third)
         assert not offenders, (
-            f"{offenders} — pyproject declares none, the README badge says none, "
+            f"{offenders}: pyproject declares none, the README says none, "
             f"and DESIGN.md explains why it matters"
         )
 
@@ -342,9 +342,9 @@ class TestTheNoDependenciesClaimIsTrue:
         declared = [x for x in (v.strip().strip('",') for v in found.group(1).split("\n")) if x]
         assert not declared, declared
 
-    def test_the_readme_badge_still_says_none(self):
+    def test_the_readme_still_says_none(self):
         root = pathlib.Path(__file__).resolve().parent.parent
-        assert "dependencies-none" in (root / "README.md").read_text()
+        assert "No dependencies" in (root / "README.md").read_text()
 
     def test_the_detector_would_notice_a_real_import(self):
         # The control: a guard that cannot fail is not a guard.

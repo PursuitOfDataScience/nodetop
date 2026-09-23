@@ -2,16 +2,13 @@
 
 # 🖥️ nodetop
 
-**See what your cluster actually has free, and why a queue that looks fine will not take your job.**
+**What's actually free on your cluster, and why your job won't run there.**
 
 Slurm · PBS Pro / OpenPBS / Torque · LSF · Grid Engine · Kubernetes · a bare pool of machines
 
 <a href="https://github.com/PursuitOfDataScience/nodetop/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/nodetop/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <a href="https://pypi.org/project/nodetop/"><img src="https://img.shields.io/pypi/v/nodetop.svg" alt="PyPI"></a>
 <a href="https://pypi.org/project/nodetop/"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PursuitOfDataScience/nodetop/badges/downloads.json" alt="PyPI downloads per month"></a>
-<img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
-<img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
-<img src="https://img.shields.io/badge/dependencies-none-brightgreen.svg" alt="No dependencies">
 
 </div>
 

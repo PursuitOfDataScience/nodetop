@@ -6,21 +6,21 @@ removes: `src/nodetop` uses none of them, but only because nobody had reached fo
 
 The three sibling packages carry the same scan. Copying theirs verbatim would have
 been wrong here, and measurably so: they are flat single-directory packages, so their
-`SRC.glob("*.py")` sees everything. **nodetop is the only one with subpackages** —
+`SRC.glob("*.py")` sees everything. **nodetop is the only one with subpackages**:
 `core/` and `backends/` hold 16 of its 25 modules, so a flat glob would have covered
 9 and reported clean. `test_the_scan_reaches_the_subpackages` is the guard against
 that specific mistake.
 
 Why a test at all, when CI runs 3.10-3.13: because this list is the part CI *cannot*
 catch. A module a newer Python **removed** is an `ImportError` in the matrix and needs
-no test. These are **deprecated but still importable** — verified on the interpreter
+no test. These are **deprecated but still importable**, verified on the interpreter
 this suite runs on (3.11): `distutils`, `imp` and `pkg_resources` all import, and
 `datetime.utcnow`, `locale.getdefaultlocale`, `typing.ByteString` and
 `importlib.find_loader` all still exist. They pass every job today and break later.
 
 The list is kept identical to the siblings' rather than trimmed to the ones that
 outlive 3.13, because which entry is removed at which version is not something this
-machine can verify — only 3.11 is installed here.
+machine can verify: only 3.11 is installed here.
 """
 
 import pathlib
@@ -104,4 +104,4 @@ class TestControls:
         # This file scans stdlib usage; the "no third-party imports" claim is
         # test_readme.py's. Asserted so the split cannot go unnoticed.
         text = (pathlib.Path(__file__).parent / "test_readme.py").read_text()
-        assert "dependencies-none" in text
+        assert "def test_no_module_imports_anything_third_party" in text
